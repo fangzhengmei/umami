@@ -53,7 +53,7 @@ API 路由 (/api/send, /api/record)
    - Glob pattern: `**/*worker*` → 0 匹配
    - Glob pattern: `**/*consumer*` → 0 匹配
 
-3. **Kafka 模块完整功能范围** [src/lib/kafka.ts]
+3. **Kafka 模块完整功能范围** [`src/lib/kafka.ts`]
    - ✅ 包含：Producer 初始化、sendMessage 方法
    - ❌ 不包含：Consumer、Worker、消费逻辑、数据同步到 ClickHouse 的逻辑
 
@@ -827,7 +827,7 @@ export function runQuery(queries: any) {
 |---------|---------|-----------|-----------------|-------------|
 | **写入路由** | runQuery 是三择一单路由机制 | `src/lib/db.ts:22-36` | ✅ 是 | 无 |
 | **写入路由** | 三种写入模式：PRISMA 直写、ClickHouse 直写、ClickHouse+Kafka 异步入队 | `src/lib/db.ts:22-36`, `src/queries/sql/events/saveEvent.ts:259-263` | ✅ 是 | 消费端逻辑外部实现 |
-| **写入路由** | KAFKA 分支在仓内所有写入函数中均未被调用 | 所有 src/queries/sql/events/saveEvent.ts` | ✅ 是 | 无 |
+| **写入路由** | KAFKA 分支在仓内所有写入函数中均未被调用 | `src/queries/sql/events/saveEvent.ts` 等写入函数 | ✅ 是 | 无 |
 | **写入路由** | Kafka 仅实现生产端，无消费端/Worker | `src/lib/kafka.ts` | ✅ 是 | 消费端实现需外部 |
 | **事件属性展开** | JSON 对象递归展开为键值对 | `src/lib/data.ts:4-25` | ✅ 是 | 无 |
 | **事件属性展开** | 支持 5 种数据类型映射 | `src/lib/constants.ts:129-135` | ✅ 是 | 无 |
