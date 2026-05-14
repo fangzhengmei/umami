@@ -1,8 +1,14 @@
 # Umami 网站权限系统协作分析（证据化核对版）
 
-## 文档版本：v1.0
+## 文档版本：v1.1
 核对日期：2026-05-14
 核对范围：用户-团队-网站三层权限架构
+
+### v1.1 更新内容：
+- 修正 TeamUser 删除语义：物理删除 vs 软删除
+- 补充 Team.deletedAt 与权限查询的联动过滤核查
+- 更新边界条件表中的相关结论
+- 修正潜在风险点的表述
 
 ---
 
@@ -46,6 +52,10 @@ model TeamUser {
   teamId    String    @map("team_id") @db.Uuid
   userId    String    @map("user_id") @db.Uuid
   role      String    @db.VarChar(50)      // 团队内角色
+  createdAt DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime? @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  // 注意：不存在 deletedAt 字段！
 
   // 索引定义
   @@index([teamId])    // 单列索引：teamId
@@ -54,8 +64,9 @@ model TeamUser {
 ```
 
 **核对结论**：
-✅ TeamUser 模型仅有**两个单列索引**，分别是 `[teamId]` 和 `[userId]`，**不存在联合索引** `[teamId, userId]`。
-⚠️ **重要事实**：权限查询时使用的是 `findFirst({ where: { teamId, userId } })，依赖数据库查询优化器，而非显式联合索引。
+✅ TeamUser 模型仅有**两个单列索引**，分别是 `[teamId]` 和 `[userId]`，**不存在联合索引** `[teamId, userId]`
+✅ **TeamUser 模型无 deletedAt 字段** → 不支持软删除，只能物理删除
+⚠️ **重要事实**：权限查询时使用的是 `findFirst({ where: { teamId, userId } })，依赖数据库查询优化器，而非显式联合索引
 
 ### 1.2 角色枚举值核对
 
@@ -358,18 +369,29 @@ export async function hasPermission(role: string, permission: string | string[])
 
 ## 四、SQL 查询封装证据化
 
-### 4.1 getTeamUser 查询实现
+### 4.1 getTeamUser 查询实现与删除语义
 
-**文件位置**：`src/queries/prisma/teamUser.ts:12-19`
+**文件位置**：`src/queries/prisma/teamUser.ts:12-19, 59-65`
 
 ```typescript
+// 查询函数
 export async function getTeamUser(teamId: string, userId: string) {
   return prisma.client.teamUser.findFirst({
     where: {
       teamId,
       userId,
     },
-    // 注意：无 deletedAt 过滤条件！
+    // 注意：TeamUser 模型本身无 deletedAt 字段
+  });
+}
+
+// 删除函数
+export async function deleteTeamUser(teamId: string, userId: string) {
+  return prisma.client.teamUser.deleteMany({
+    where: {
+      teamId,
+      userId,
+    },
   });
 }
 ```
@@ -378,7 +400,16 @@ export async function getTeamUser(teamId: string, userId: string) {
 ✅ 使用 `findFirst` + 两个 where 条件
 ✅ 数据库有 `@@index([teamId]) 和 `@@index([userId])` 单列索引
 ✅ **无联合索引**，依赖数据库查询优化器选择最优索引
-❌ **无软删除过滤**：已删除的团队成员关系仍可被查询到
+
+**TeamUser 删除语义核查**：
+✅ **物理删除**：使用 `deleteMany` 直接从数据库删除记录
+❌ **无软删除**：模型本身无 `deletedAt` 字段，不支持软删除
+✅ **删除后影响**：记录被物理删除 → `getTeamUser` 返回 null → 权限检查自动失效
+⚠️ **注意**：TeamUser 不存在"已删除但仍可被查询到"的情况，因为是物理删除
+
+**调用路径证据**：
+- `DELETE /api/teams/[teamId]/users/[userId]` → 调用 `deleteTeamUser(teamId, userId)`
+- 权限检查全部依赖 `getTeamUser()` → 物理删除后权限立即失效
 
 ### 4.2 getWebsite 查询实现
 
@@ -426,27 +457,127 @@ export async function getWebsites(criteria: Prisma.WebsiteFindManyArgs, filters:
 - 列表查询 `getWebsites` **有** `deletedAt: null` 过滤
 - 权限检查调用的是 `getWebsite`（单条查询，可能查询到已删除网站
 
-### 4.4 getUserWebsites 与 getTeamWebsites
+### 4.4 Team.deletedAt 联动过滤核查
 
-均调用 `getWebsites` → 继承软删除过滤。
+#### 核查场景：权限检查是否过滤已删除团队的网站
+
+**证据1：getAllUserWebsitesIncludingTeamOwner 列表查询**
+**文件位置**：`src/queries/prisma/website.ts:45-69`
+
+```typescript
+export async function getAllUserWebsitesIncludingTeamOwner(userId: string, filters?: QueryFilters) {
+  return getWebsites(
+    {
+      where: {
+        OR: [
+          { userId },
+          {
+            team: {
+              deletedAt: null,  // ✅ 列表查询有 team.deletedAt 过滤
+              members: {
+                some: {
+                  role: ROLES.teamOwner,
+                  userId,
+                },
+              },
+            },
+          },
+        ],
+      },
+    },
+    // ...
+  );
+}
+```
+
+**证据2：getTeamUsers 列表查询**
+**文件位置**：`src/app/api/teams/[teamId]/users/route.ts:33`
+
+```typescript
+// 团队成员列表查询有 deletedAt 过滤
+where: {
+  teamId,
+  deletedAt: null,  // ✅
+  user: { deletedAt: null },
+}
+```
+
+**证据3：权限检查函数（单条查询）**
+**文件位置**：`src/permissions/website.ts:23-37, 77-81`
+
+```typescript
+// canViewWebsite 权限检查
+const entity = await getEntity(websiteId);  // ❌ 内部调用 getWebsite，无 team.deletedAt 过滤
+if (entity.teamId) {
+  const teamUser = await getTeamUser(entity.teamId, user.id);  // ❌ 仅检查成员存在性
+  return !!teamUser;
+}
+
+// canUpdateWebsite 权限检查
+const website = await getWebsite(websiteId);  // ❌ 无 team.deletedAt 过滤
+if (website.teamId) {
+  const teamUser = await getTeamUser(website.teamId, user.id);  // ❌ 仅检查成员存在性
+  return teamUser && hasPermission(...);
+}
+```
+
+**证据4：getTeam 单条查询**
+**文件位置**：`src/queries/prisma/team.ts:13-25`
+
+```typescript
+export async function getTeam(teamId: string, options) {
+  return findTeam({
+    where: {
+      id: teamId,  // ❌ 无 deletedAt 过滤
+    },
+    // ...
+  });
+}
+```
+
+**Team.deletedAt 联动过滤结论表**：
+
+| 查询场景 | 文件位置 | team.deletedAt 过滤 | 影响范围 |
+|---------|---------|---------------------|---------|
+| `getAllUserWebsitesIncludingTeamOwner`（列表） | `website.ts:45-69` | ✅ 有 `deletedAt: null` | 团队所有者查看的网站列表 |
+| `getTeamUsers`（列表） | `teamUser.ts:21-37` | ✅ 有 `deletedAt: null` | 团队成员列表 |
+| `getUserTeams`（列表） | `team.ts:49-85` | ✅ 有 `deletedAt: null` | 用户所属团队列表 |
+| `canViewWebsite`（权限检查） | `website.ts:23-37` | ❌ 无 | 单网站查看权限 |
+| `canUpdateWebsite`（权限检查） | `website.ts:77-81` | ❌ 无 | 单网站更新权限 |
+| `canDeleteWebsite`（权限检查） | `website.ts:95-109` | ❌ 无 | 单网站删除权限 |
+| `canViewTeam`（权限检查） | `team.ts:6-16` | ❌ 无 | 团队查看权限 |
+| `getTeam`（单条查询） | `team.ts:13-25` | ❌ 无 | 单个团队详情 |
+
+**关键结论**：
+⚠️ **列表查询有 Team.deletedAt 过滤，单条查询/权限检查无过滤**
+⚠️ **团队被软删除后，用户在列表中看不到该团队及其网站，但通过直接调用 API 仍可能访问到团队下的网站**
+
+---
+
+### 4.5 getUserWebsites 与 getTeamWebsites
+
+均调用 `getWebsites` → 继承 website.deletedAt 过滤，但**无 team.deletedAt 过滤**。
 
 ---
 
 ## 五、边界条件详细核对表
 
-| 边界条件 | 代码位置 | 实际行为 |
-|---------|---------|---------|
-| **website 不存在** | `website.ts:69-71` | `getWebsite` 返回 null → 权限函数返回 false |
-| **teamUser 记录不存在** | `website.ts:77-80` | `getTeamUser` 返回 null → `teamUser && ...` 返回 false |
-| **auth.user 为 null** | `website.ts:59` | `!user` → 返回 false |
-| **entity 为 null** | `website.ts:25-27` | `!entity` → 返回 false |
-| **website 同时有 userId 和 teamId** | N/A | 业务代码无防御，按代码顺序 userId 分支优先 |
-| **已删除 website（单条查询）** | `website.ts:11-16` | 可被查询到，权限判断正常执行 |
-| **已删除 website（列表查询）** | `website.ts:37` | 被 `deletedAt: null` 过滤，不可见 |
-| **已删除 teamUser 关系** | `teamUser.ts:12-19` | 无 `deletedAt` 过滤，可被查询到 |
-| **shareToken 查看网站** | `website.ts:12-21` | 绕过归属检查，直接返回 true |
-| **teamViewOnly 查看网站** | `website.ts:33-37` | 仅需 teamUser 存在即可，无权限检查 → **可查看 |
-| **teamViewOnly 更新网站** | `website.ts:77-81` | `hasPermission('team-view-only', 'website:update') → ROLE_PERMISSIONS['team-view-only'] 为空数组 → 返回 false |
+| 边界条件 | 代码位置 | 实际行为 | 验证结论 |
+|---------|---------|---------|---------|
+| **website 不存在** | `website.ts:69-71` | `getWebsite` 返回 null → 权限函数返回 false | ✅ 正确 |
+| **teamUser 记录不存在** | `website.ts:77-80` | `getTeamUser` 返回 null → `teamUser && ...` 返回 false | ✅ 正确 |
+| **auth.user 为 null** | `website.ts:59` | `!user` → 返回 false | ✅ 正确 |
+| **entity 为 null** | `website.ts:25-27` | `!entity` → 返回 false | ✅ 正确 |
+| **website 同时有 userId 和 teamId** | N/A | 业务代码无防御，按代码顺序 userId 分支优先 | ⚠️ 防御缺失 |
+| **已删除 website（单条查询）** | `website.ts:11-16` | 可被查询到，权限判断正常执行 | ⚠️ 无过滤 |
+| **已删除 website（列表查询）** | `website.ts:37` | 被 `deletedAt: null` 过滤，不可见 | ✅ 有过滤 |
+| **已删除 teamUser 关系** | `teamUser.ts:59-65` | TeamUser 是物理删除 → 记录不存在 → `getTeamUser` 返回 null → 权限自动失效 | ✅ 正确 |
+| **已删除 Team（team.deletedAt）** | `website.ts:23-37, 77-81` | 权限检查无 team.deletedAt 过滤 → 成员仍可访问该团队下的网站 | ⚠️ 联动过滤缺失 |
+| **shareToken 查看网站** | `website.ts:12-21` | 绕过归属检查，直接返回 true | ✅ 按设计 |
+| **teamViewOnly 查看网站** | `website.ts:33-37` | 仅需 teamUser 存在即可，无权限检查 → 可查看 | ✅ 按设计 |
+| **teamViewOnly 更新网站** | `website.ts:77-81` | `hasPermission('team-view-only', 'website:update') → ROLE_PERMISSIONS['team-view-only'] 为空数组 → 返回 false | ✅ 正确 |
+| **Cloud 模式下删除 Team** | `team.ts:143-158` | Team 被软删除 → TeamUser 记录保留 → 成员仍可通过权限检查 | ⚠️ 权限残留 |
+| **非 Cloud 模式下删除 Team** | `team.ts:160-171` | Team 被物理删除 + TeamUser 级联删除 → 权限自动失效 | ✅ 正确 |
 
 ---
 
@@ -593,15 +724,22 @@ HTTP Request
 3. ✅ **归属互斥**：是业务代码约定，非 Prisma 数据库级约束
 4. ✅ **查看权限**：团队成员查看网站无需权限检查，仅需存在成员关系
 5. ✅ **getEntity**：并行查询 Website/Link/Pixel/Board 四张表
-6. ⚠️ **软删除不一致**：单条查询无 deletedAt 过滤，列表查询有过滤
+6. ✅ **TeamUser 删除语义**：物理删除，无软删除机制 → 删除后权限立即失效
 7. ✅ **canDeleteTeamUser**：用户可以自己离开团队，无需权限
 8. ✅ **isAdmin**：是认证阶段派生的硬编码判断，不等同 `hasPermission('all')`
 9. ✅ **ShareToken**：有6种匹配方式，绕过归属检查
 10. ✅ **权限判断顺序**：userId 优先于 teamId 判断
+11. ✅ **列表查询一致性**：团队列表、网站列表均有 deletedAt 过滤
 
-### 潜在风险点：
+### 关键修正结论：
 
-1. ⚠️ 已删除网站在权限检查中仍可被访问到
-2. ⚠️ 已删除团队成员关系仍可参与权限判断
-3. ⚠️ 无数据库级约束保证 userId/teamId 互斥，脏数据可能导致权限判断结果不一致
-4. ⚠️ TeamUser 无联合索引，高并发下可能存在性能隐患
+1. ❌ **原报告错误**：TeamUser 有软删除 → **修正为**：TeamUser 无 deletedAt 字段，是物理删除
+2. ❌ **原报告错误**：已删除 teamUser 仍可参与权限判断 → **修正为**：物理删除后记录不存在，权限自动失效
+3. ✅ **补充确认**：Team.deletedAt 仅在列表查询过滤，单条权限检查无联动过滤
+
+### 潜在风险点（基于真实代码验证）：
+
+1. ⚠️ **网站软删除不一致**：已删除网站在单条权限检查中仍可被访问到（列表中不可见）
+2. ⚠️ **团队软删除联动缺失**：Cloud 模式下团队被软删除后，TeamUser 记录保留 → 成员仍可访问该团队下的网站
+3. ⚠️ **无数据库级约束**：无 CHECK 约束保证 userId/teamId 互斥，脏数据可能导致权限判断结果不一致
+4. ⚠️ **TeamUser 无联合索引**：`findFirst({ teamId, userId })` 使用单列索引，高并发下可能存在性能隐患
