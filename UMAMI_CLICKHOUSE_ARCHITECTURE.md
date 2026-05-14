@@ -12,6 +12,7 @@
 |---------|-----|
 | ✅ **仓内可证** | 结论可由仓库内代码直接验证 |
 | ⚠️ **外部依赖** | 结论依赖外部基础设施，仓内代码不包含完整实现 |
+| ❌ **无法证伪/证实** | 仓内代码不足以得出确定性结论 |
 
 ---
 
@@ -26,15 +27,15 @@ API 路由 (/api/send, /api/record)
     ↓  [✅ 仓内可证] src/queries/sql/events/saveEvent.ts
 数据处理层 (saveEvent, saveEventData, saveSessionData, saveRecording)
     ↓  [✅ 仓内可证] src/lib/db.ts:22-36
-数据库路由层 (runQuery)
+数据库路由层 (runQuery) - 三择一，单路由
     ├─ 配置了 CLICKHOUSE_URL → 走 CLICKHOUSE 分支
-    │       ↓  [✅ 仓内可证] src/queries/sql/events/saveEvent.ts:259-263
-    │       ├─ kafka.enabled = true → sendMessage(topic, data) → Kafka 写入
-    │       │   └─ ⚠️ 外部依赖: Kafka集群 + 外部消费端（本仓未包含 consumer/worker 实现）
-    │       └─ kafka.enabled = false → clickhouse.insert(table, data) → 直接写入 ClickHouse
-    │           └─ ⚠️ 外部依赖: ClickHouse 集群
+    │   ↓  [✅ 仓内可证] src/queries/sql/events/saveEvent.ts:259-263
+    │   ├─ kafka.enabled = true → sendMessage(topic, data) → Kafka 异步入队
+    │   │   └─ ⚠️ 外部依赖: Kafka集群 + 外部消费端（本仓未包含 consumer/worker 实现）
+    │   └─ kafka.enabled = false → clickhouse.insert(table, data) → ClickHouse 直写
+    │       └─ ⚠️ 外部依赖: ClickHouse 集群
     │
-    └─ 未配置 CLICKHOUSE_URL → 走 PRISMA 分支 → PostgreSQL/MySQL
+    └─ 未配置 CLICKHOUSE_URL → 走 PRISMA 分支 → PostgreSQL/MySQL 直写
         └─ [✅ 仓内可证] src/lib/prisma.ts
 ```
 
@@ -44,7 +45,7 @@ API 路由 (/api/send, /api/record)
 
 **检索证据：**
 
-1. **关键词搜索结果** [src/lib/db.ts]
+1. **关键词搜索结果**
    - Grep pattern: `worker|consumer|kafka.*consume|consume.*kafka`
    - 仅在 `pnpm-lock.yaml` 中找到匹配，源码目录无匹配文件
 
@@ -56,7 +57,7 @@ API 路由 (/api/send, /api/record)
    - ✅ 包含：Producer 初始化、sendMessage 方法
    - ❌ 不包含：Consumer、Worker、消费逻辑、数据同步到 ClickHouse 的逻辑
 
-**结论：** 本仓库仅实现了 Kafka 生产端，消费端 / Worker 需外部实现，仓内不可见。
+**结论：** 本仓库仅实现 Kafka 生产端，消费端 / Worker 需外部实现，仓内不可见。
 
 ---
 
@@ -75,7 +76,7 @@ Umami 支持 4 种采集类型：
 | `performance` | 网页性能指标（LCP/INP/CLS/FCP/TTFB） |
 | `record` | 会话录制（独立路由 `/api/record`） |
 
-**事件载荷结构：
+**事件载荷结构：**
 
 ```typescript
 interface EventPayload {
@@ -139,11 +140,11 @@ if (hasBlockedIp(ip)) {
 
 ---
 
-## 3. 写入路由机制（已修正）
+## 3. 写入路由机制（已核对）
 
 ### 3.1 runQuery 路由逻辑
 
-**核心文件：** `src/lib/db.ts:22-36
+**核心文件：** `src/lib/db.ts:22-36`
 
 ```typescript
 export async function runQuery(queries: any) {
@@ -167,14 +168,22 @@ export async function runQuery(queries: any) {
 }
 ```
 
-**关键修正：**
+**关键事实核对：**
 - 当配置 `CLICKHOUSE_URL` 时，**仅执行 CLICKHOUSE 分支**，不会同时走多个分支
 - KAFKA 分支在仓内所有查询函数中均未定义，实际不会被调用
 - Kafka 生产逻辑是在各查询函数**内部**通过 `kafka.enabled` 进行二选一
 
-### 3.2 saveEvent 写入路径详解
+### 3.2 三种写入模式详解
 
-**核心文件：** `src/queries/sql/events/saveEvent.ts:65-276`
+| 模式 | 触发条件 | 执行路径 | 数据最终落点 |
+|-----|---------|----------|
+| **PRISMA 直写 | 未配置 CLICKHOUSE_URL | Prisma ORM → PostgreSQL/MySQL |
+| **ClickHouse 直写 | 配置 CLICKHOUSE_URL=true, kafka.enabled=false | clickhouse.insert() → 直接写入表 | ClickHouse 表 |
+| **ClickHouse + Kafka 异步入队 | 配置 CLICKHOUSE_URL, kafka.enabled=true | kafka.sendMessage() → Kafka topic | Kafka 队列（后续消费由外部实现） |
+
+### 3.3 saveEvent 写入路径详解
+
+**核心文件：** `src/queries/sql/events/saveEvent.ts:65-276
 
 ```typescript
 export async function saveEvent(args: SaveEventArgs) {
@@ -185,7 +194,7 @@ export async function saveEvent(args: SaveEventArgs) {
 }
 ```
 
-**ClickHouse 分支写入逻辑：
+**ClickHouse 分支写入逻辑：**
 
 ```typescript
 async function clickhouseQuery({ ... }: SaveEventArgs) {
@@ -205,9 +214,9 @@ async function clickhouseQuery({ ... }: SaveEventArgs) {
   // ✅ 关键：在 ClickHouse 分支内部按 kafka.enabled 二选一
   // [src/queries/sql/events/saveEvent.ts:259-263]
   if (kafka.enabled) {
-    await sendMessage('event', message);  // → Kafka 生产端
+    await sendMessage('event', message);  // → Kafka 异步入队
   } else {
-    await insert('website_event', [message]);  // → 直接写入 ClickHouse
+    await insert('website_event', [message]);  // → ClickHouse 直写
   }
 
   // 事件属性展开写入
@@ -217,18 +226,18 @@ async function clickhouseQuery({ ... }: SaveEventArgs) {
 }
 ```
 
-### 3.3 四类写入函数的统一模式
+### 3.4 四类写入函数的统一模式
 
 仓库中共有 4 个写入函数遵循相同的模式：
 
 | 函数 | 文件路径 | Kafka Topic |
 |-----|---------|-----------|
-| `saveEvent` | `src/queries/sql/events/saveEvent.ts:259 | `event` |
-| `saveEventData` | `src/queries/sql/events/saveEventData.ts:74 | `event_data` |
-| `saveSessionData` | `src/queries/sql/sessions/saveSessionData.ts:99 | `session_data` |
-| `saveRecording` | `src/queries/sql/replays/saveRecording.ts:78 | `session_replay` |
+| `saveEvent` | `src/queries/sql/events/saveEvent.ts:259` | `event` |
+| `saveEventData` | `src/queries/sql/events/saveEventData.ts:74` | `event_data` |
+| `saveSessionData` | `src/queries/sql/sessions/saveSessionData.ts:99` | `session_data` |
+| `saveRecording` | `src/queries/sql/replays/saveRecording.ts:78` | `session_replay` |
 
-**统一模式伪代码：
+**统一模式伪代码：**
 
 ```typescript
 async function clickhouseQuery(args) {
@@ -238,27 +247,30 @@ async function clickhouseQuery(args) {
   const message = transform(args);
 
   if (kafka.enabled) {
-    await sendMessage(topic, message);  // 发送到 Kafka
+    await sendMessage(topic, message);  // 发送到 Kafka 队列
   } else {
-    await insert(table, [message]);   // 直接写入 ClickHouse
+    await insert(table, [message]);   // 直接写入 ClickHouse 表
   }
 }
 ```
 
-### 3.4 Kafka 边界与风险
+### 3.5 写入模式下的可证事实与边界
 
 **✅ 仓内可证事实：**
-1. **仅包含 Kafka 生产端实现 [src/lib/kafka.ts]
+
+1. **仅包含 Kafka 生产端实现** [src/lib/kafka.ts]
 2. **支持 SASL 认证**（plain/scram-sha-256/scram-sha-512）
 3. **4 个 topic：`event`, `event_data`, `session_data`, `session_replay`
 4. **消息格式：** JSON 序列化
 
 **⚠️ 外部依赖 / 仓内不可证：**
+
 1. **Kafka Consumer / Worker 实现**：仓内未包含，需外部实现消费逻辑
-2. **数据可靠性：** Kafka → ClickHouse 的同步逻辑完全不在本仓内
-3. **消息丢失风险：** Kafka 开启后，数据能否最终写入 ClickHouse 依赖外部消费端的正确性
-4. **Exactly-Once 语义：** 消费端的去重/幂等逻辑仓内不可见
-5. **批量写入优化：** 消费端的批量插入、重试机制仓内不可见
+2. **数据可靠性**：Kafka → ClickHouse 的同步逻辑完全不在本仓内
+3. **消息丢失风险**：Kafka 开启后，数据能否最终写入 ClickHouse 依赖外部消费端的正确性
+4. **Exactly-Once 语义**：消费端的去重/幂等逻辑仓内不可见
+5. **批量写入优化**：消费端的批量插入、重试机制仓内不可见
+6. **消费失败处理**：消费失败的重试策略仓内不可见
 
 ---
 
@@ -444,7 +456,7 @@ GROUP BY website_id, session_id, visit_id, hostname,
          country, region, city, event_type, distinct_id, timestamp;
 ```
 
-**⚠️ **外部依赖说明：**
+**⚠️ 外部依赖说明：**
 - 物化视图是 ClickHouse 内置功能
 - 聚合逻辑在 ClickHouse 服务端执行
 - 聚合正确性依赖 ClickHouse 版本和配置
@@ -518,17 +530,17 @@ function getFilterQuery(filters, options) {
   const orClauses: string[] = [];
   const andClauses: string[] = [];
 
-  filtersObjectToArray(filters, options).forEach(({ name, column, operator }) => {
+  filtersObjectToArray(filters, options).forEach(({ name, column, operator, paramName }) => {
     if (column) {
       // eventType 始终是 AND 条件
       const isAlwaysAnd = name === 'eventType' || (isCohort && name === cohortActionName);
 
       if (isAlwaysAnd) {
-        andClauses.push(`and ${mapFilter(column, operator, name, type)}`);
+        andClauses.push(`and ${mapFilter(column, operator, name, name === 'eventType' ? 'UInt32' : 'String', paramName)}`);
       } else if (isOr) {
-        orClauses.push(mapFilter(column, operator, name, 'String'));
+        orClauses.push(mapFilter(column, operator, name, 'String', paramName));
       } else {
-        andClauses.push(`and ${mapFilter(column, operator, name, 'String')}`);
+        andClauses.push(`and ${mapFilter(column, operator, name, 'String', paramName)}`);
       }
 
       // 来源过滤隐含条件：排除本站域名
@@ -552,27 +564,34 @@ function getFilterQuery(filters, options) {
 
 #### 6.1.3 过滤操作符映射
 
-**核心文件：** `src/lib/clickhouse.ts:69-99`
+**核心文件：** `src/lib/clickhouse.ts:73-99`
 
 ```typescript
-function mapFilter(column, operator, name, type = 'String') {
+function mapFilter(
+  column: string,
+  operator: string,
+  name: string,
+  type: string = 'String',
+  paramName?: string,
+) {
+  const param = paramName ?? name;
+  const value = `{${param}:${type}}`;
+
   switch (operator) {
     case OPERATORS.equals:
-      return `${column} IN {${name}:Array(${type})}`;
-
+      return `${column} IN {${param}:Array(${type})}`;
     case OPERATORS.notEquals:
-      return `${column} NOT IN {${name}:Array(${type})}`;
-
+      return `${column} NOT IN {${param}:Array(${type})}`;
     case OPERATORS.contains:
-      return `positionCaseInsensitive(${column}, {${name}:String}) > 0`;
-
+      return `positionCaseInsensitive(${column}, ${value}) > 0`;
     case OPERATORS.doesNotContain:
-      return `positionCaseInsensitive(${column}, {${name}:String}) = 0`;
-
+      return `positionCaseInsensitive(${column}, ${value}) = 0`;
     case OPERATORS.regex:
-      return `match(${column}, concat('(?i)', {${name}:String}))`;
-
-    // ... 其他操作符
+      return `match(${column}, concat('(?i)', ${value}))`;
+    case OPERATORS.notRegex:
+      return `not match(${column}, concat('(?i)', ${value}))`;
+    default:
+      return '';
   }
 }
 ```
@@ -739,7 +758,7 @@ WHERE event_type = 2;  -- 仅自定义事件
 
 ---
 
-## 8. Prisma 与 ClickHouse 职责分配
+## 8. Prisma 与 ClickHouse 职责划分
 
 ### 8.1 核心分工矩阵
 
@@ -750,7 +769,7 @@ WHERE event_type = 2;  -- 仅自定义事件
 | **网站配置** | ✅ 网站基础信息、域名、重置设置 | ❌ |
 | **共享链接** | ✅ 共享 token、权限、过期时间 | ❌ |
 | **报表/看板** | ✅ 报表定义、看板配置、图表布局 | ❌ |
-| **事件数据存储** | ⚠️（仅小数据量） | ✅ 原始事件、属性、会话 |
+| **事件数据存储** | ⚠️（仅小数据量，回退模式） | ✅ 原始事件、属性、会话 |
 | **实时查询** | ❌（性能不足） | ✅ 毫秒级聚合查询 |
 | **漏斗分析** | ❌ | ✅ 多步骤会话漏斗 |
 | **留存分析** | ❌ | ✅ 用户留存计算 |
@@ -764,7 +783,7 @@ WHERE event_type = 2;  -- 仅自定义事件
 
 ```typescript
 export function runQuery(queries: any) {
-  // 优先使用 ClickHouse（如配置了 CLICKHOUSE_URL）
+  // 配置了 CLICKHOUSE_URL → 仅走 CLICKHOUSE 分支
   if (process.env.CLICKHOUSE_URL) {
     if (queries[KAFKA]) {
       return queries[KAFKA]();   // Kafka 分支（仓内无函数使用）
@@ -780,11 +799,11 @@ export function runQuery(queries: any) {
 }
 ```
 
-### 8.3 双写一致性保证
+### 8.3 写入路由的可证事实与边界
 
 **✅ 仓内可证事实：**
 
-1. **写入路径分离**：
+1. **写入路径三择一**：
    - 配置类数据 → 仅写 Prisma
    - 事件类数据 → 仅写 ClickHouse（或 Kafka）
 
@@ -798,7 +817,27 @@ export function runQuery(queries: any) {
 
 **⚠️ 外部依赖 / 风险：**
 - Kafka 开启后，事件数据从生产到消费到 ClickHouse 的延迟不可控
-- 双写模式下无分布式事务保证，极端情况可能数据不一致
+- 双模式下无分布式事务保证，极端情况可能数据不一致
+
+---
+
+## 9. 结论-证据矩阵
+
+| 结论分类 | 具体结论 | 证据文件路径 | 证据是否仓内可证 | 剩余不确定性 |
+|---------|---------|-----------|-----------------|-------------|
+| **写入路由** | runQuery 是三择一单路由机制 | `src/lib/db.ts:22-36` | ✅ 是 | 无 |
+| **写入路由** | 三种写入模式：PRISMA 直写、ClickHouse 直写、ClickHouse+Kafka 异步入队 | `src/lib/db.ts:22-36`, `src/queries/sql/events/saveEvent.ts:259-263` | ✅ 是 | 消费端逻辑外部实现 |
+| **写入路由** | KAFKA 分支在仓内所有写入函数中均未被调用 | 所有 src/queries/sql/events/saveEvent.ts` | ✅ 是 | 无 |
+| **写入路由** | Kafka 仅实现生产端，无消费端/Worker | `src/lib/kafka.ts` | ✅ 是 | 消费端实现需外部 |
+| **事件属性展开** | JSON 对象递归展开为键值对 | `src/lib/data.ts:4-25` | ✅ 是 | 无 |
+| **事件属性展开** | 支持 5 种数据类型映射 | `src/lib/constants.ts:129-135` | ✅ 是 | 无 |
+| **事件属性展开** | event_data 表按 website_id, event_id, data_key 排序 | `db/clickhouse/schema.sql` | ✅ 是 | 无 |
+| **过滤拼接** | 支持 21 个过滤字段映射 | `src/lib/constants.ts:72-97` | ✅ 是 | 无 |
+| **过滤拼接** | 支持 AND/OR 组合，6 种操作符 | `src/lib/clickhouse.ts:73-99` | ✅ 是 | 无 |
+| **过滤拼接** | referrer 过滤隐含排除本站域名条件 | `src/lib/clickhouse.ts:125-127` | ✅ 是 | 无 |
+| **高基数字段成本** | 8 个高基数字段识别 | `db/clickhouse/schema.sql` | ✅ 是 | 实际基数依赖真实数据 |
+| **高基数字段成本** | LowCardinality 编码仅用于低基数字段 | `db/clickhouse/schema.sql` | ✅ 是 | 无 |
+| **高基数字段成本** | 投影索引仅覆盖 url_path 和 referrer_domain | `db/clickhouse/schema.sql` | ✅ 是 | 无 |
 
 ---
 
@@ -833,7 +872,7 @@ export function runQuery(queries: any) {
 3. **物化视图加速**：小时级预聚合，无过滤查询毫秒级返回
 4. **投影索引优化**：针对高频过滤维度创建排序投影
 5. **LowCardinality 编码**：低基数维度存储优化
-6. **Kafka 异步写入**：支持高吞吐场景下的缓冲
+6. **Kafka 异步入队**：支持高吞吐场景下的缓冲（需外部消费端）
 
 ### 权衡与取舍
 
