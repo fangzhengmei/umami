@@ -176,14 +176,14 @@ export async function runQuery(queries: any) {
 ### 3.2 三种写入模式详解
 
 | 模式 | 触发条件 | 执行路径 | 数据最终落点 |
-|-----|---------|----------|
-| **PRISMA 直写 | 未配置 CLICKHOUSE_URL | Prisma ORM → PostgreSQL/MySQL |
-| **ClickHouse 直写 | 配置 CLICKHOUSE_URL=true, kafka.enabled=false | clickhouse.insert() → 直接写入表 | ClickHouse 表 |
-| **ClickHouse + Kafka 异步入队 | 配置 CLICKHOUSE_URL, kafka.enabled=true | kafka.sendMessage() → Kafka topic | Kafka 队列（后续消费由外部实现） |
+|-----|---------|----------|-------------|
+| **PRISMA 直写** | 未配置 CLICKHOUSE_URL | Prisma ORM → PostgreSQL/MySQL | PostgreSQL/MySQL |
+| **ClickHouse 直写** | 配置 CLICKHOUSE_URL, kafka.enabled=false | clickhouse.insert() → 直接写入表 | ClickHouse 表 |
+| **ClickHouse + Kafka 异步入队** | 配置 CLICKHOUSE_URL, kafka.enabled=true | kafka.sendMessage() → Kafka topic | Kafka 队列（后续消费由外部实现） |
 
 ### 3.3 saveEvent 写入路径详解
 
-**核心文件：** `src/queries/sql/events/saveEvent.ts:65-276
+**核心文件：** `src/queries/sql/events/saveEvent.ts:65-276`
 
 ```typescript
 export async function saveEvent(args: SaveEventArgs) {
