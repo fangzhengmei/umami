@@ -192,11 +192,14 @@ const sessionSalt = getSalt(saltRotation, createdAt);
 
 #### 3.3.3 隐私保护效果
 
-| 场景 | 效果 |
-|-----|------|
-| 同一用户同一天内访问 | sessionId 相同，可识别为同一访客 |
-| 同一用户跨天访问 | Salt 轮换，产生不同 sessionId，无法跨天追踪 |
-| 同一用户跨月访问 | 完全不同 sessionId，匿名化程度最高 |
+| 轮换配置 | 场景 | 效果 |
+|---------|-----|------|
+| `day` | 同一用户同一天内访问 | sessionId 相同，可识别为同一访客 |
+| `day` | 同一用户跨天访问 | Salt 变更，产生不同 sessionId，无法跨天追踪 |
+| `week` | 同一用户同一周内访问 | sessionId 相同，可识别为同一访客；周起始日由 date-fns 库默认行为决定 |
+| `week` | 同一用户跨周访问 | Salt 变更，产生不同 sessionId，无法跨周追踪 |
+| `month` | 同一用户同一月内访问 | sessionId 相同，可识别为同一访客 |
+| `month` | 同一用户跨月访问 | Salt 变更，产生不同 sessionId，匿名化程度最高 |
 
 ---
 
@@ -538,7 +541,7 @@ export function RealtimeHeader({ data }) {
 | **时间窗口** | 5 分钟 | 30 分钟 |
 | **刷新频率** | 60 秒 | 10 秒 |
 | **输出格式** | 单一数值 `{ visitors: 42 }` | 完整对象 `{ totals: { visitors: 156, ... }, series, countries, ... }` |
-| **事件范围** | 所有事件类型（含自定义事件） | 排除 `event_type=2,5`（仅页面浏览类） |
+| **事件范围** | 所有事件类型（无过滤） | `event_type NOT IN (2,5)`，排除自定义事件和性能事件，保留 pageView、linkEvent、pixelEvent |
 | **去重方式** | `COUNT(DISTINCT session_id)` | 30 分钟内 session 聚合求和 |
 | **典型场景** | 快速了解当前人气 | 深入分析实时流量分布 |
 
