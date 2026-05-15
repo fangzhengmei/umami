@@ -663,8 +663,68 @@ const handleConfirm = async () => {
 
 | 删除方式 | UI 位置 | 使用者 | 适用场景 |
 |---------|---------|--------|---------|
-| **成员表删除按钮** | 成员表操作列每行的垃圾桶图标 | Admin、teamOwner、teamManager | 管理成员，移除其他人 |
-| **TeamLeaveButton** | 页面顶部标题栏，独立按钮 | 非 Owner 且非 Admin 的成员 | 主动离开，用户自删 |
+| **成员表删除按钮** | 成员表操作列每行的垃圾桶图标 | Admin、teamOwner、teamManager | 管理成员，移除其他人；**teamManager 也可用于自删** |
+| **TeamLeaveButton** | 页面顶部标题栏，独立按钮 | 非 Owner 且非 Admin 的成员（teamManager、teamMember、teamViewOnly） | 主动离开，用户自删（语义化退出） |
+
+> **关键发现**：`teamManager` 角色同时拥有两条自删除路径！
+> - 在成员表中，自己的行显示 "Remove" 按钮（因为不是 teamOwner）
+> - 在页面顶部，同时显示独立的 "Leave" 按钮（因为不是 teamOwner 也不是 Admin）
+> - 两者最终调用同一个 DELETE API，但语义和位置不同
+
+### 6.4.1 两条自删除路径详细对比
+
+#### 路径一：成员表删除按钮自删
+
+**触发条件**（同时满足）：
+1. `canEdit = true` → 用户角色为 Admin、teamOwner、teamManager 之一
+2. `row.role !== ROLES.teamOwner` → 目标行不是团队所有者
+
+**适用角色**：
+- Admin：可通过成员表删除任何人（包括自己，但不推荐）
+- teamOwner：可通过成员表删除非 Owner 成员（包括 Manager/Member），但不能删自己（自己的行不显示按钮）
+- **teamManager**：可通过成员表删除非 Owner 成员，**包括自己那一行也显示删除按钮** → 可用于自删
+
+**UI 表现**：
+- 图标：垃圾桶 (Trash)
+- 按钮文本：Remove
+- 确认消息："Confirm removal of {userName}?"
+- 位置：成员表操作列内联按钮
+
+---
+
+#### 路径二：TeamLeaveButton 独立按钮自删
+
+**触发条件**（同时满足）：
+1. `!isTeamOwner` → 当前用户不是团队所有者
+2. `!user.isAdmin` → 当前用户不是系统管理员
+
+**适用角色**：
+- **teamManager**：显示 Leave 按钮（非 Owner 非 Admin）
+- teamMember：显示 Leave 按钮
+- teamViewOnly：显示 Leave 按钮
+
+**UI 表现**：
+- 图标：登出 (LogOut)
+- 按钮文本：Leave
+- 确认消息："Confirm leaving {teamName}?"
+- 位置：页面顶部标题栏，与成员表分离
+
+---
+
+#### 两条路径差异总结
+
+| 对比维度 | 成员表删除按钮自删 | TeamLeaveButton 自删 |
+|---------|-------------------|----------------------|
+| **语义** | "Remove" - 移除操作，管理语义 | "Leave" - 离开操作，退出语义 |
+| **触发条件** | `canEdit=true` + 非 Owner 行 | `!isTeamOwner && !isAdmin` |
+| **适用角色** | Admin、teamManager（Owner 不能自删） | teamManager、teamMember、teamViewOnly |
+| **API 调用** | DELETE `/teams/{teamId}/users/{userId}` | DELETE `/teams/{teamId}/users/{userId}`（相同 API） |
+| **UI 位置** | 成员表操作列，每行内联 | 页面顶部，独立于表格 |
+| **确认文案** | "Confirm removal of {userName}" | "Confirm leaving {teamName}" |
+| **成功后跳转** | 无跳转，刷新成员列表 | 跳转至 `/settings/teams` 页面 |
+| **刷新 key** | `touch('teams:members')` | `touch('teams:members')` + `touch('teams')` |
+
+> **特别注意 teamManager 角色**：由于 `canEdit=true`（是 Manager）且 `!isTeamOwner`（不是 Owner），**teamManager 同时看到两条自删路径**！既可以在成员表中点击自己行的 "Remove" 按钮，也可以点击页面顶部的 "Leave" 按钮。两者功能相同，但语义不同。
 
 ### 6.5 三类操作通用时序图
 
