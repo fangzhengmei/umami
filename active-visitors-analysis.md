@@ -1,186 +1,235 @@
-# 在线访客数计算流程分析报告
+# 在线访客指标计算流程分析报告
 
 ## 一、概述
 
-本报告详细梳理了 Umami 网站分析系统中「当前在线访客数」指标从前端事件采集到后端数据存储、计算，最终在前端展示的完整技术流程。
+本报告详细梳理 Umami 网站分析系统中**两类在线访客指标**的完整计算流程，包括：
+1. **页面头部在线人数** - 各页面右上角显示的实时在线用户数
+2. **实时页访客统计** - 「实时」标签页中显示的访客统计数据
 
-## 二、完整流程架构
-
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  前端 Tracker   │────▶│  API 收集层    │────▶│  数据存储层    │────▶│  数据查询层    │
-│  (事件采集)    │     │  (/api/send)   │     │  (数据库)      │     │  (SQL 查询)    │
-└─────────────────┘     └─────────────────┘     └─────────────────┘     └─────────────────┘
-                                                              │
-                                                              ▼
-                                                    ┌─────────────────┐
-                                                    │  API 展示层    │
-                                                    │  (/active)     │
-                                                    └─────────────────┘
-                                                              │
-                                                              ▼
-                                                    ┌─────────────────┐
-                                                    │  前端展示层    │
-                                                    │  (React 组件)  │
-                                                    └─────────────────┘
-```
+本文档将从前端事件采集、后端数据存储、计算逻辑、API 接口到前端展示的完整链路进行深入分析。
 
 ---
 
-## 三、详细流程分解
+## 二、指标概览对比
 
-### 3.1 第一阶段：事件采集 (Frontend Tracker)
+| 维度 | 页面头部在线人数 | 实时页访客统计 |
+|------|----------------|--------------|
+| **展示位置** | 所有网站分析页面的右上角 | 「实时」标签页顶部指标栏 |
+| **对应组件** | `ActiveUsers.tsx` | `RealtimeHeader.tsx` |
+| **API 接口** | `/api/websites/{websiteId}/active` | `/api/realtime/{websiteId}` |
+| **核心查询** | `getActiveVisitors()` | `getRealtimeData()` |
+| **时间窗口** | 5 分钟 | 30 分钟 |
+| **前端刷新频率** | 60 秒 | 10 秒 |
+| **统计粒度** | 单一数值 | 含时间序列的多维度统计 |
 
-#### 3.1.1 Tracker 脚本
-- **位置**: 嵌入在被监控网站的页面中
-- **功能**: 自动采集页面浏览事件和自定义事件
+---
 
-#### 3.1.2 采集的数据字段
+## 三、第一阶段：事件采集与 Session 生成
+
+### 3.1 Tracker 事件采集
+
+**核心文件**: `src/tracker/index.d.ts`
+
+**采集属性**:
 ```typescript
 interface TrackedProperties {
   hostname: string;      // 网站域名
   language: string;      // 浏览器语言
-  referrer: string;      // 页面来源
+  referrer: string;      // 来源页面
   screen: string;        // 屏幕分辨率
   title: string;         // 页面标题
   url: string;           // 页面路径
-  website: string;       // 网站 ID (必需)
+  website: string;       // 网站 ID（必需）
 }
 ```
 
-#### 3.1.3 触发时机
-1. 页面加载完成时自动触发 pageview 事件
-2. 通过 `umami.track()` 手动触发自定义事件
-3. 支持传递自定义事件数据 `EventData`
+**事件类型**:
+- `pageView` (type=1): 页面浏览
+- `customEvent` (type=2): 自定义事件（支持 `name` + `data`）
+- `identify` (type 特殊): 用户识别（传入 `id` 即 distinctId）
 
 ---
 
-### 3.2 第二阶段：API 收集层 (`/api/send`)
+### 3.2 SessionId 生成分支逻辑
 
-#### 3.2.1 核心文件
-- **路径**: `src/app/api/send/route.ts`
+**核心文件**: `src/app/api/send/route.ts` + `src/lib/crypto.ts`
 
-#### 3.2.2 处理流程
+#### 3.2.1 生成流程图
 
-**步骤 1: 请求验证与解析**
-- 解析请求体，验证 schema
-- 提取 `type` (event/identify/performance) 和 `payload`
-- 验证网站存在性
-
-**步骤 2: 客户端信息检测**
-```typescript
-// 从请求中提取
-const { ip, userAgent, device, browser, os, country, region, city } = await getClientInfo(request, payload);
+```
+                    传入请求参数
+                        │
+                        ▼
+              ┌──────────────────────┐
+              │   是否有 distinct_id? │
+              │    (payload.id)       │
+              └──────────┬───────────┘
+                         │
+           ┌─────────────┴─────────────┐
+           │ 有                         │ 无
+           ▼                            ▼
+    ┌───────────────┐          ┌─────────────────┐
+    │ uuid(         │          │ uuid(           │
+    │   websiteId,  │          │   websiteId,    │
+    │   id          │          │   ip,           │
+    │ )             │          │   userAgent,    │
+    └───────┬───────┘          │   sessionSalt   │
+            │                  └────────┬────────┘
+            ▼                           ▼
+    ┌─────────────────────────────────────────────┐
+    │            最终 sessionId                    │
+    │  v5(hash(...args, secret()), v5.DNS)        │
+    └─────────────────────────────────────────────┘
 ```
 
-**步骤 3: 机器人检测**
+#### 3.2.2 分支一：Distinct ID 优先模式
+
+**触发条件**: 当 tracker 调用时传入了 `id` 参数
+```javascript
+// 前端调用示例
+umami.identify('user-123');
+// 或
+umami.track({ website: 'xxx', id: 'user-123' });
+```
+
+**生成算法**:
 ```typescript
-if (!process.env.DISABLE_BOT_CHECK && isbot(userAgent)) {
-  return json({ beep: 'boop' }); // 不记录机器人访问
+// src/app/api/send/route.ts:147
+const sessionId = uuid(sourceId, id);
+```
+
+**特点**:
+- 基于 `websiteId + 用户自定义 id` 生成
+- 跨设备、跨网络可识别同一用户
+- 适用于登录态用户追踪
+
+#### 3.2.3 分支二：匿名访客模式
+
+**触发条件**: 未传入 `id` 参数（默认情况）
+
+**生成算法**:
+```typescript
+// src/app/api/send/route.ts:147
+const sessionId = uuid(sourceId, ip, userAgent, sessionSalt);
+```
+
+**输入因子**:
+1. `sourceId`: 网站 ID (websiteId / linkId / pixelId)
+2. `ip`: 客户端 IP 地址
+3. `userAgent`: 浏览器 User-Agent 字符串
+4. `sessionSalt`: 轮换 Salt 保护隐私
+
+#### 3.2.4 UUID 生成内核
+
+**核心文件**: `src/lib/crypto.ts:60-66`
+
+```typescript
+export function uuid(...args: any) {
+  if (args.length) {
+    // 确定性 UUID v5：相同输入产生相同输出
+    return v5(hash(...args, secret()), v5.DNS);
+  }
+
+  // 随机 UUID v4 或 v7
+  return process.env.USE_UUIDV7 ? v7() : v4();
+}
+
+export function hash(...args: string[]) {
+  return crypto.createHash('sha512').update(args.join('')).digest('hex');
 }
 ```
 
-**步骤 4: IP 黑名单检查**
-```typescript
-if (hasBlockedIp(ip)) {
-  return forbidden();
-}
-```
-
-**步骤 5: Session 生成**
-```typescript
-// 基于 IP + UserAgent + Salt 生成唯一 sessionId
-const sessionId = id ? uuid(sourceId, id) : uuid(sourceId, ip, userAgent, sessionSalt);
-```
-
-**步骤 6: Visit 过期处理**
-```typescript
-// Visit 30 分钟过期
-const VISIT_EXPIRE_TIME = 1800; // 秒
-if (!timestamp && now - iat > VISIT_EXPIRE_TIME) {
-  visitId = uuid(sessionId, visitSalt); // 重新生成 visitId
-  iat = now;
-}
-```
-
-**步骤 7: 事件分类处理**
-| 事件类型 | 说明 | eventType 值 |
-|---------|------|-------------|
-| pageView | 页面浏览 | 1 |
-| customEvent | 自定义事件 | 2 |
-| linkEvent | 链接事件 | 3 |
-| pixelEvent | Pixel 事件 | 4 |
-| performance | 性能指标 | 5 |
-
-**步骤 8: 保存事件**
-```typescript
-await saveEvent({
-  websiteId: sourceId,
-  sessionId,
-  visitId,
-  eventType,
-  createdAt,
-  // ... 其他字段
-});
-```
-
-**步骤 9: 返回缓存 Token**
-```typescript
-const token = createToken({ websiteId, sessionId, visitId, iat }, secret());
-return json({ cache: token, sessionId, visitId });
-```
+**关键点**:
+- 使用 **UUID v5**（确定性哈希）保证相同输入产生相同 sessionId
+- 哈希算法: SHA-512
+- 混入系统 `secret()` 防止逆向工程
 
 ---
 
-### 3.3 第三阶段：数据存储层
+### 3.3 Salt 轮换配置
 
-#### 3.3.1 核心文件
-- **路径**: `src/queries/sql/events/saveEvent.ts`
+**核心文件**: `src/lib/crypto.ts:72-78`
 
-#### 3.3.2 双数据库支持
-系统同时支持关系型数据库 (MySQL/PostgreSQL) 和 ClickHouse 列式数据库。
+#### 3.3.1 轮换算法
 
-**关系型数据库存储 (Prisma)**
+```typescript
+export function getSalt(saltRotation: string, createdAt: Date): string {
+  return hash(
+    (saltRotation === 'day' 
+      ? startOfDay 
+      : saltRotation === 'week' 
+        ? startOfWeek 
+        : startOfMonth)(createdAt).toUTCString()
+  );
+}
+```
+
+#### 3.3.2 配置选项
+
+通过环境变量 `SALT_ROTATION` 配置：
+
+| 配置值 | 轮换频率 | 说明 |
+|-------|---------|------|
+| `day` | 每天 | Salt 每日 UTC 0 点刷新 |
+| `week` | 每周 | Salt 每周一 UTC 0 点刷新 |
+| `month` | 每月 | **默认**，每月 1 日 UTC 0 点刷新 |
+
+**代码引用**:
+```typescript
+// src/app/api/send/route.ts:143
+const saltRotation = process.env.SALT_ROTATION || 'month';
+const sessionSalt = getSalt(saltRotation, createdAt);
+```
+
+#### 3.3.3 隐私保护效果
+
+| 场景 | 效果 |
+|-----|------|
+| 同一用户同一天内访问 | sessionId 相同，可识别为同一访客 |
+| 同一用户跨天访问 | Salt 轮换，产生不同 sessionId，无法跨天追踪 |
+| 同一用户跨月访问 | 完全不同 sessionId，匿名化程度最高 |
+
+---
+
+## 四、第二阶段：数据存储
+
+**核心文件**: `src/queries/sql/events/saveEvent.ts`
+
+### 4.1 双数据库架构
+
+#### 4.1.1 关系型数据库 (PostgreSQL/MySQL)
+
 ```typescript
 await prisma.client.websiteEvent.create({
   data: {
-    id: websiteEventId,         // UUID
+    id: websiteEventId,         // 事件 UUID
     websiteId,                  // 网站 ID
-    sessionId,                  // 会话 ID (访客唯一标识)
+    sessionId,                  // ← 访客唯一标识（关键）
     visitId,                    // 访问 ID
     urlPath,                    // URL 路径
-    urlQuery,                   // URL 查询参数
-    referrerPath,               // 来源路径
-    referrerQuery,              // 来源查询参数
-    referrerDomain,             // 来源域名
-    pageTitle,                  // 页面标题
     eventType,                  // 事件类型
     eventName,                  // 事件名称
-    createdAt,                  // 创建时间
+    distinctId,                 // 用户自定义 ID（如有）
+    createdAt,                  // 事件时间
     // ... 其他字段
   },
 });
 ```
 
-**ClickHouse 存储 (高性能分析)**
+#### 4.1.2 ClickHouse 列式存储
+
 ```typescript
 const message = {
   website_id: websiteId,
-  session_id: sessionId,       // 关键：用于访客去重
+  session_id: sessionId,       // ← 访客唯一标识（关键）
   visit_id: visitId,
-  event_id: eventId,
-  country,
-  region,
-  city,
-  url_path: urlPath,
+  event_name: eventName,
+  distinct_id: distinctId,     // 用户自定义 ID
   created_at: getUTCString(createdAt),
-  browser,
-  os,
-  device,
   // ... 其他字段
 };
 
-// 可选：Kafka 消息队列
+// 可选 Kafka 缓冲
 if (kafka.enabled) {
   await sendMessage('event', message);
 } else {
@@ -188,120 +237,64 @@ if (kafka.enabled) {
 }
 ```
 
-#### 3.3.3 关键数据模型
-**website_event 表核心字段**:
-| 字段 | 类型 | 说明 |
+### 4.2 关键字段说明
+
+| 字段 | 说明 | 用途 |
 |------|------|------|
-| session_id | VARCHAR(36) | **访客唯一标识，用于在线访客统计** |
-| website_id | VARCHAR(36) | 网站 ID |
-| created_at | DATETIME | 事件发生时间 |
-| event_type | INT | 事件类型 |
+| `session_id` | 会话唯一标识 | **核心**，用于访客去重统计 |
+| `distinct_id` | 用户自定义 ID | identify 调用时传入，优先级更高 |
+| `created_at` | 事件时间戳 | 时间窗口过滤 |
+| `website_id` | 网站 ID | 数据隔离 |
 
 ---
 
-### 3.4 第四阶段：在线访客数计算
+## 五、第三阶段：两类指标计算逻辑
 
-#### 3.4.1 核心文件
-- **路径**: `src/queries/sql/getActiveVisitors.ts`
+### 5.1 指标一：页面头部在线人数
 
-#### 3.4.2 计算逻辑
+**核心文件**: `src/queries/sql/getActiveVisitors.ts`
 
-**时间窗口定义**
+#### 5.1.1 计算逻辑
+
+**时间窗口定义**:
 ```typescript
-// 在线访客的定义：过去 5 分钟内有活动的访客
+// 过去 5 分钟内有任何事件的访客
 const ACTIVE_WINDOW_MINUTES = 5;
 const startDate = subMinutes(new Date(), ACTIVE_WINDOW_MINUTES);
 ```
 
-**SQL 查询核心**
+**SQL 查询**:
 ```sql
--- 关系型数据库 (MySQL/PostgreSQL)
+-- PostgreSQL/MySQL
 SELECT COUNT(DISTINCT session_id) AS visitors
 FROM website_event
-WHERE website_id = ?
-  AND created_at >= ?
+WHERE website_id = {{websiteId}}
+  AND created_at >= {{startDate}}
 
 -- ClickHouse
 SELECT COUNT(DISTINCT session_id) AS visitors
 FROM website_event
-WHERE website_id = ?
-  AND created_at >= ?
+WHERE website_id = {websiteId:UUID}
+  AND created_at >= {startDate:DateTime64}
 ```
 
-**关键技术点**:
-1. 使用 `COUNT(DISTINCT session_id)` 进行访客去重
-2. 时间窗口过滤：只统计过去 5 分钟内的事件
-3. 按 website_id 隔离不同网站的数据
+#### 5.1.2 API 接口
 
-#### 3.4.3 两种数据库实现
+**路径**: `src/app/api/websites/[websiteId]/active/route.ts`
 
-**Prisma (关系型)**
 ```typescript
-async function relationalQuery(websiteId: string) {
-  const { rawQuery } = prisma;
-  const startDate = subMinutes(new Date(), 5);
-
-  const result = await rawQuery(
-    `
-    select count(distinct session_id) as "visitors"
-    from website_event
-    where website_id = {{websiteId::uuid}}
-    and created_at >= {{startDate}}
-    `,
-    { websiteId, startDate },
-    'getActiveVisitors',
-  );
-
-  return result?.[0] ?? null;
-}
-```
-
-**ClickHouse (列式)**
-```typescript
-async function clickhouseQuery(websiteId: string): Promise<{ x: number }> {
-  const { rawQuery } = clickhouse;
-  const startDate = subMinutes(new Date(), 5);
-
-  const result = await rawQuery(
-    `
-    select
-      count(distinct session_id) as "visitors"
-    from website_event
-    where website_id = {websiteId:UUID}
-      and created_at >= {startDate:DateTime64}
-    `,
-    { websiteId, startDate },
-    'getActiveVisitors',
-  );
-
-  return result[0] ?? null;
-}
-```
-
----
-
-### 3.5 第五阶段：API 展示层
-
-#### 3.5.1 获取在线访客数 API
-
-**核心文件**: `src/app/api/websites/[websiteId]/active/route.ts`
-
-**请求处理流程**:
-```typescript
-export async function GET(request: Request, { params }) {
-  // 1. 解析请求，验证权限
+export async function GET(request, { params }) {
   const { auth, error } = await parseRequest(request);
   const { websiteId } = await params;
 
-  // 2. 权限检查
+  // 权限校验
   if (!(await canViewWebsite(auth, websiteId))) {
     return unauthorized();
   }
 
-  // 3. 查询在线访客数
+  // 调用计算逻辑
   const visitors = await getActiveVisitors(websiteId);
 
-  // 4. 返回结果
   return json(visitors);
 }
 ```
@@ -313,14 +306,18 @@ export async function GET(request: Request, { params }) {
 }
 ```
 
-#### 3.5.2 实时数据 API (补充)
+---
 
-**核心文件**: `src/app/api/realtime/[websiteId]/route.ts`
+### 5.2 指标二：实时页访客统计
 
-**时间范围**:
+**核心文件**: `src/queries/sql/getRealtimeData.ts`
+
+#### 5.2.1 计算逻辑
+
+**时间窗口定义**:
 ```typescript
-// 实时数据统计过去 30 分钟
-const REALTIME_RANGE = 30; // 分钟
+// src/app/api/realtime/[websiteId]/route.ts:27
+const REALTIME_RANGE = 30;  // 过去 30 分钟
 
 const filters = await getQueryFilters(
   {
@@ -332,38 +329,166 @@ const filters = await getQueryFilters(
 );
 ```
 
----
-
-### 3.6 第六阶段：前端展示层
-
-#### 3.6.1 数据查询 Hook
-
-**核心文件**: `src/components/hooks/queries/useRealtimeQuery.ts`
-
+**多维度聚合逻辑**:
 ```typescript
-export function useRealtimeQuery(websiteId: string) {
-  const { get, useQuery } = useApi();
-  
-  // 每 10 秒自动刷新一次
-  const REALTIME_INTERVAL = 10000; // 10 秒
+export async function getRealtimeData(websiteId: string, filters: QueryFilters) {
+  // 并行查询三类数据
+  const [activity, pageviews, sessions] = await Promise.all([
+    getRealtimeActivity(websiteId, filters),  // 最近 100 条活动
+    getPageviewStats(websiteId, filters),     // 浏览量时间序列
+    getSessionStats(websiteId, filters),      // 访客数时间序列
+  ]);
 
-  const { data, isLoading, error } = useQuery<RealtimeData>({
-    queryKey: ['realtime', { websiteId }],
-    queryFn: async () => {
-      return get(`/realtime/${websiteId}`);
+  const uniques = new Set();  // 用于去重统计
+
+  const { countries, urls, referrers, events } = activity.reverse().reduce(
+    (obj, event) => {
+      const { sessionId, urlPath, referrerDomain, country } = event;
+
+      // 首次出现的会话计入国家统计
+      if (!uniques.has(sessionId)) {
+        uniques.add(sessionId);
+        increment(countries, country);
+      }
+
+      increment(urls, urlPath);
+      increment(referrers, referrerDomain);
+
+      return obj;
     },
-    enabled: !!websiteId,
-    refetchInterval: REALTIME_INTERVAL, // 自动轮询
-  });
+    { countries: {}, urls: {}, referrers: {}, events: [] }
+  );
 
-  return { data, isLoading, error };
+  return {
+    countries,    // 国家分布
+    urls,         // 页面分布
+    referrers,    // 来源分布
+    events,       // 事件日志
+    series: {     // 时间序列
+      views: pageviews,
+      visitors: sessions,
+    },
+    totals: {     // ← 顶部指标栏数值
+      views: pageviews.reduce((sum, { y }) => Number(sum) + Number(y), 0),
+      visitors: sessions.reduce((sum, { y }) => Number(sum) + Number(y), 0),
+      events: activity.filter(e => e.eventName).length,
+      countries: Object.keys(countries).length,
+    },
+    timestamp: Date.now(),
+  };
 }
 ```
 
-#### 3.6.2 展示组件
+#### 5.2.2 访客数时间序列计算
 
-**核心文件**: `src/app/(main)/websites/[websiteId]/realtime/RealtimeHeader.tsx`
+**核心文件**: `src/queries/sql/sessions/getSessionStats.ts`
 
+```sql
+-- ClickHouse 按分钟粒度聚合
+SELECT
+  ${getDateSQL('created_at', 'minute', timezone)} AS t,
+  uniq(session_id) AS y          -- uniq = ClickHouse 近似去重
+FROM website_event
+WHERE website_id = {websiteId}
+  AND created_at BETWEEN {startDate} AND {endDate}
+  AND event_type NOT IN (2, 5)   -- 排除自定义事件、性能事件
+GROUP BY t
+ORDER BY t
+```
+
+**要点**:
+- 排除 `event_type=2`（自定义事件）和 `event_type=5`（性能事件）
+- 只统计页面浏览类事件
+- 按分钟粒度聚合，用于绘制实时趋势图
+
+---
+
+## 六、第四阶段：前端展示层
+
+### 6.1 页面头部在线人数展示
+
+**组件**: `src/components/metrics/ActiveUsers.tsx`
+
+**调用链**:
+```
+WebsiteHeader.tsx
+    ↳ ActiveUsers.tsx
+        ↳ useActyiveUsersQuery()  ← 注意拼写（typo）
+            ↳ GET /api/websites/{websiteId}/active
+```
+
+**代码**:
+```typescript
+export function ActiveUsers({
+  websiteId,
+  value,
+  refetchInterval = 60000,  // ← 默认 60 秒刷新
+}: {
+  websiteId: string;
+  value?: number;
+  refetchInterval?: number;
+}) {
+  const { t, labels } = useMessages();
+  const { data } = useActyiveUsersQuery(websiteId, { refetchInterval });
+
+  const count = data?.visitors || 0;
+
+  if (count === 0) return null;
+
+  return (
+    <StatusLight variant="success">
+      <Text size="sm" weight="medium">
+        {count} {t(labels.online)}
+      </Text>
+    </StatusLight>
+  );
+}
+```
+
+**Hook 定义** (`src/components/hooks/queries/useActiveUsersQuery.ts`):
+```typescript
+export function useActyiveUsersQuery(websiteId: string, options?: ReactQueryOptions) {
+  const { get, useQuery } = useApi();
+  return useQuery({
+    queryKey: ['websites:active', websiteId],
+    queryFn: () => get(`/websites/${websiteId}/active`),
+    enabled: !!websiteId,
+    ...options,
+  });
+}
+```
+
+> ⚠️ **注意**: 函数名存在拼写错误 `useActyiveUsersQuery` (应为 `useActiveUsersQuery`)
+
+---
+
+### 6.2 实时页访客统计展示
+
+**组件**: `src/app/(main)/websites/[websiteId]/realtime/RealtimeHeader.tsx`
+
+**调用链**:
+```
+RealtimePage.tsx
+    ↳ useRealtimeQuery()
+        ↳ GET /api/realtime/{websiteId}
+            ↳ RealtimeHeader.tsx
+                ↳ MetricCard (views / visitors / events / countries)
+```
+
+**Hook 定义** (`src/components/hooks/queries/useRealtimeQuery.ts`):
+```typescript
+export function useRealtimeQuery(websiteId: string) {
+  const { get, useQuery } = useApi();
+  return useQuery({
+    queryKey: ['realtime', { websiteId }],
+    queryFn: async () => get(`/realtime/${websiteId}`),
+    enabled: !!websiteId,
+    refetchInterval: 10000,  // ← 10 秒自动刷新
+  });
+}
+```
+
+**展示组件**:
 ```typescript
 export function RealtimeHeader({ data }) {
   const { t, labels } = useMessages();
@@ -382,105 +507,143 @@ export function RealtimeHeader({ data }) {
 
 ---
 
-## 四、关键配置常量
+## 七、两类指标详细对比
 
-| 常量名称 | 值 | 说明 | 文件位置 |
-|---------|-----|------|---------|
-| `ACTIVE_WINDOW_MINUTES` | 5 | 在线访客时间窗口（分钟） | `getActiveVisitors.ts` |
-| `REALTIME_RANGE` | 30 | 实时数据统计范围（分钟） | `lib/constants.ts:32` |
-| `REALTIME_INTERVAL` | 10000 | 前端自动刷新间隔（毫秒） | `lib/constants.ts:33` |
-| `VISIT_EXPIRE_TIME` | 1800 | Visit 过期时间（秒） | `api/send/route.ts:172` |
-
----
-
-## 五、核心技术要点
-
-### 5.1 访客唯一性保证
-- **算法**: `UUID(websiteId + IP + UserAgent + Salt)`
-- **Salt 轮换**: 按月轮换 Salt 保护隐私
-- **优点**: 无需 Cookie，跨设备同一 IP 会被识别为同一访客
-
-### 5.2 在线状态定义
-- **定义**: 过去 5 分钟内有任何事件（页面浏览、自定义事件等）
-- **优点**: 实时性强，简单高效
-- **注意**: 用户关闭页面后最长 5 分钟后才会从在线统计中消失
-
-### 5.3 性能优化
-1. **ClickHouse 优化**: 列式存储，COUNT DISTINCT 性能优异
-2. **缓存机制**: 前端使用 React Query 缓存，每 10 秒刷新
-3. **索引优化**: `website_event` 表需对 `(website_id, created_at, session_id)` 建立联合索引
-
-### 5.4 隐私保护
-- 不使用 Cookie 追踪用户
-- Salt 轮换机制，无法长期追踪同一用户
-- 支持 IP 黑名单过滤
+| 对比维度 | 页面头部在线人数 | 实时页访客统计 |
+|---------|---------------|--------------|
+| **指标名称** | Active Users / 在线 | Visitors / 访客 |
+| **展示位置** | 所有页面右上角绿色圆点旁 | 实时页顶部指标栏 |
+| **API 路径** | `/api/websites/{id}/active` | `/api/realtime/{id}` |
+| **查询函数** | `getActiveVisitors()` | `getRealtimeData()` |
+| **时间窗口** | 5 分钟 | 30 分钟 |
+| **刷新频率** | 60 秒 | 10 秒 |
+| **输出格式** | 单一数值 `{ visitors: 42 }` | 完整对象 `{ totals: { visitors: 156, ... }, series, countries, ... }` |
+| **事件范围** | 所有事件类型（含自定义事件） | 排除 `event_type=2,5`（仅页面浏览类） |
+| **去重方式** | `COUNT(DISTINCT session_id)` | 30 分钟内 session 聚合求和 |
+| **典型场景** | 快速了解当前人气 | 深入分析实时流量分布 |
 
 ---
 
-## 六、数据流时序图
+## 八、完整数据流时序图
 
 ```
-  浏览器 (访客)          Umami Tracker      Umami Server        Database        仪表盘
-      │                    │                   │                  │              │
-      │  访问页面          │                   │                  │              │
-      │───────────────────▶│                   │                  │              │
-      │                    │  采集页面信息     │                  │              │
-      │                    │  hostname, url    │                  │              │
-      │                    │──────────────────▶│                  │              │
-      │                    │                   │  生成 sessionId  │              │
-      │                    │                   │  UUID(ip, ua)    │              │
-      │                    │                   │─────────────────▶│              │
-      │                    │                   │  INSERT event    │              │
-      │                    │                   │                  │              │
-      │                    │                   │◀─────────────────│              │
-      │                    │◀──────────────────│                  │              │
-      │                    │     cache token   │                  │              │
-      │                    │                   │                  │              │
-      │                    │                   │                  │              │
-      │                    │                   │  [10秒后]         │              │
-      │                    │                   │◀────────────────────────────────│
-      │                    │                   │  GET /realtime   │              │
-      │                    │                   │─────────────────▶│              │
-      │                    │                   │  COUNT(DISTINCT  │              │
-      │                    │                   │    session_id)    │              │
-      │                    │                   │  过去 5 分钟      │              │
-      │                    │                   │◀─────────────────│              │
-      │                    │                   │                  │              │
-      │◀────────────────────────────────────────────────────────────────────────│
-      │    { visitors: 42 }
+  访客浏览器             Umami 服务器             数据库           管理员仪表盘
+      │                      │                      │                 │
+      │ 访问网站             │                      │                 │
+      │─────────────────────▶│                      │                 │
+      │                      │  生成 sessionId      │                 │
+      │                      │  (见 3.2 分支)       │                 │
+      │                      │                      │                 │
+      │                      │  INSERT website_event│                 │
+      │                      │─────────────────────▶│                 │
+      │                      │                      │                 │
+      │                      │◀─────────────────────│                 │
+      │◀─────────────────────│                      │                 │
+      │   cache token         │                      │                 │
+      │                      │                      │                 │
+      │                      │                      │                 │
+      │ [ 页面头部在线人数查询 ]                       │                 │
+      │                      │                      │                 │
+      │                      │◀────────────────────────────────────────│
+      │                      │   GET /active (每 60 秒)               │
+      │                      │                      │                 │
+      │                      │  SELECT COUNT(DISTINCT session_id)     │
+      │                      │  WHERE created_at >= NOW() - 5min      │
+      │                      │─────────────────────▶│                 │
+      │                      │                      │                 │
+      │                      │◀─────────────────────│                 │
+      │                      │                      │                 │
+      │◀─────────────────────────────────────────────────────────────│
+      │   { visitors: 42 }   │                      │                 │
+      │   【 绿色圆点 + 42 online 】                                     │
+      │                      │                      │                 │
+      │                      │                      │                 │
+      │ [ 实时页访客统计查询 ]                       │                 │
+      │                      │                      │                 │
+      │                      │◀────────────────────────────────────────│
+      │                      │   GET /realtime (每 10 秒)             │
+      │                      │                      │                 │
+      │                      │  查询过去 30 分钟数据                   │
+      │                      │  ── activity (最近 100 条)              │
+      │                      │  ── pageviews (按分钟)                  │
+      │                      │  ── sessions (按分钟去重)               │
+      │                      │─────────────────────▶│                 │
+      │                      │                      │                 │
+      │                      │◀─────────────────────│                 │
+      │                      │                      │                 │
+      │                      │  聚合 totals.visitors                  │
+      │                      │                      │                 │
+      │◀─────────────────────────────────────────────────────────────│
+      │   { totals: { visitors: 156, ... } }                          │
+      │   【 指标栏：浏览量 892 | 访客 156 | 事件 231 | 国家 12 】    │
 ```
 
 ---
 
-## 七、总结
+## 九、核心配置常量汇总
 
-### 7.1 完整流程回顾
-1. **采集**: 页面加载 → Tracker 采集信息 → 发送 `/api/send`
-2. **处理**: 服务器验证 → 生成 sessionId → 识别用户
-3. **存储**: 写入 `website_event` 表，携带 session_id
-4. **计算**: 查询过去 5 分钟 → `COUNT(DISTINCT session_id)`
-5. **展示**: API 返回 → 前端每 10 秒刷新 → 展示在线访客数
+| 常量名 | 值 | 含义 | 所属文件 |
+|-------|-----|------|---------|
+| **时间窗口** | | | |
+| `ACTIVE_WINDOW_MINUTES` | 5 | 页面头部在线人数统计窗口（分钟） | `getActiveVisitors.ts` |
+| `REALTIME_RANGE` | 30 | 实时页统计时间范围（分钟） | `lib/constants.ts:32` |
+| **刷新频率** | | | |
+| `refetchInterval` (ActiveUsers) | 60000 | 页面头部在线人数刷新间隔（毫秒） | `ActiveUsers.tsx:8` |
+| `REALTIME_INTERVAL` | 10000 | 实时数据自动刷新间隔（毫秒） | `lib/constants.ts:33` |
+| **Salt 轮换** | | | |
+| `SALT_ROTATION` | 'month' | 默认 Salt 轮换周期（day/week/month） | `api/send/route.ts:143` |
+| **其他** | | | |
+| `VISIT_EXPIRE_TIME` | 1800 | Visit ID 过期时间（秒，30 分钟） | `api/send/route.ts:172` |
 
-### 7.2 核心指标定义
-| 指标 | 定义 | 计算方式 |
-|------|------|---------|
-| 在线访客数 | 过去 5 分钟内有活动的独立访客数 | `COUNT(DISTINCT session_id)` WHERE created_at >= NOW() - 5min |
-| 实时访客数 | 过去 30 分钟内的访客统计 | 同上述逻辑，时间窗口 30 分钟 |
+---
 
-### 7.3 关键设计决策
-1. **无 Cookie 设计**: 使用 IP + UserAgent + Salt 生成匿名标识
-2. **滑动时间窗口**: 5 分钟窗口保证实时性
-3. **双数据库架构**: 关系型数据库保证一致性，ClickHouse 保证性能
-4. **定时轮询**: 前端 10 秒刷新平衡实时性和服务器压力
+## 十、技术要点总结
+
+### 10.1 访客识别策略
+
+| 层级 | 优先级 | 识别方式 | 特点 |
+|-----|-------|---------|------|
+| L1 | 最高 | `distinct_id` | 用户自定义 ID，跨设备可追踪 |
+| L2 | 默认 | `session_id = hash(websiteId + ip + ua + salt)` | 匿名识别，按月轮换 |
+
+### 10.2 时间窗口设计哲学
+
+- **5 分钟（页面头部）**：定义「真正在线」，反映当前实时人气
+- **30 分钟（实时页）**：定义「最近活跃」，提供更完整趋势分析
+
+### 10.3 性能优化策略
+
+1. **双数据库路由**：关系型保证一致性，ClickHouse 保证大数据量查询性能
+2. **前端轮询频率差异化**：关键指标（实时页）10 秒一刷，辅助指标（头部）60 秒一刷
+3. **React Query 缓存**：避免重复请求，自动后台刷新
+
+### 10.4 隐私保护设计
+
+1. **无 Cookie 设计**：完全不依赖 Cookie，规避 GDPR 合规风险
+2. **Salt 轮换机制**：定期重置匿名标识，防止长期追踪
+3. **IP + UA 哈希**：单向散列，无法逆向还原原始信息
+
+---
+
+## 十一、代码索引
+
+| 功能模块 | 文件路径 |
+|---------|---------|
+| Session 生成 | `src/app/api/send/route.ts` |
+| UUID / Salt 算法 | `src/lib/crypto.ts` |
+| 事件存储 | `src/queries/sql/events/saveEvent.ts` |
+| 在线人数计算 | `src/queries/sql/getActiveVisitors.ts` |
+| 实时数据聚合 | `src/queries/sql/getRealtimeData.ts` |
+| 在线人数 API | `src/app/api/websites/[websiteId]/active/route.ts` |
+| 实时数据 API | `src/app/api/realtime/[websiteId]/route.ts` |
+| 头部在线组件 | `src/components/metrics/ActiveUsers.tsx` |
+| 实时指标栏 | `src/app/(main)/websites/[websiteId]/realtime/RealtimeHeader.tsx` |
+| 在线人数 Hook | `src/components/hooks/queries/useActiveUsersQuery.ts` |
+| 实时数据 Hook | `src/components/hooks/queries/useRealtimeQuery.ts` |
+| 常量定义 | `src/lib/constants.ts` |
 
 ---
 
 **报告生成时间**: 2026-05-15
 **分析版本**: Umami v2.x
-**代码路径参考**:
-- Tracker API: `src/tracker/index.d.ts`
-- 事件收集: `src/app/api/send/route.ts`
-- 事件保存: `src/queries/sql/events/saveEvent.ts`
-- 在线访客计算: `src/queries/sql/getActiveVisitors.ts`
-- 实时数据 API: `src/app/api/realtime/[websiteId]/route.ts`
-- 前端 Hook: `src/components/hooks/queries/useRealtimeQuery.ts`
+**作者**: Umami 技术架构组
