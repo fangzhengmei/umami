@@ -113,8 +113,8 @@ export const ROLES = {
 ```typescript
 export const ROLE_PERMISSIONS = {
   [ROLES.teamOwner]: [
-    PERMISSIONS.teamUpdate,
-    PERMISSIONS.teamDelete,
+    PERMISSIONS.teamUpdate,      // ✓ 可以更新团队
+    PERMISSIONS.teamDelete,      // ✓ 可以删除团队
     PERMISSIONS.websiteCreate,
     PERMISSIONS.websiteUpdate,
     PERMISSIONS.websiteDelete,
@@ -122,20 +122,27 @@ export const ROLE_PERMISSIONS = {
     PERMISSIONS.websiteTransferToUser,
   ],
   [ROLES.teamManager]: [
-    PERMISSIONS.teamUpdate,
+    PERMISSIONS.teamUpdate,      // ✓ 可以更新团队
     PERMISSIONS.websiteCreate,
     PERMISSIONS.websiteUpdate,
     PERMISSIONS.websiteDelete,
     PERMISSIONS.websiteTransferToTeam,
+    // 注意：teamManager 没有 teamDelete 权限
   ],
   [ROLES.teamMember]: [
     PERMISSIONS.websiteCreate,
     PERMISSIONS.websiteUpdate,
     PERMISSIONS.websiteDelete,
+    // 注意：teamMember 没有 teamUpdate 权限
   ],
   [ROLES.teamViewOnly]: [],
 } as const;
 ```
+
+**关键结论：**
+- `teamOwner` 和 `teamManager` 都有 `teamUpdate` 权限
+- 只有 `teamOwner` 有 `teamDelete` 权限
+- `teamMember` 和 `teamViewOnly` 都没有 `teamUpdate` 权限
 
 ### 2.3 Schema 验证 (`src/lib/schema.ts:88`)
 
@@ -143,7 +150,7 @@ export const ROLE_PERMISSIONS = {
 export const teamRoleParam = z.enum(['team-member', 'team-view-only', 'team-manager']);
 ```
 
-> **注意**: `teamOwner` 不在此枚举中，无法通过 API 直接设置，它是团队创建时默认分配的角色。
+> **注意**: `teamOwner` 不在此枚举中，无法通过 API 直接设置或修改，它是团队创建时默认分配的角色。
 
 ---
 
@@ -291,6 +298,8 @@ if (!(await canUpdateTeam(auth, teamId))) {
 }
 ```
 
+**注意**: `canUpdateTeam` 检查 `teamUpdate` 权限，只有 teamOwner 和 teamManager 有此权限。
+
 #### 业务逻辑
 
 ```typescript
@@ -325,6 +334,8 @@ if (!(await canUpdateTeam(auth, teamId))) {
 }
 ```
 
+**注意**: 编辑权限与添加权限相同，均检查 `teamUpdate` 权限。
+
 #### 业务逻辑
 
 ```typescript
@@ -343,13 +354,38 @@ const user = await updateTeamUser(teamUser.id, body);
 
 **文件位置**: `src/app/api/teams/[teamId]/users/[userId]/route.ts:60-85`
 
-#### 权限检查
+#### 权限检查 (`src/permissions/team.ts:58-74`)
 
 ```typescript
-if (!(await canDeleteTeamUser(auth, teamId, userId))) {
-  return unauthorized({ message: 'You must be the owner/manager of this team.' });
+export async function canDeleteTeamUser({ user }: Auth, teamId: string, removeUserId: string) {
+  if (!user) {
+    return false;
+  }
+
+  // 分支1：系统管理员 → 允许删除任何人
+  if (user.isAdmin) {
+    return true;
+  }
+
+  // 分支2：用户删除自己 → 允许离开团队（无需角色权限）
+  if (removeUserId === user.id) {
+    return true;
+  }
+
+  // 分支3：团队成员且有 teamUpdate 权限 → 允许删除他人
+  const teamUser = await getTeamUser(teamId, user.id);
+
+  return teamUser && hasPermission(teamUser.role, PERMISSIONS.teamUpdate);
 }
 ```
+
+**权限判定分支总结：**
+| 场景 | 条件 | 结果 | 说明 |
+|------|------|------|------|
+| 管理员删除 | `user.isAdmin === true` | ✓ 允许 | 系统管理员可删除任意成员 |
+| 用户自删除 | `removeUserId === user.id` | ✓ 允许 | 成员可随时离开团队，无需角色 |
+| 有管理权限删除 | 是团队成员 + 有 teamUpdate 权限 | ✓ 允许 | teamOwner/teamManager 可删他人 |
+| 无权限删除 | 普通成员删除他人 | ✗ 拒绝 | teamMember/teamViewOnly 不可删他人 |
 
 #### 业务逻辑
 
@@ -522,7 +558,9 @@ const handleSave = () => {
 
 ### 6.3 移除团队成员
 
-#### 触发点：`TeamMemberRemoveButton.tsx:22-30`
+#### 6.3.1 管理员/管理者移除成员
+
+**触发点**：`TeamMemberRemoveButton.tsx:22-30`
 
 ```typescript
 const handleConfirm = async (close: () => void) => {
@@ -536,10 +574,10 @@ const handleConfirm = async (close: () => void) => {
 };
 ```
 
-#### 完整链路：
+#### 完整链路（移除他人）：
 
 ```
-1. 点击成员行的 Remove 按钮
+1. 点击成员行的 Remove 按钮（仅 allowEdit=true 时显示）
    ↓
 2. 打开确认对话框
    ↓
@@ -547,21 +585,70 @@ const handleConfirm = async (close: () => void) => {
    ↓
 4. 调用 DELETE /api/teams/{teamId}/users/{userId}
    ↓
-5. API 成功返回
+5. API 权限检查：canDeleteTeamUser
+   ├─ 管理员：通过
+   ├─ teamOwner：通过（有 teamUpdate 权限）
+   └─ teamManager：通过（有 teamUpdate 权限）
    ↓
-6. 触发 onSuccess 回调
+6. API 成功返回
+   ↓
+7. 触发 onSuccess 回调
    ├─ touch('teams:members') → 更新 Zustand store
    ├─ 关闭对话框
    └─ 执行额外回调 onSave
    ↓
-7. useTeamMembersQuery 中的 modified 值变化
+8. useTeamMembersQuery 中的 modified 值变化
    ↓
-8. queryKey 变化，React Query 自动重新获取数据
+9. queryKey 变化，React Query 自动重新获取数据
    ↓
-9. GET /api/teams/{teamId}/users 获取最新成员列表
+10. GET /api/teams/{teamId}/users 获取最新成员列表
    ↓
-10. TeamMembersTable 重新渲染，被移除的成员消失
+11. TeamMembersTable 重新渲染，被移除的成员消失
 ```
+
+#### 6.3.2 用户主动离开团队（自删除）
+
+**触发点**：`TeamLeaveButton.tsx:13-16` → `TeamLeaveForm.tsx:21-29`
+
+```typescript
+// TeamLeaveForm.tsx
+const handleConfirm = async () => {
+  await mutateAsync(null, {
+    onSuccess: async () => {
+      touch('teams:members');
+      onSave();
+      onClose();
+    },
+  });
+};
+```
+
+**完整链路（自删除）：**
+
+```
+1. 用户不是 teamOwner 且不是 Admin → 页面顶部显示 "Leave" 按钮
+   ↓
+2. 点击 "Leave" 按钮
+   ↓
+3. 打开确认对话框（TeamLeaveForm）
+   ↓
+4. 点击确认离开
+   ↓
+5. 调用 DELETE /api/teams/{teamId}/users/{userId}
+   ↓
+6. API 权限检查：canDeleteTeamUser
+   └─ removeUserId === user.id → 通过（用户可删除自己，无需角色权限）
+   ↓
+7. API 成功返回
+   ↓
+8. 触发 onSuccess 回调
+   ├─ touch('teams:members') → 更新成员列表
+   ├─ touch('teams') → 更新团队列表
+   ├─ 关闭对话框
+   └─ 跳转到 /settings/teams 页面
+```
+
+> **重要发现**：用户自删除（离开团队）不需要任何团队角色权限，即便是 teamMember 或 teamViewOnly 角色的用户也可以随时通过独立的 "Leave" 按钮离开团队。
 
 ### 6.4 三类操作通用时序图
 
@@ -580,7 +667,7 @@ UI 操作      API 调用      成功回调     touch()    Zustand    React Quer
 
 ---
 
-## 七、前端数据获取与展示层
+## 七、前端展示层与权限控制
 
 ### 7.1 数据获取 Hook (`src/components/hooks/queries/useTeamMembersQuery.ts`)
 
@@ -598,11 +685,6 @@ export function useTeamMembersQuery(teamId: string) {
   });
 }
 ```
-
-**特性说明：**
-- 使用 `usePagedQuery` 封装分页查询
-- `modified` 作为 queryKey 一部分，变化时触发自动刷新
-- `enabled` 控制查询启用时机
 
 ### 7.2 分页查询封装 (`src/components/hooks/usePagedQuery.ts`)
 
@@ -629,20 +711,46 @@ export function usePagedQuery<TData = any, TError = Error>({
 
 ```
 TeamSettings
-    └── TeamMembersDataTable
-          ├── DataGrid (搜索、分页包装)
-          └── TeamMembersTable
-                ├── DataTable (基础表格)
-                ├── DataColumn (用户名)
-                ├── DataColumn (角色)
-                └── DataColumn (操作: 编辑 / 删除)
-                      ├── TeamMemberEditButton
-                      │   └── TeamMemberEditForm
-                      └── TeamMemberRemoveButton
-                          └── ConfirmationForm
+    ├── TeamLeaveButton (条件显示：非 Owner 且非 Admin)
+    │   └── TeamLeaveForm
+    ├── TeamMembersDataTable
+    │   ├── DataGrid (搜索、分页包装)
+    │   └── TeamMembersTable
+    │       ├── DataTable (基础表格)
+    │       ├── DataColumn (用户名)
+    │       ├── DataColumn (角色)
+    │       └── DataColumn (操作: 编辑 / 删除) [条件显示: allowEdit=true]
+    │           ├── TeamMemberEditButton (不显示给 teamOwner)
+    │           │   └── TeamMemberEditForm
+    │           └── TeamMemberRemoveButton (不显示给 teamOwner)
+    │               └── ConfirmationForm
+    └── TeamsMemberAddButton (仅 Admin 可见)
 ```
 
-### 7.4 TeamMembersDataTable (`src/app/(main)/teams/[teamId]/TeamMembersDataTable.tsx`)
+### 7.4 团队页面权限判断 (`src/app/(main)/teams/[teamId]/TeamSettings.tsx:21-31`)
+
+```typescript
+// 判断是否为团队所有者
+const isTeamOwner =
+  !!team?.members?.find(
+    ({ userId, role }) => role === ROLES.teamOwner && userId === user.id
+  ) && user.role !== ROLES.viewOnly;
+
+// 判断是否可编辑（决定操作按钮是否显示）
+const canEdit =
+  user.isAdmin ||
+  (!!team?.members?.find(
+    ({ userId, role }) =>
+      (role === ROLES.teamOwner || role === ROLES.teamManager) && userId === user.id
+  ) &&
+  user.role !== ROLES.viewOnly);
+```
+
+**UI 权限判断总结：**
+- `canEdit = true` → 显示编辑/删除按钮 → 需要是 Admin 或 teamOwner/teamManager
+- `!isTeamOwner && !isAdmin` → 显示 "Leave" 按钮 → 普通成员可主动离开
+
+### 7.5 TeamMembersDataTable (`src/app/(main)/teams/[teamId]/TeamMembersDataTable.tsx`)
 
 ```typescript
 export function TeamMembersDataTable({
@@ -662,62 +770,104 @@ export function TeamMembersDataTable({
 }
 ```
 
-**Props 说明：**
-- `teamId`: 团队 ID
-- `allowEdit`: 是否允许编辑操作
-
-### 7.5 TeamMembersTable (`src/app/(main)/teams/[teamId]/TeamMembersTable.tsx`)
-
-#### 角色本地化映射
+### 7.6 TeamMembersTable 中的权限限制 (`src/app/(main)/teams/[teamId]/TeamMembersTable.tsx`)
 
 ```typescript
-const roles = {
-  [ROLES.teamOwner]: t(labels.teamOwner),
-  [ROLES.teamManager]: t(labels.teamManager),
-  [ROLES.teamMember]: t(labels.teamMember),
-  [ROLES.teamViewOnly]: t(labels.viewOnly),
-};
+return (
+  <DataTable data={data}>
+    <DataColumn id="username" label={t(labels.username)}>
+      {(row: any) => row?.user?.username}
+    </DataColumn>
+    <DataColumn id="role" label={t(labels.role)}>
+      {(row: any) => roles[row?.role]}
+    </DataColumn>
+    {allowEdit && (                            // 外层权限：只有 canEdit=true 才显示操作列
+      <DataColumn id="action" align="end">
+        {(row: any) => {
+          if (row?.role === ROLES.teamOwner) {  // 内层权限：对 teamOwner 不显示操作按钮
+            return null;
+          }
+
+          return (
+            <Row alignItems="center" maxHeight="20px">
+              <TeamMemberEditButton teamId={teamId} userId={row?.user?.id} role={row?.role} />
+              <TeamMemberRemoveButton
+                teamId={teamId}
+                userId={row?.user?.id}
+                userName={row?.user?.username}
+              />
+            </Row>
+          );
+        }}
+      </DataColumn>
+    )}
+  </DataTable>
+);
 ```
 
-#### 表格列定义
-
-1. **用户名列** - 显示 `row.user.username`
-2. **角色列** - 显示本地化后的角色名称
-3. **操作列** (仅 `allowEdit=true` 时显示):
-   - TeamOwner 不显示操作按钮（受保护）
-   - 其他角色显示：编辑按钮 + 删除按钮
-
-#### 权限控制逻辑
-
-```typescript
-if (row?.role === ROLES.teamOwner) {
-  return null;  // 团队所有者不能被编辑/删除
-}
-```
-
-### 7.6 权限判断逻辑 (`src/app/(main)/teams/[teamId]/TeamSettings.tsx:21-31`)
-
-```typescript
-// 判断是否为团队所有者
-const isTeamOwner =
-  !!team?.members?.find(
-    ({ userId, role }) => role === ROLES.teamOwner && userId === user.id
-  ) && user.role !== ROLES.viewOnly;
-
-// 判断是否可编辑
-const canEdit =
-  user.isAdmin ||
-  (!!team?.members?.find(
-    ({ userId, role }) =>
-      (role === ROLES.teamOwner || role === ROLES.teamManager) && userId === user.id
-  ) && user.role !== ROLES.viewOnly);
-```
+**前端 UI 限制总结：**
+1. **外层限制**：`allowEdit=false` → 不显示操作列 → 普通成员看不到任何编辑/删除按钮
+2. **内层限制**：即便是 `allowEdit=true`，`teamOwner` 的行也不显示操作按钮
+3. **自删除例外**：自删除不通过成员列表中的删除按钮，而是通过页面顶部的独立 "Leave" 按钮
 
 ---
 
-## 八、完整数据链路总览
+## 八、前端限制与后端授权的差异分析
 
-### 8.1 数据流向图
+### 8.1 权限判定对照表
+
+| 操作场景 | 前端 UI 是否显示按钮 | 后端 API 实际权限 | 一致性 |
+|---------|---------------------|------------------|--------|
+| **管理员删除任意成员** | ✗ 不在成员列表中显示（Admin 路由单独处理） | ✓ 允许（`user.isAdmin === true`） | 特殊情况 |
+| **teamOwner 删除其他成员** | ✓ 显示（`canEdit=true` + 目标不是 owner） | ✓ 允许（有 `teamUpdate` 权限） | ✓ 一致 |
+| **teamOwner 删除其他 owner** | ✗ 不显示（内层限制：跳过 role=teamOwner 的行） | ✓ API 允许（但无 UI 入口） | ✗ 不一致 |
+| **teamManager 删除成员** | ✓ 显示 | ✓ 允许（有 `teamUpdate` 权限） | ✓ 一致 |
+| **teamMember 删除他人** | ✗ 不显示（`allowEdit=false`） | ✗ API 拒绝 | ✓ 一致 |
+| **用户删除自己（离开团队）** | ✗ 不通过成员列表按钮 | ✓ API 允许（自删除例外） | ✗ 不一致（通过独立 Leave 按钮） |
+
+### 8.2 关键差异详解
+
+#### 差异1：删除 teamOwner 的 UI 限制与 API 能力
+- **前端限制**：TeamMembersTable 中 `row?.role === ROLES.teamOwner` 时返回 null → 不显示编辑/删除按钮
+- **后端能力**：API 层面允许删除 teamOwner（只要调用者有 teamUpdate 权限，包括其他 owner）
+- **影响**：无法通过 UI 删除团队所有者，但理论上可通过直接调用 API 实现
+- **设计意图**：保护团队所有者不被误删除
+
+#### 差异2：用户自删除的 UI 入口与权限
+- **前端限制**：普通成员在成员列表中看不到 "Remove" 按钮（因为 `allowEdit=false`）
+- **后端能力**：API 允许用户删除自己（无需任何角色权限）
+- **处理方式**：通过页面顶部的独立 "Leave" 按钮实现，不与成员列表混在一起
+- **设计意图**：提供清晰的语义化操作，"Leave" 比 "Remove" 更符合用户心理模型
+
+#### 差异3：teamOwner 删除 teamOwner 的边界情况
+- **场景**：团队有多个 owner（虽然 UI 不支持设置，但数据库可能存在）
+- **前端行为**：内层限制跳过所有 teamOwner 行 → 任何 owner 都无法通过 UI 删除其他 owner
+- **后端行为**：canDeleteTeamUser 只检查 teamUpdate 权限 → 理论上一个 owner 可以通过 API 删除另一个 owner
+- **实际影响**：低风险，因为 UI 不支持创建多个 owner
+
+### 8.3 结论与建议
+
+**结论：**
+1. 整体权限设计是一致且合理的
+2. 前端做了更保守的限制（尤其是对 teamOwner 的保护）
+3. 自删除机制通过独立 UI 入口实现，与成员管理操作在概念上分离
+4. 边界情况（多个 owner 互删）在数据库层理论可行，但在 UI 层面被有效屏蔽
+
+**设计合理性评价：**
+- ✅ 权限分层合理：Admin > teamOwner > teamManager > teamMember > teamViewOnly
+- ✅ 自删除机制正确：任何人都可以随时离开团队
+- ✅ UI 与 API 差异主要是为了更好的用户体验和操作安全
+- ✅ 没有严重的越权漏洞
+
+**潜在改进点：**
+- 后端可以增加额外保护：禁止删除 teamOwner 角色的成员（除非是自删）
+- 后端可以限制：每个团队至少保留一个 teamOwner
+
+---
+
+## 九、完整数据链路总览
+
+### 9.1 数据流向图
 
 ```
 ┌─────────────────────────┐
@@ -742,6 +892,7 @@ const canEdit =
 │  └─ /[userId]           │
 │     ├─ POST: 编辑角色    │
 │     └─ DELETE: 移除成员  │
+│           └─ canDeleteTeamUser: 3 分支权限判定
 └────────────┬────────────┘
              │
              ▼
@@ -767,13 +918,18 @@ const canEdit =
 │  TeamMembersTable       │     表格渲染
 │  ├─ 用户名              │
 │  ├─ 角色                │
-│  └─ 操作按钮            │
+│  └─ 操作按钮 [canEdit]  │
 │     ├─ Edit Button      │
 │     └─ Remove Button    │
+│       [跳过 teamOwner]  │
+└─────────────────────────┘
+┌─────────────────────────┐
+│  TeamLeaveButton        │     自删除独立入口
+│  └─ [!isTeamOwner]      │
 └─────────────────────────┘
 ```
 
-### 8.2 数据转换过程
+### 9.2 数据转换过程
 
 **原始数据库记录 → API 返回 → 前端展示**
 
@@ -801,20 +957,31 @@ API 返回:
     username: "john@example.com"
   }
 }
-    ↓ (前端映射)
+    ↓ (前端映射 + canEdit 权限判断)
 表格展示:
-┌──────────────────────┬────────────┬──────────────────┐
-│ 用户名               │ 角色       │ 操作             │
-├──────────────────────┼────────────┼──────────────────┤
-│ john@example.com     │ 团队成员   │ [编辑] [删除]    │
-└──────────────────────┴────────────┴──────────────────┘
+┌──────────────────────┬────────────┬───────────────────────┐
+│ 用户名               │ 角色       │ 操作                  │
+├──────────────────────┼────────────┼───────────────────────┤
+│ owner@example.com    │ 团队所有者  │ (无按钮 - 受保护)     │
+├──────────────────────┼────────────┼───────────────────────┤
+│ manager@example.com  │ 团队管理员  │ [编辑] [删除]         │
+├──────────────────────┼────────────┼───────────────────────┤
+│ john@example.com     │ 团队成员    │ [编辑] [删除]         │
+│                      │            │ (Owner/Manager 可见)  │
+└──────────────────────┴────────────┴───────────────────────┘
+
+页面顶部:
+┌───────────────────────────────────────────────────────────┐
+│ [Team Name]                                        [Leave] │
+│                                         (非 Owner 用户可见)│
+└───────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 九、关键设计决策
+## 十、关键设计决策总结
 
-### 9.1 软删除处理
+### 10.1 软删除处理
 
 ```typescript
 where: {
@@ -825,7 +992,7 @@ where: {
 }
 ```
 
-### 9.2 搜索实现
+### 10.2 搜索实现
 
 ```typescript
 prisma.getSearchParameters(search, [{ user: { username: 'contains' } }])
@@ -834,7 +1001,7 @@ prisma.getSearchParameters(search, [{ user: { username: 'contains' } }])
 - 仅支持按用户名搜索
 - 使用 `contains` 模糊匹配
 
-### 9.3 排序策略
+### 10.3 排序策略
 
 ```typescript
 orderBy: {
@@ -842,13 +1009,13 @@ orderBy: {
 }
 ```
 
-### 9.4 团队所有者保护
+### 10.4 团队所有者保护
 
-1. **API Schema 层**: `teamOwner` 不在 `teamRoleParam` 枚举中，无法通过 API 设置或修改
-2. **UI 展示层**: `teamOwner` 的行不显示编辑/删除按钮
-3. **权限层**: 只有 Owner/Manager 才能执行修改操作
+1. **API Schema 层**：`teamOwner` 不在 `teamRoleParam` 枚举中，无法通过 API 设置或修改
+2. **UI 展示层**：`teamOwner` 的行不显示编辑/删除按钮
+3. **权限层**：只有 Owner/Manager 才能执行修改操作
 
-### 9.5 缓存刷新设计
+### 10.5 缓存刷新设计
 
 **设计优点：**
 - 声明式：组件只需要调用 `touch(key)`，无需关心具体刷新逻辑
@@ -863,24 +1030,28 @@ orderBy: {
 
 ---
 
-## 十、相关文件清单
+## 十一、相关文件清单
 
 | 文件路径 | 功能说明 |
 |---------|----------|
 | `prisma/schema.prisma:216-230` | TeamUser 表定义 |
 | `src/lib/constants.ts:164-217` | 角色与权限定义 |
 | `src/lib/schema.ts:88` | 团队角色参数验证 |
+| `src/lib/auth.ts:76-78` | hasPermission 权限检查函数 |
 | `src/queries/prisma/teamUser.ts` | 团队成员数据库查询 |
+| `src/permissions/team.ts` | 团队权限判定函数 |
 | `src/app/api/teams/[teamId]/users/route.ts` | 成员列表/新增 API |
 | `src/app/api/teams/[teamId]/users/[userId]/route.ts` | 成员编辑/删除 API |
 | `src/components/hooks/useModified.ts` | Zustand 缓存刷新机制 |
 | `src/components/hooks/queries/useTeamMembersQuery.ts` | 前端数据获取 Hook |
 | `src/components/hooks/usePagedQuery.ts` | 分页查询封装 |
 | `src/app/(main)/teams/[teamId]/TeamMembersDataTable.tsx` | 成员表格容器 |
-| `src/app/(main)/teams/[teamId]/TeamMembersTable.tsx` | 成员表格渲染 |
+| `src/app/(main)/teams/[teamId]/TeamMembersTable.tsx` | 成员表格渲染（含 UI 权限限制） |
 | `src/app/(main)/teams/TeamsMemberAddButton.tsx` | 新增成员按钮 |
 | `src/app/(main)/teams/TeamMemberAddForm.tsx` | 新增成员表单 |
 | `src/app/(main)/teams/[teamId]/TeamMemberEditButton.tsx` | 编辑成员按钮 |
 | `src/app/(main)/teams/[teamId]/TeamMemberEditForm.tsx` | 编辑成员表单 |
 | `src/app/(main)/teams/[teamId]/TeamMemberRemoveButton.tsx` | 删除成员按钮 |
-| `src/app/(main)/teams/[teamId]/TeamSettings.tsx` | 团队设置页面 |
+| `src/app/(main)/teams/TeamLeaveButton.tsx` | 离开团队按钮（自删除入口） |
+| `src/app/(main)/teams/TeamLeaveForm.tsx` | 离开团队表单 |
+| `src/app/(main)/teams/[teamId]/TeamSettings.tsx` | 团队设置页面（权限判断） |
