@@ -166,16 +166,25 @@ export function getSalt(saltRotation: string, createdAt: Date): string {
 
 #### 3.3.2 配置选项
 
-通过环境变量 `SALT_ROTATION` 配置：
+通过环境变量 `SALT_ROTATION` 配置，调用 `date-fns` 库的时间起点函数计算 Salt 值：
 
-| 配置值 | 轮换频率 | 说明 |
-|-------|---------|------|
-| `day` | 每天 | Salt 每日 UTC 0 点刷新 |
-| `week` | 每周 | Salt 每周一 UTC 0 点刷新 |
-| `month` | 每月 | **默认**，每月 1 日 UTC 0 点刷新 |
+| 配置值 | `date-fns` 调用 | 说明 |
+|-------|----------------|------|
+| `day` | `startOfDay()` | 按当日 00:00:00 UTC 为时间起点计算 Salt |
+| `week` | `startOfWeek()` | 按周起点为时间基准计算 Salt；**周起始日由外部 date-fns 库默认行为决定，本段代码中未显式指定周起始日配置** |
+| `month` | `startOfMonth()` | **默认值**，按当月 1 日 00:00:00 UTC 为时间起点计算 Salt |
 
 **代码引用**:
 ```typescript
+// src/lib/crypto.ts:72-78
+export function getSalt(saltRotation: string, createdAt: Date): string {
+  return hash(
+    (saltRotation === 'day' ? startOfDay : saltRotation === 'week' ? startOfWeek : startOfMonth)(
+      createdAt,
+    ).toUTCString(),
+  );
+}
+
 // src/app/api/send/route.ts:143
 const saltRotation = process.env.SALT_ROTATION || 'month';
 const sessionSalt = getSalt(saltRotation, createdAt);
