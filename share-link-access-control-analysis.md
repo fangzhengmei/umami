@@ -22,17 +22,51 @@
 
 因此，`Share` 负责持久化“共享配置”，而 Token 负责“访问时会话凭据”。
 
-## 2. 共享链接创建时 slug 的来源分支
+## 2. 共享链接短码（slug）的全链路来源分支
 
-### 2.1 网站共享创建：固定随机 slug
-`src/app/api/websites/[websiteId]/shares/route.ts` 的 POST 逻辑直接使用 `getRandomChars(16)`，此分支不接受自定义 slug。
+### 2.1 网站创建时写入共享短码（支持自定义）
+`src/app/api/websites/route.ts` 在创建网站时接收可选 `shareId`：
+- 若 `shareId` 存在，创建 share 记录并将 `slug: shareId`
+- 若 `shareId` 不存在，不创建对应 share 记录
 
-### 2.2 通用共享创建：可自定义 slug，否则回退随机
-`src/app/api/share/route.ts` 的 schema 中 `slug` 是可选项：
-- 传入 `slug`：使用调用方提供值
-- 未传 `slug`：回退 `getRandomChars(16)`
+权限门槛：`canCreateWebsite`（若创建到团队还需 `canCreateTeamWebsite`）。
 
-结论：并非所有共享创建都“只能随机 slug”，网站专用接口与通用接口行为不同。
+冲突处理：该路径未显式捕获 slug 唯一冲突，数据库唯一约束错误会直接冒泡。
+
+### 2.2 网站更新时写入共享短码（支持自定义 + 三分支）
+`src/app/api/websites/[websiteId]/route.ts` 的 `shareId` 分三种语义：
+- `shareId === null`：删除该网站关联 share（`deleteSharesByEntityId`）
+- `shareId` 为非空字符串：创建新 share，`slug: shareId`
+- `shareId === undefined`：保持现状，回读 `getShareByEntityId`
+
+权限门槛：`canUpdateWebsite`。
+
+冲突处理：显式捕获 `unique constraint` 并返回友好错误 `"That share ID is already taken."`。
+
+### 2.3 网站专用共享接口创建（固定随机）
+`src/app/api/websites/[websiteId]/shares/route.ts` 的 POST 逻辑固定 `getRandomChars(16)`：
+- 请求 schema 不含 `slug`
+- 该路径不支持自定义 slug
+
+权限门槛：`canUpdateWebsite`。
+
+### 2.4 通用共享创建接口（可自定义，缺省回退随机）
+`src/app/api/share/route.ts` 的 `slug` 为可选：
+- 传入 `slug`：按传入值写入
+- 未传 `slug`：`slug || getRandomChars(16)`
+
+权限门槛：`canUpdateEntity`。
+
+### 2.5 统一口径矩阵（避免片面结论）
+
+| 分支 | API | slug 策略 | 权限门槛 | 冲突处理 |
+| --- | --- | --- | --- | --- |
+| 网站创建 | `POST /api/websites` | `shareId` 自定义（可选） | `canCreateWebsite` / `canCreateTeamWebsite` | 无显式捕获 |
+| 网站更新 | `POST /api/websites/[websiteId]` | `shareId` 自定义 / 删除 / 保持 | `canUpdateWebsite` | 有显式捕获并返回友好错误 |
+| 网站专用共享 | `POST /api/websites/[websiteId]/shares` | 固定随机 16 位 | `canUpdateWebsite` | 无显式捕获 |
+| 通用共享 | `POST /api/share` | 自定义或随机回退 | `canUpdateEntity` | 无显式捕获 |
+
+结论：只有“网站专用共享接口”是固定随机；网站创建、网站更新、通用共享接口都存在自定义 slug 路径，因此“网站共享只能随机 slug”是片面结论。
 
 ## 3. 访客访问时的权限判定路径（含 board 展开）
 
@@ -90,6 +124,6 @@
 
 - Share 表持久化的是共享配置，不含 token。
 - token 是访问 `/api/share/[slug]` 时动态签发的会话凭据。
-- slug 来源存在“接口分支差异”：网站专用接口固定随机，通用接口支持自定义回退随机。
+- slug 来源存在明确分支差异：网站创建/更新与通用共享支持自定义，网站专用共享接口固定随机。
 - board share 通过 `websiteIds/pixelIds/linkIds` 展开参与 `canViewWebsite` 判定。
 - 前端 `parameters` 是导航限制，后端 `canViewWebsite` 才是数据放行边界。
