@@ -22,51 +22,68 @@
 
 因此，`Share` 负责持久化“共享配置”，而 Token 负责“访问时会话凭据”。
 
-## 2. 共享链接短码（slug）的全链路来源分支
+## 2. 共享链接短码（slug）的全链路来源分支（8 个写入口）
 
-### 2.1 网站创建时写入共享短码（支持自定义）
-`src/app/api/websites/route.ts` 在创建网站时接收可选 `shareId`：
-- 若 `shareId` 存在，创建 share 记录并将 `slug: shareId`
-- 若 `shareId` 不存在，不创建对应 share 记录
+### 2.1 Website 相关入口
 
-权限门槛：`canCreateWebsite`（若创建到团队还需 `canCreateTeamWebsite`）。
+1) `POST /api/websites`（`src/app/api/websites/route.ts`）  
+- `shareId` 可选；有值则 `slug: shareId` 创建 share，无值则不创建。  
+- 权限门槛：`canCreateWebsite`（团队场景还需 `canCreateTeamWebsite`）。  
+- 冲突处理：无显式捕获，唯一约束异常直接冒泡。
 
-冲突处理：该路径未显式捕获 slug 唯一冲突，数据库唯一约束错误会直接冒泡。
+2) `POST /api/websites/[websiteId]`（`src/app/api/websites/[websiteId]/route.ts`）  
+- `shareId` 三分支：`null` 删除、非空字符串创建并写入 `slug`、`undefined` 保持现状。  
+- 权限门槛：`canUpdateWebsite`。  
+- 冲突处理：显式捕获唯一约束，返回 `"That share ID is already taken."`。
 
-### 2.2 网站更新时写入共享短码（支持自定义 + 三分支）
-`src/app/api/websites/[websiteId]/route.ts` 的 `shareId` 分三种语义：
-- `shareId === null`：删除该网站关联 share（`deleteSharesByEntityId`）
-- `shareId` 为非空字符串：创建新 share，`slug: shareId`
-- `shareId === undefined`：保持现状，回读 `getShareByEntityId`
+3) `POST /api/websites/[websiteId]/shares`（`src/app/api/websites/[websiteId]/shares/route.ts`）  
+- 固定 `getRandomChars(16)`，该路径不接受自定义 slug。  
+- 权限门槛：`canUpdateWebsite`。  
+- 冲突处理：无显式捕获。
 
-权限门槛：`canUpdateWebsite`。
+### 2.2 Board / Pixel / Link 专用共享入口
 
-冲突处理：显式捕获 `unique constraint` 并返回友好错误 `"That share ID is already taken."`。
+4) `POST /api/boards/[boardId]/shares`（`src/app/api/boards/[boardId]/shares/route.ts`）  
+- 固定 `getRandomChars(16)`，`parameters` 默认 `{}`。  
+- 权限门槛：`canUpdateBoard`。  
+- 冲突处理：无显式捕获。
 
-### 2.3 网站专用共享接口创建（固定随机）
-`src/app/api/websites/[websiteId]/shares/route.ts` 的 POST 逻辑固定 `getRandomChars(16)`：
-- 请求 schema 不含 `slug`
-- 该路径不支持自定义 slug
+5) `POST /api/pixels/[pixelId]/shares`（`src/app/api/pixels/[pixelId]/shares/route.ts`）  
+- 固定 `getRandomChars(16)`，`parameters` 默认 `{}`。  
+- 权限门槛：`canUpdatePixel`。  
+- 冲突处理：无显式捕获。
 
-权限门槛：`canUpdateWebsite`。
+6) `POST /api/links/[linkId]/shares`（`src/app/api/links/[linkId]/shares/route.ts`）  
+- 固定 `getRandomChars(16)`，`parameters` 默认 `{}`。  
+- 权限门槛：`canUpdateLink`。  
+- 冲突处理：无显式捕获。
 
-### 2.4 通用共享创建接口（可自定义，缺省回退随机）
-`src/app/api/share/route.ts` 的 `slug` 为可选：
-- 传入 `slug`：按传入值写入
-- 未传 `slug`：`slug || getRandomChars(16)`
+### 2.3 通用入口与 Share ID 更新入口
 
-权限门槛：`canUpdateEntity`。
+7) `POST /api/share`（`src/app/api/share/route.ts`）  
+- `slug` 可选；传入即使用，未传则回退 `getRandomChars(16)`。  
+- 权限门槛：`canUpdateEntity`。  
+- 冲突处理：无显式捕获。
 
-### 2.5 统一口径矩阵（避免片面结论）
+8) `POST /api/share/id/[shareId]`（`src/app/api/share/id/[shareId]/route.ts`）  
+- `slug` 必填，支持直接修改已有 share 的 slug。  
+- 权限门槛：`canUpdateEntity`。  
+- 冲突处理：无显式捕获。
+
+### 2.4 全链路统一矩阵
 
 | 分支 | API | slug 策略 | 权限门槛 | 冲突处理 |
 | --- | --- | --- | --- | --- |
 | 网站创建 | `POST /api/websites` | `shareId` 自定义（可选） | `canCreateWebsite` / `canCreateTeamWebsite` | 无显式捕获 |
-| 网站更新 | `POST /api/websites/[websiteId]` | `shareId` 自定义 / 删除 / 保持 | `canUpdateWebsite` | 有显式捕获并返回友好错误 |
+| 网站更新 | `POST /api/websites/[websiteId]` | `shareId` 自定义 / 删除 / 保持 | `canUpdateWebsite` | 显式捕获并返回友好错误 |
 | 网站专用共享 | `POST /api/websites/[websiteId]/shares` | 固定随机 16 位 | `canUpdateWebsite` | 无显式捕获 |
+| Board 专用共享 | `POST /api/boards/[boardId]/shares` | 固定随机 16 位 | `canUpdateBoard` | 无显式捕获 |
+| Pixel 专用共享 | `POST /api/pixels/[pixelId]/shares` | 固定随机 16 位 | `canUpdatePixel` | 无显式捕获 |
+| Link 专用共享 | `POST /api/links/[linkId]/shares` | 固定随机 16 位 | `canUpdateLink` | 无显式捕获 |
 | 通用共享 | `POST /api/share` | 自定义或随机回退 | `canUpdateEntity` | 无显式捕获 |
+| Share ID 更新 | `POST /api/share/id/[shareId]` | 必填自定义（更新） | `canUpdateEntity` | 无显式捕获 |
 
-结论：只有“网站专用共享接口”是固定随机；网站创建、网站更新、通用共享接口都存在自定义 slug 路径，因此“网站共享只能随机 slug”是片面结论。
+结论：固定随机 slug 的入口不止网站专用共享，还包括 board/pixel/link 专用共享；支持自定义 slug 的入口包括网站创建、网站更新、通用共享与 share id 更新。
 
 ## 3. 访客访问时的权限判定路径（含 board 展开）
 
@@ -124,6 +141,6 @@
 
 - Share 表持久化的是共享配置，不含 token。
 - token 是访问 `/api/share/[slug]` 时动态签发的会话凭据。
-- slug 来源存在明确分支差异：网站创建/更新与通用共享支持自定义，网站专用共享接口固定随机。
+- slug 来源存在多入口分支差异：网站创建/更新、通用共享与 share id 更新支持自定义；网站/board/pixel/link 专用共享固定随机。
 - board share 通过 `websiteIds/pixelIds/linkIds` 展开参与 `canViewWebsite` 判定。
 - 前端 `parameters` 是导航限制，后端 `canViewWebsite` 才是数据放行边界。
