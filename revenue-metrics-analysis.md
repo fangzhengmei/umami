@@ -459,8 +459,8 @@ Session A 在 2024-01-01 10:00:05.123（毫秒级）同时触发了 2 个事件:
 
 | 场景 | 是否触发重复计算 | 说明 |
 |------|----------------|------|
-| 事件时间戳完全相同（PostgreSQL 同毫秒，ClickHouse 同秒） | ✅ 触发 | 精确匹配导致 JOIN 到多条记录 |
-| 事件时间戳相差 1 毫秒（PostgreSQL）或 1 秒（ClickHouse） | ❌ 不触发 | 时间戳不相等，只能 JOIN 到首事件 |
+| 首事件时间戳完全一致（PostgreSQL 精度为毫秒，ClickHouse 精度为秒） | ✅ 触发 | 精确匹配导致 JOIN 到多条记录 |
+| 事件时间戳存在差异（PostgreSQL 相差 1 毫秒以上，ClickHouse 相差 1 秒以上） | ❌ 不触发 | 时间戳不相等，只能 JOIN 到首事件 |
 | 同 session 不同 visit 的事件 | ❌ 不触发 | 首事件时间戳取整个 session 的最小值，不区分 visit |
 | 首事件本身是 custom event（带 revenue） | ✅ 可能触发 | 如果该时间戳还有其他事件，仍会重复 |
 | 首事件是 pageview，revenue 事件在之后时间戳 | ❌ 不触发 | 只有首事件时间戳会被 JOIN，后续 revenue 事件不会导致重复 |
