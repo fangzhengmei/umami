@@ -130,7 +130,8 @@ const result = await createSegment({
 
 **特点**：
 - 使用 `segmentParamSchema` 严格校验 `parameters` 的结构
-- 必须包含 `filters`、`match`、`dateRange`、`action` 等字段（虽然都是 optional，但结构必须正确）
+- `parameters` 字段本身**必填**（schema 无 `.optional()`），但内部 `filters`、`match`、`dateRange`、`action` 均为 `.optional()`
+- 允许传入空对象 `parameters: {}`，但不能省略 `parameters` 字段
 - 自动生成 UUID
 - 权限：`canUpdateWebsite`
 
