@@ -1,33 +1,90 @@
 # Umami Revenue 指标查询分析
 
+## 0. 完整数据流转链路
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              前端 (Revenue.tsx)                                 │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌──────────────────┐    │
+│  │ 货币选择器  │→│ 日期范围选择 │→│ 筛选条件配置 │→│ 触发查询请求     │    │
+│  └─────────────┘   └─────────────┘   └─────────────┘   └──────────────────┘    │
+│                                          ↓ (HTTP POST)                          │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                           ↓
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          API 路由 (route.ts)                                   │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. 权限校验 (canViewWebsite)                                             │   │
+│  │ 2. 日期处理 (setWebsiteDate)                                              │   │
+│  │ 3. 筛选解析 (getQueryFilters) → 生成 QueryFilters 对象                   │   │
+│  │ 4. 并行调用: getRevenue + getRevenueStats + getRevenueMetrics             │   │
+│  │ 5. 查询对比周期数据 (getRevenueStats 再次调用)                            │   │
+│  │ 6. 合并结果返回                                                           │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                           ↓
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        数据查询层 (四大核心查询)                                │
+│  ┌─────────────────┐  ┌──────────────────┐  ┌────────────────────┐             │
+│  │ getRevenue      │  │ getRevenueStats  │  │ getRevenueMetrics  │             │
+│  │ (图表数据)      │  │ (统计指标)       │  │ (维度分析)         │             │
+│  │ - 按事件+时间   │  │ - sum (总收入)   │  │ - country          │             │
+│  │   分组聚合      │  │ - count (订单数) │  │ - region           │             │
+│  │                 │  │ - AOV            │  │ - referrer         │             │
+│  │                 │  │ - Unique         │  │ - channel          │             │
+│  │                 │  │   Customers      │  │   (首次接触归因)   │             │
+│  │                 │  │ - ARPU           │  │                    │             │
+│  └─────────────────┘  └──────────────────┘  └────────────────────┘             │
+│                          ↓ 统一调用 parseFilters                                │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │ parseFilters 实际使用字段:                                                │   │
+│  │ ✓ queryParams     ✓ filterQuery     ✓ cohortQuery                         │   │
+│  │ ✓ joinSessionQuery  ✗ excludeBounceQuery  (⚠️ 未使用)                      │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                           ↓
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        双数据库适配层 (PostgreSQL / ClickHouse)                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │ PostgreSQL: 表名 revenue, 使用 ILIKE / COUNT(DISTINCT) / INNER JOIN      │   │
+│  │ ClickHouse: 表名 website_revenue, 使用 multiSearchAny / uniqExact         │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                           ↓
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              前端展示层                                        │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌──────────────────┐    │
+│  │ MetricsBar  │→│ RevenueChart│→│ ListTable    │→│ SessionsTable    │    │
+│  │ (5个指标卡) │   │ (趋势图)    │   │ (来源/位置) │   │ (客户列表)     │    │
+│  │ - Total     │   │             │   │ - referrer │   │                  │    │
+│  │ - AOV       │   │             │   │ - channel  │   │                  │    │
+│  │ - ARPU      │   │             │   │ - country  │   │                  │    │
+│  │ - Orders    │   │             │   │ - region   │   │                  │    │
+│  │ - Unique    │   │             │   │            │   │                  │    │
+│  │   Customers │   │             │   │            │   │                  │    │
+│  └─────────────┘   └─────────────┘   └─────────────┘   └──────────────────┘    │
+│                        ↓ (使用 formatLongCurrency 格式化)                        │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │ 货币格式化: Intl.NumberFormat + 自动缩写 (k/m/b)                           │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## 1. 系统架构概览
 
 ### 1.1 核心组件关系
 
-```
-前端 Revenue 页面 (Revenue.tsx)
-        ↓ (HTTP POST)
-API 路由 (route.ts)
-        ↓ (并行调用)
-┌─────────────────┬──────────────────┬────────────────────┐
-│ getRevenue      │ getRevenueStats  │ getRevenueMetrics  │
-│ (图表数据)      │ (统计指标)       │ (维度分析)         │
-└─────────────────┴──────────────────┴────────────────────┘
-        ↓
-双数据库适配层 (PostgreSQL / ClickHouse)
-```
-
-### 1.2 代码文件位置
-
-| 模块 | 文件路径 |
-|------|----------|
-| API 路由 | `src/app/api/reports/revenue/route.ts` |
-| 图表查询 | `src/queries/sql/reports/getRevenue.ts` |
-| 统计指标 | `src/queries/sql/reports/getRevenueStats.ts` |
-| 维度分析 | `src/queries/sql/reports/getRevenueMetrics.ts` |
-| 会话列表 | `src/queries/sql/reports/getRevenueSessions.ts` |
-| 数据写入 | `src/queries/sql/events/saveRevenue.ts` |
-| 前端页面 | `src/app/(main)/websites/[websiteId]/(reports)/revenue/Revenue.tsx` |
+| 模块 | 文件路径 | 主要职责 |
+|------|----------|---------|
+| API 路由 | `src/app/api/reports/revenue/route.ts` | 请求解析、权限校验、并行调用、结果合并 |
+| 图表查询 | `src/queries/sql/reports/getRevenue.ts` | 按事件和时间粒度聚合图表数据 |
+| 统计指标 | `src/queries/sql/reports/getRevenueStats.ts` | 计算总收入、订单数、AOV、ARPU 等 |
+| 维度分析 | `src/queries/sql/reports/getRevenueMetrics.ts` | 按国家/地区/来源/渠道分组分析 |
+| 会话列表 | `src/queries/sql/reports/getRevenueSessions.ts` | 查询有收入的会话详情列表 |
+| 数据写入 | `src/queries/sql/events/saveRevenue.ts` | 写入 revenue 事件数据 |
+| 前端页面 | `src/app/(main)/websites/[websiteId]/(reports)/revenue/Revenue.tsx` | 指标卡片、图表、列表展示 |
 
 ---
 
@@ -80,6 +137,7 @@ interface RevenuParameters {
 ```typescript
 interface QueryFilters extends DateParams, FilterParams, SortParams, PageParams, SegmentParams {
   cohortFilters?: QueryFilters;  // 同期群筛选
+  excludeBounce?: boolean;       // 排除跳出会话
 }
 ```
 
@@ -100,6 +158,7 @@ interface QueryFilters extends DateParams, FilterParams, SortParams, PageParams,
    ├─ dateQuery: 日期范围过滤
    ├─ filterQuery: 业务筛选条件
    ├─ cohortQuery: 同期群子查询
+   ├─ excludeBounceQuery: 排除跳出会话 (⚠️ 生成但 revenue 查询未使用)
    └─ queryParams: 预处理参数值
 ```
 
@@ -132,14 +191,43 @@ interface QueryFilters extends DateParams, FilterParams, SortParams, PageParams,
 
 ### 3.5 特殊筛选逻辑
 
-**同期群 (Cohort) 筛选:**
+#### 3.5.1 同期群 (Cohort) 筛选
 - 筛选条件前缀 `cohort_`
 - 生成子查询：找出在指定时间段内满足条件的 session_id
 - 主查询通过 JOIN 关联这些 session_id
 
-**排除跳出 (Exclude Bounce):**
-- 筛选条件 `excludeBounce: true`
-- 排除只有一个 pageview 的会话
+#### 3.5.2 排除跳出 (Exclude Bounce) - ⚠️ 纠错分析
+
+**excludeBounceQuery 生成逻辑** (`src/lib/prisma.ts:175-192`):
+```sql
+join (
+  select distinct session_id, visit_id
+  from website_event
+  where website_id = {{websiteId}}
+    and created_at between {{startDate}} and {{endDate}}
+    and event_type = 1  -- pageview
+  group by session_id, visit_id
+  having count(*) > 1  -- 至少 2 个 pageview
+) excludeBounce
+on excludeBounce.session_id = website_event.session_id
+  and excludeBounce.visit_id = website_event.visit_id
+```
+
+**⚠️ 实际生效范围分析：**
+
+| 查询函数 | 是否使用 excludeBounceQuery | 说明 |
+|---------|---------------------------|------|
+| getRevenue | ❌ 未使用 | 即使设置 `excludeBounce: true` 也不生效 |
+| getRevenueStats | ❌ 未使用 | 总收入、订单数等不受影响 |
+| getRevenueMetrics | ❌ 未使用 | 来源/渠道/国家/地区分析不受影响 |
+| getRevenueSessions | ❌ 未使用 | 客户列表不受影响 |
+| getPageviewStats | ✅ 使用 | 页面浏览统计正常排除 |
+| getSessionStats | ✅ 使用 | 会话统计正常排除 |
+| getChannelMetrics | ✅ 使用 | 渠道统计正常排除 |
+
+**结论：** `excludeBounce` 筛选在 revenue 统计链路中**完全不生效**。这是因为四个 revenue 查询在调用 `parseFilters()` 后，只解构使用了 `queryParams`、`filterQuery`、`cohortQuery`、`joinSessionQuery`，但没有使用 `excludeBounceQuery`。
+
+**影响范围：** 即使前端通过筛选器勾选了"排除跳出"，revenue 相关的所有指标（总收入、订单数、AOV、ARPU、来源分析、渠道分析等）仍然会包含只有一个 pageview 的会话数据。
 
 ---
 
@@ -262,7 +350,7 @@ interface RevenueMetricsResult {
 }
 ```
 
-##### 3.1 国家/地区维度
+##### 4.3.1 国家/地区维度
 
 **SQL 逻辑:**
 - JOIN `session` 表获取国家/地区信息
@@ -284,38 +372,91 @@ group by session.country
 order by value desc
 ```
 
-##### 3.2 来源/渠道维度
+##### 4.3.2 来源/渠道维度 - 首次接触归因
 
-**归因逻辑** (首次接触归因):
-1. 先按 session 汇总 revenue
-2. 找出每个 session 的首个事件时间 (`min(created_at)`)
-3. 关联首个事件的 referrer_domain、utm 参数等
-4. 按来源/渠道分组
+**归因逻辑** (`src/queries/sql/reports/getRevenueMetrics.ts:103-147`):
 
 ```sql
 WITH events AS (
+  -- Step 1: 按 session 汇总 revenue
   select
     revenue.website_id,
     revenue.session_id,
     sum(revenue.revenue) as "value"
   from revenue
+  where revenue.website_id = {{websiteId}}
+    and revenue.created_at between {{startDate}} and {{endDate}}
+    and upper(revenue.currency) = {{currency}}
   group by revenue.website_id, revenue.session_id
 ),
 revenue_data AS (
+  -- Step 2: 找到每个 session 的首个事件时间
   select
     e.website_id,
     e.session_id,
     e.value,
     we.min_date as created_at
   from events e
-  join (select session_id, min(created_at) as min_date
-        from website_event group by session_id) we
-  on we.session_id = e.session_id
+  join (
+    select session_id, min(created_at) as min_date
+    from website_event
+    where website_id = {{websiteId}}
+      and created_at between {{startDate}} and {{endDate}}
+    group by session_id
+  ) we on we.session_id = e.session_id
 )
--- 关联首个事件的 referrer/utm 信息进行分组
+-- Step 3: 关联首个事件的 referrer_domain 并分组
+select
+  we.referrer_domain as "name",
+  sum(revenue_data.value) as "value"
+from revenue_data
+join (
+  select website_id, session_id, referrer_domain, created_at
+  from website_event
+  where website_id = {{websiteId}}
+    and created_at between {{startDate}} and {{endDate}}
+) we
+on we.website_id = revenue_data.website_id
+  and we.session_id = revenue_data.session_id
+  and we.created_at = revenue_data.created_at  -- ⚠️ 同秒多事件问题
+group by we.referrer_domain
+order by value desc
 ```
 
-##### 3.3 渠道分类规则
+**⚠️ 同秒多事件问题分析：**
+
+**问题场景：** 同一个 session 在同一秒（`created_at` 精度到秒）触发了多个事件（例如 pageview + custom event 同时触发）。
+
+**问题本质：**
+- Step 2 中 `min(created_at)` 返回的是秒级时间戳
+- Step 3 中 `we.created_at = revenue_data.created_at` 会匹配到**同一秒的所有事件**
+- 导致 revenue 金额被**重复计算 N 次**（N = 同秒事件数）
+
+**示例演示：**
+```
+Session A 在 2024-01-01 10:00:05 同时触发了 2 个事件:
+  Event 1: pageview, referrer_domain = "google.com"
+  Event 2: custom event, referrer_domain = ""
+
+该 session 的 revenue = $100
+
+查询结果 (referrer 维度):
+  google.com: $100  (来自 Event 1)
+  "": $100          (来自 Event 2)
+  合计: $200        (实际应为 $100，被重复计算了 2 次)
+```
+
+**影响范围：**
+- ✅ `getRevenue()` 图表数据：**不受影响**（直接从 revenue 表聚合，不经过归因 join）
+- ✅ `getRevenueStats()` 统计指标：**不受影响**（直接从 revenue 表聚合）
+- ❌ `getRevenueMetrics()` 来源/渠道分析：**严重受影响**，金额可能被重复计算
+- ✅ `getRevenueMetrics()` 国家/地区分析：**不受影响**（从 session 表直接获取，不经过时间 join）
+
+**影响程度：** 取决于同秒多事件的发生频率。在高流量网站或 SPA 应用中，同一秒触发多个事件的情况较为常见。
+
+---
+
+##### 4.3.3 渠道分类规则
 
 **渠道判定优先级** (`src/queries/sql/reports/getRevenueMetrics.ts:207-219`):
 
@@ -381,6 +522,7 @@ and upper(revenue.currency) = {{currency}}
 
 - 使用 `upper()` 进行大小写不敏感匹配
 - 货币代码在查询参数中传递，需用户选择
+- **重要：** 不进行汇率转换，查询时必须选择数据上报时使用的货币
 
 ### 5.3 货币格式化
 
@@ -403,8 +545,8 @@ export function formatCurrency(value: number, currency: string, locale = 'en-US'
 ```
 
 **长数字格式化** `formatLongCurrency()` (`src/lib/format.ts:106-120`):
-| 数值范围 | 显示格式 |
-|---------|----------|
+| 数值范围 | 显示格式 (USD 示例) |
+|---------|-------------------|
 | >= 1,000,000,000 | `$1.2b` (十亿美元) |
 | >= 1,000,000 | `$1.2m` (百万美元) |
 | >= 1,000 | `$1.20k` (千美元) |
@@ -421,6 +563,7 @@ const [currency, setCurrency] = useState(
 
 - 优先级: 本地存储 > 环境变量 > 默认值 (USD)
 - 切换时保存到 localStorage
+- 货币切换会重新触发所有 revenue 查询
 
 ---
 
@@ -543,13 +686,36 @@ const metrics = useMemo(() => {
       change: comparison ? sum - comparison.sum : 0,
       formatValue: (n) => formatLongCurrency(n, currency),
     },
-    // ... 其他指标
+    {
+      value: average,
+      label: 'AOV',
+      change: comparison ? average - comparison.average : 0,
+      formatValue: (n) => formatLongCurrency(n, currency),
+    },
+    {
+      value: arpu,
+      label: 'ARPU',
+      change: comparison ? arpu - (comparison.arpu ?? 0) : 0,
+      formatValue: (n) => formatLongCurrency(n, currency),
+    },
+    {
+      value: count,
+      label: 'Orders',
+      change: comparison ? count - comparison.count : 0,
+      formatValue: formatLongNumber,
+    },
+    {
+      value: unique_count,
+      label: 'Unique Customers',
+      change: comparison ? unique_count - comparison.unique_count : 0,
+      formatValue: formatLongNumber,
+    },
   ];
 }, [data]);
 ```
 
 - 每个指标计算与对比周期的差值
-- 使用 `formatLongCurrency` 格式化金额
+- 金额类指标使用 `formatLongCurrency` 格式化
 - 非 "All Time" 范围显示变化值
 
 ### 7.3 图表展示
@@ -638,24 +804,28 @@ async function relationalQuery(data: SaveRevenueArgs) {
 
 ---
 
-## 10. 关键设计决策总结
+## 10. 关键设计决策与已知问题
 
 ### 10.1 归因模型
 - **首次接触归因**: 将 revenue 归因为用户会话的第一个事件来源
 - **实现方式**: 通过 `min(created_at)` 找到会话首个事件，关联其来源信息
+- **已知问题**: 同秒多事件会导致金额重复计算（详见 4.3.2 节）
 
 ### 10.2 货币处理
 - **单货币查询**: 每次查询只能选择一种货币，不进行汇率转换
 - **大小写不敏感**: 使用 `upper()` 匹配货币代码
 - **本地格式化**: 使用浏览器 `Intl.NumberFormat` 进行本地化显示
 
-### 10.3 性能优化
+### 10.3 筛选条件
+- **excludeBounce 不生效**: 在 revenue 查询中未使用 `excludeBounceQuery`（详见 3.5.2 节）
+- **通用筛选框架**: 统一的 `parseFilters` 机制，支持动态字段和操作符
+
+### 10.4 性能优化
 - **并行查询**: 三个主查询通过 `Promise.all` 并行执行
 - **可选 JOIN**: 仅当有筛选条件时才 JOIN website_event 表
 - **双数据库支持**: 同时支持 PostgreSQL 和 ClickHouse，可根据规模选择
 - **读副本**: 支持通过 `DATABASE_REPLICA_URL` 配置读副本
 
-### 10.4 扩展性
-- **筛选框架**: 统一的 `parseFilters` 机制，支持动态字段和操作符
+### 10.5 扩展性
 - **同期群支持**: 内置 cohort 筛选能力，支持复杂用户分群分析
 - **分段 (Segment)**: 支持保存的筛选条件，可复用和共享
