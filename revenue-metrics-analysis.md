@@ -423,18 +423,27 @@ group by we.referrer_domain
 order by value desc
 ```
 
-**⚠️ 同秒多事件问题分析：**
+**⚠️ 首事件时间戳一致问题分析：**
 
-**问题场景：** 同一个 session 在同一秒（`created_at` 精度到秒）触发了多个事件（例如 pageview + custom event 同时触发）。
+**时间精度确认：**
+| 数据库 | 字段定义 | 实际存储精度 | 说明 |
+|--------|---------|------------|------|
+| PostgreSQL | `@db.Timestamptz(6)` | 毫秒级 | 虽然定义为微秒级(6)，但 JavaScript `Date` 对象只有毫秒级精度 |
+| ClickHouse | `DateTime('UTC')` | 秒级 | ClickHouse DateTime 类型本身只精确到秒 |
+
+**问题场景：** 同一个 session 的多个事件拥有**完全相同的 `created_at` 时间戳**（PostgreSQL 精确到毫秒，ClickHouse 精确到秒）。常见触发情况：
+1. SPA 应用中 pageview 和 custom event 在同一事件循环中触发
+2. 页面加载时同时发送 pageview 和自定义事件
+3. 前端批量上报多个事件
 
 **问题本质：**
-- Step 2 中 `min(created_at)` 返回的是秒级时间戳
-- Step 3 中 `we.created_at = revenue_data.created_at` 会匹配到**同一秒的所有事件**
-- 导致 revenue 金额被**重复计算 N 次**（N = 同秒事件数）
+- Step 2 中 `min(created_at)` 返回首事件的时间戳
+- Step 3 中 `we.created_at = revenue_data.created_at` 会匹配到**所有与首事件时间戳完全一致的事件**
+- 导致 revenue 金额被**重复计算 N 次**（N = 与首事件时间戳相同的事件数量）
 
 **示例演示：**
 ```
-Session A 在 2024-01-01 10:00:05 同时触发了 2 个事件:
+Session A 在 2024-01-01 10:00:05.123（毫秒级）同时触发了 2 个事件:
   Event 1: pageview, referrer_domain = "google.com"
   Event 2: custom event, referrer_domain = ""
 
@@ -446,13 +455,33 @@ Session A 在 2024-01-01 10:00:05 同时触发了 2 个事件:
   合计: $200        (实际应为 $100，被重复计算了 2 次)
 ```
 
+**边界条件与触发判定：**
+
+| 场景 | 是否触发重复计算 | 说明 |
+|------|----------------|------|
+| 事件时间戳完全相同（PostgreSQL 同毫秒，ClickHouse 同秒） | ✅ 触发 | 精确匹配导致 JOIN 到多条记录 |
+| 事件时间戳相差 1 毫秒（PostgreSQL）或 1 秒（ClickHouse） | ❌ 不触发 | 时间戳不相等，只能 JOIN 到首事件 |
+| 同 session 不同 visit 的事件 | ❌ 不触发 | 首事件时间戳取整个 session 的最小值，不区分 visit |
+| 首事件本身是 custom event（带 revenue） | ✅ 可能触发 | 如果该时间戳还有其他事件，仍会重复 |
+| 首事件是 pageview，revenue 事件在之后时间戳 | ❌ 不触发 | 只有首事件时间戳会被 JOIN，后续 revenue 事件不会导致重复 |
+
 **影响范围：**
 - ✅ `getRevenue()` 图表数据：**不受影响**（直接从 revenue 表聚合，不经过归因 join）
 - ✅ `getRevenueStats()` 统计指标：**不受影响**（直接从 revenue 表聚合）
-- ❌ `getRevenueMetrics()` 来源/渠道分析：**严重受影响**，金额可能被重复计算
+- ❌ `getRevenueMetrics()` 来源/渠道分析：**受影响**，金额可能被重复计算
 - ✅ `getRevenueMetrics()` 国家/地区分析：**不受影响**（从 session 表直接获取，不经过时间 join）
 
-**影响程度：** 取决于同秒多事件的发生频率。在高流量网站或 SPA 应用中，同一秒触发多个事件的情况较为常见。
+**统计口径边界说明：**
+
+1. **来源/渠道金额可能大于总收入**：由于重复计算，来源/渠道各分组的金额之和可能大于 `total.sum`（总收入）。这是已知的统计口径差异，不是数据错误。
+
+2. **百分比计算失真**：前端 ListTable 中 `(value / total.sum) * 100` 的百分比计算，在存在重复计算时，各分组百分比之和可能超过 100%。
+
+3. **多 revenue 事件的会话**：如果一个 session 内有多个 revenue 事件（分布在不同时间戳），只有与**首个事件时间戳相同**的事件会导致重复，其他时间戳的 revenue 事件正常归因。
+
+4. **ClickHouse 受影响概率更高**：由于 ClickHouse 的 `DateTime` 只有秒级精度，同秒内的事件都会被视为时间戳相同，重复计算的概率显著高于 PostgreSQL（毫秒级精度）。
+
+**影响程度：** 取决于首事件时间戳冲突的发生频率。在高流量网站、SPA 应用或使用批量上报的场景中，同一时间戳触发多个事件的情况较为常见。
 
 ---
 
