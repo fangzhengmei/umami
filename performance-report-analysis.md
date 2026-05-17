@@ -439,6 +439,152 @@ queryKey: [
 
 ---
 
+#### 5.2.1 报表查询鉴权的完整双场景链路
+
+Performance 报表查询存在 **两条完全独立的鉴权链路**，分别服务于登录用户和分享链接访问者。两条链路共享相同的 queryKey 和缓存空间，但鉴权方式和权限校验逻辑完全不同。
+
+---
+
+##### 链路 A：登录场景 Authorization 鉴权
+
+**触发条件**：页面路径不以 `/share/` 开头（即用户已登录访问自有报表）
+
+**完整链路（生成 → 存储 → 使用 → 校验）**：
+
+```
+1. 登录成功
+   POST /api/auth/login
+   └─ 验证用户名密码
+      └─ Redis 启用：saveAuth({ userId, role }) → 生成 authKey → createSecureToken({ authKey })
+      └─ Redis 禁用：createSecureToken({ userId, role }, secret())
+         └─ 返回 token（AES-256-GCM 加密的 JWT）
+
+2. 客户端存储
+   setClientAuthToken(token) → localStorage.setItem('authToken', token)
+
+3. 报表查询触发
+   useResultQuery('performance', { websiteId, ... })
+   └─ useApi()
+      └─ getClientAuthToken() → 从 localStorage 读取 token
+         └─ 构建请求头：Authorization: Bearer <token>
+
+4. 后端鉴权校验
+   POST /api/reports/performance
+   └─ parseRequest(request, schema)  // 无 skipAuth
+      └─ checkAuth(request)
+         ├─ getBearerToken(request) → 从 Authorization 头提取 token
+         ├─ parseSecureToken(token, secret()) → AES-256-GCM 解密 + JWT 验证
+         ├─ Redis 启用：通过 authKey 查询 Redis 获取 userId
+         ├─ Redis 禁用：直接从 token payload 获取 userId
+         ├─ 查询用户信息：getUser(userId)
+         └─ 返回 auth = { user, token, authKey, shareToken: null }
+
+5. 权限校验
+   canViewWebsite(auth, websiteId)
+   ├─ user.isAdmin → ✅ 放行
+   ├─ entity.userId → user.id === entity.userId → ✅ 放行
+   └─ entity.teamId → getTeamUser(teamId, user.id) 存在 → ✅ 放行
+```
+
+**关键代码入口**：
+
+| 阶段 | 文件 | 关键函数 |
+|------|------|---------|
+| Token 生成 | `src/app/api/auth/login/route.ts:36-40` | `saveAuth()` / `createSecureToken()` |
+| 客户端存储 | `src/lib/client.ts:4-14` | `getClientAuthToken()` / `setClientAuthToken()` |
+| 请求头注入 | `src/components/hooks/useApi.ts:30-33` | `authorization: Bearer ${getClientAuthToken()}` |
+| 鉴权校验 | `src/lib/auth.ts:17-60` | `checkAuth()` |
+| 权限校验 | `src/permissions/website.ts:7-40` | `canViewWebsite()` |
+
+---
+
+##### 链路 B：分享场景 x-umami-share-token 鉴权
+
+**触发条件**：页面路径以 `/share/` 开头（即通过分享链接匿名访问报表）
+
+**完整链路（分享创建 → Token 生成 → 存储 → 使用 → 校验）**：
+
+```
+1. 分享创建（管理员/所有者操作）
+   POST /api/share（创建分享记录）
+   └─ 生成 share slug（短链接标识）
+      └─ 存储到数据库：{ id, code, entityId, shareType, parameters }
+
+2. 访问分享页面
+   GET /share/[slug]/performance
+   └─ ShareProvider 渲染
+      └─ useShareTokenQuery(slug)
+         └─ GET /api/share/[slug]
+            ├─ getShareByCode(slug) → 查询分享记录
+            ├─ 根据 shareType 获取对应 entity（website/board/pixel/link）
+            ├─ 构建 sharePayload = { shareId, shareType, websiteId, ... }
+            ├─ createToken(sharePayload, secret()) → 明文 JWT（未加密）
+            └─ 返回 { ...sharePayload, token }
+
+3. 客户端存储
+   setShareData(data, { token: data.token }) → zustand store
+
+4. 报表查询触发
+   useResultQuery('performance', { websiteId, ... })
+   └─ useApi()
+      ├─ isSharePath = pathname.startsWith('/share') → true
+      ├─ shareToken = useApp(state => state.shareToken) → 从 zustand 读取
+      └─ 构建请求头：
+         ├─ Authorization: Bearer <空>  // 无登录态
+         ├─ x-umami-share-token: <shareToken>
+         └─ x-umami-share-context: '1'
+
+5. 后端鉴权校验
+   POST /api/reports/performance
+   └─ parseRequest(request, schema)  // 无 skipAuth
+      └─ checkAuth(request)
+         ├─ Authorization 头为空 → user = null
+         ├─ parseShareToken(request) → 解析 x-umami-share-token 头
+         ├─ 验证 shareToken 签名有效
+         ├─ 检查 x-umami-share-context 头存在
+         └─ 返回 auth = { user: null, shareToken, token: null, authKey: null }
+
+6. 权限校验
+   canViewWebsite(auth, websiteId)
+   ├─ user 为 null → 跳过用户权限检查
+   └─ shareToken.websiteId === websiteId → ✅ 放行
+      或 shareToken.websiteIds?.includes(websiteId) → ✅ 放行
+```
+
+**关键代码入口**：
+
+| 阶段 | 文件 | 关键函数 |
+|------|------|---------|
+| Share Token 生成 | `src/app/api/share/[slug]/route.ts:94` | `createToken(data, secret())` |
+| 客户端存储 | `src/store/app.ts:35-40` | `setShareData(share, shareToken)` |
+| 请求头注入 | `src/components/hooks/useApi.ts:25-33` | `shareHeaders` 条件注入 |
+| 鉴权校验 | `src/lib/auth.ts:80-86` | `parseShareToken()` |
+| 权限校验 | `src/permissions/website.ts:12-21` | `shareToken.websiteId` 匹配校验 |
+
+---
+
+##### 双场景鉴权对比表（精确到代码级别）
+
+| 维度 | 登录场景 Authorization | 分享场景 x-umami-share-token |
+|------|------------------------|-----------------------------|
+| **触发路径** | `/websites/[websiteId]/(reports)/performance` | `/share/[slug]/performance` |
+| **路径检测** | `!pathname.startsWith('/share')` | `pathname.startsWith('/share')` |
+| **Token 类型** | `createSecureToken()` → AES-256-GCM 加密 JWT | `createToken()` → 明文 JWT（HS256 签名） |
+| **Token 存储** | `localStorage['authToken']` | zustand store（内存） |
+| **请求头 1** | `Authorization: Bearer <authToken>` | `Authorization: Bearer `（空值） |
+| **请求头 2** | 无 | `x-umami-share-token: <shareToken>` |
+| **请求头 3** | 无 | `x-umami-share-context: '1' |
+| **Token 过期** | 登录态过期（Redis TTL / 浏览器关闭） | 页面刷新/关闭即丢失（内存存储） |
+| **鉴权函数** | `parseSecureToken()`（解密+验证） | `parseShareToken()` → `parseToken()`（仅验证） |
+| **返回 auth** | `{ user: {...}, shareToken: null }` | `{ user: null, shareToken: {...} }` |
+| **权限校验** | 检查用户角色 / 网站归属 | 检查 shareToken.websiteId 匹配 |
+| **缓存 Key** | 相同（queryKey 不含鉴权信息） | 相同（queryKey 不含鉴权信息） |
+| **缓存命中** | ✅ 相同 websiteId 参数命中 | ⚠️ 可能命中其他分享的缓存（后端重新校验） |
+
+> **重要安全说明**：两种场景使用相同的 React Query 缓存 Key。这意味着同一浏览器访问不同分享链接时可能命中之前的缓存数据。但后端会在每次请求时重新校验 shareToken 权限，即使前端缓存命中，若权限不匹配仍会返回 401。这是一个潜在的设计权衡——为了缓存复用牺牲了一定的隔离性，但通过后端二次校验保证了安全性。
+
+---
+
 ### 5.3 /api/send 会话缓存（采集层）
 
 **设计目的**：避免每次上报都重新计算 sessionId 和 visitId（涉及加密哈希和数据库查询），提升上报性能。
@@ -814,3 +960,9 @@ Umami Performance 报表遵循了现代 Web 性能监控的最佳实践：
 | 指标卡片 | `src/components/metrics/PerformanceCard.tsx` |
 | 阈值定义 | `src/lib/constants.ts` |
 | 数据库迁移 | `db/clickhouse/migrations/09_add_performance.sql` |
+| **查询缓存 Hook** | `src/components/hooks/queries/useResultQuery.ts` |
+| **API 封装** | `src/components/hooks/useApi.ts` |
+| **鉴权逻辑** | `src/lib/auth.ts` |
+| **权限校验** | `src/permissions/website.ts` |
+| **加密与盐值** | `src/lib/crypto.ts` |
+| **分享场景 Provider** | `src/app/share/ShareProvider.tsx` |
