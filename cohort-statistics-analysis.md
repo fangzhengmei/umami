@@ -147,15 +147,14 @@ const schema = z.object({
   parameters: anyObjectParam,       // ⚠️ 任意 JSON 对象，不校验结构
 });
 
-// 先检查 segment 是否存在
+// ⚠️ 先鉴权，后检查存在性（安全设计：避免越权探测资源是否存在）
+if (!(await canUpdateWebsite(auth, websiteId))) {
+  return unauthorized();
+}
+
 const segment = await getWebsiteSegment(websiteId, segmentId);
 if (!segment) {
   return notFound();
-}
-
-// 权限检查
-if (!(await canUpdateWebsite(auth, websiteId))) {
-  return unauthorized();
 }
 
 // 更新
@@ -168,7 +167,7 @@ const result = await updateSegment(segmentId, {
 
 **特点**：
 - 使用 `anyObjectParam` 宽松校验 `parameters`（`z.record(z.string(), z.any())`）
-- 必须先检查 segment 是否存在
+- **先鉴权后查存在性**：防止未授权用户通过 404/403 状态码差异探测 segment 是否存在
 - 使用 `POST` 方法而非 `PUT/PATCH`
 - 权限：`canUpdateWebsite`
 
@@ -758,11 +757,28 @@ Umami 同时支持 PostgreSQL 和 ClickHouse，Cohort 查询在两个数据库�
 | 更新 Segment API | `src/app/api/websites/[websiteId]/segments/[segmentId]/route.ts:33-69` |
 | 留存报表 API | `src/app/api/reports/retention/route.ts` |
 
+## 十、易错点对照清单
+
+| 序号 | 错误说法 | 正确代码事实 | 证据位置 |
+|------|----------|--------------|----------|
+| 1 | 更新接口先检查存在性再鉴权 | **先鉴权后查存在性**：先调用 `canUpdateWebsite`，检查通过后才查询 segment 是否存在。这是安全设计，防止未授权用户通过 HTTP 状态码差异（404 vs 403）探测 segment 是否存在。 | `src/app/api/websites/[websiteId]/segments/[segmentId]/route.ts:52-60` |
+| 2 | 创建接口的 `parameters` 字段可选，可省略 | **`parameters` 字段必填**：schema 定义为 `parameters: segmentParamSchema`（无 `.optional()`），但内部所有子字段（filters、match、dateRange、action）均为 `.optional()`。允许 `parameters: {}`，但不能不传该字段。 | `src/app/api/websites/[websiteId]/segments/route.ts:42-46`、`src/lib/schema.ts:303-321` |
+| 3 | Cohort 过滤器和主查询过滤器使用相同的 `match` 参数 | **各自独立**：Cohort 使用 `cohort_match`，主查询使用 `match`。两者互不影响。 | `src/lib/prisma.ts:108-150`、`src/lib/request.ts:384-388` |
+| 4 | Cohort 的 action 条件会受 `match: 'any'` 影响 | **action 始终用 AND 连接**：代码中 `isAlwaysAnd = name === cohortActionName`，确保 action 条件不会被 OR 逻辑影响，保证队列定义的准确性。 | `src/lib/prisma.ts:108-150`（第 497 行） |
+| 5 | Cohort 定义窗口和报表查询窗口必须一致 | **两个窗口完全独立**：Cohort 定义窗口保存在 `parameters.dateRange`，报表查询窗口来自 URL 参数。可以用"过去 30 天访问过 /pricing 的用户"分析"他们在过去 7 天的留存"。 | `src/lib/request.ts:358-389` |
+| 6 | 新建和更新使用不同的 HTTP 方法（POST vs PUT） | **都用 POST**：无论新建还是更新，统一使用 `POST` 方法，通过 URL 路径是否包含 ID 区分操作。 | `src/app/api/websites/[websiteId]/segments/route.ts`、`[segmentId]/route.ts` |
+| 7 | 新建接口对 `parameters` 的校验和更新一样宽松 | **新建更严格**：新建用 `segmentParamSchema`（结构校验），更新用 `anyObjectParam`（任意 JSON）。 | `src/app/api/websites/[websiteId]/segments/route.ts:45` vs `[segmentId]/route.ts:40` |
+| 8 | 删除权限和更新权限相同 | **删除权限更高**：删除用 `canDeleteWebsite`，更新用 `canUpdateWebsite`。 | `src/app/api/websites/[websiteId]/segments/[segmentId]/route.ts:83` vs `52` |
+| 9 | Cohort 的 `match: 'all'` 会保存到数据库 | **'all' 不保存**：前端代码 `match: currentMatch !== 'all' ? currentMatch : undefined`，只有非 'all' 时才保存。 | `src/app/(main)/websites/[websiteId]/cohorts/CohortEditForm.tsx:85` |
+| 10 | Cohort 过滤器直接拼接到主查询 WHERE 条件 | **用子查询 JOIN**：Cohort 条件在子查询中筛选出符合条件的 `session_id`，然后通过 INNER JOIN 限制主查询。这样 Cohort 条件只影响"哪些用户"，不影响"这些用户的哪些行为"。 | `src/lib/prisma.ts:152-173` |
+
 ---
 
-**文档版本**：v1.1（修订版）
-**修订内容**：
-1. 修正新建与更新接口的 Schema 校验差异（严格 vs 宽松）
-2. 补充筛选器 URL 参数到报表查询的完整 5 步链路
-3. 补充留存报表从页面到 SQL 的完整调用链
-4. 所有结论均标注代码文件和行号，可直接验证
+**文档版本**：v1.2（事实校准版）
+**修订历史**：
+- v1.0：初版，覆盖 Cohort 全流程
+- v1.1：修正接口分工差异，补充完整链路
+- v1.2：事实校准
+  - 修正更新接口鉴权与存在性检查顺序（先鉴权后查存在性）
+  - 修正创建接口 parameters 字段必填性（字段必填，子字段可选）
+  - 新增易错点对照清单（10 条常见误解 vs 代码事实）
