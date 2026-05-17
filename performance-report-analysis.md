@@ -355,7 +355,27 @@ limit ${limit}
 
 ## 五、查询缓存机制
 
-### 5.1 客户端缓存（React Query）
+Umami Performance 报表涉及 **两种完全独立的缓存体系**，分别服务于数据采集上报和报表查询展示两个不同场景，二者边界清晰，互不干扰。
+
+### 5.1 两种缓存的边界对比
+
+| 维度 | React Query 查询缓存 | /api/send 会话缓存（Token Cache） |
+|------|---------------------|----------------------------------|
+| **所属层级** | 前端报表查询层 | 前端采集上报层 |
+| **缓存内容** | `/api/reports/performance` 返回的报表数据（chart、summary、pages 等） | 会话标识（sessionId、visitId、iat） |
+| **存储位置** | 浏览器内存（QueryClient 实例） | Tracker 脚本内存变量 + JWT Token |
+| **传输方式** | 不传输，纯前端内存 | 通过 `x-umami-cache` 请求头发送给后端 |
+| **生命周期** | 60 秒 staleTime，页面刷新即丢失 | sessionId 按月盐值轮换，visitId 30 分钟过期 |
+| **触发场景** | 打开/切换报表页面时 | 上报性能数据 / 页面浏览事件时 |
+| **缓存 Key** | queryKey 数组（所有查询参数序列化） | 无 Key，单用户单 Tracker 实例 |
+| **失效条件** | 查询参数变化、60 秒过期、手动 refetch | 30 分钟过期、页面关闭、Tracker 重置 |
+| **代码路径** | `useResultQuery` → `/api/reports/performance` | Tracker `send()` → `/api/send` |
+
+> **关键结论**：两种缓存位于完全独立的代码路径，服务于不同业务目的。报表查询缓存与数据上报缓存之间没有任何交互。
+
+---
+
+### 5.2 React Query 查询缓存（报表层）
 
 **配置位置**：`src/app/Providers.tsx:11-19`
 
@@ -371,58 +391,112 @@ const client = new QueryClient({
 });
 ```
 
-**缓存 Key 组成**：
+**缓存 Key 构成（精确映射）**：
 
 ```typescript
 // src/components/hooks/queries/useResultQuery.ts:17-29
 queryKey: [
-  'reports',
+  'reports',  // 命名空间
   {
-    type,           // 'performance'
-    websiteId,
-    startDate,
-    endDate,
-    timezone,
-    unit,
-    ...params,      // metric 等
-    ...filters,     // 过滤条件
+    type: 'performance',              // 报表类型，固定值
+    websiteId,                        // 网站 UUID，来自 URL path
+    startDate: '2024-01-01T00:00:00Z',  // 来自 useDateParameters
+    endDate: '2024-01-02T00:00:00Z',    // 来自 useDateParameters
+    timezone: 'UTC',                  // 来自 useDateParameters
+    unit: 'day',                      // 来自 useDateParameters
+    metric: 'lcp',                    // 来自组件内部状态 selectedMetric
+    ...filters,                       // 来自 URL 查询参数（路径、浏览器等过滤）
   },
 ]
 ```
 
-**缓存特性**：
-- **Stale Time**：60 秒内不会重新请求
-- **无重试**：查询失败不会自动重试
-- **无窗口聚焦重获**：切换标签页回来不会自动刷新
-- **查询参数全量参与 Key**：任何参数变化都会使缓存失效
+**缓存命中与失效规则**：
 
-### 5.2 服务端会话缓存（Token Cache）
+| 场景 | 行为 | 原因 |
+|------|------|------|
+| 切换日期范围（如 24h → 7d） | 缓存失效，重新请求 | startDate/endDate/unit 变化 → queryKey 变化 |
+| 切换指标（如 LCP → INP） | 缓存失效，重新请求 | metric 参数变化 → queryKey 变化 |
+| 添加过滤条件（如浏览器=Chrome） | 缓存失效，重新请求 | filters 变化 → queryKey 变化 |
+| 切换百分位（p75 → p95） | **缓存命中**，不请求 | selectedPercentile 不参与 queryKey，仅前端过滤展示 |
+| 60 秒内重复访问同一报表 | 缓存命中，不请求 | staleTime 内数据视为新鲜 |
+| 页面刷新后重新访问 | 缓存失效，重新请求 | QueryClient 实例重建，内存缓存丢失 |
+| 切换到其他报表再切回 | 60 秒内命中，否则重查 | 同一 QueryClient 实例内多报表缓存共存 |
 
-Tracker 端使用 JWT Token 缓存会话信息，减少重复计算：
+**缓存生命周期**：
+```
+组件挂载 → useResultQuery 执行 → 检查 queryKey 对应缓存
+    │
+    ├─ 缓存存在且 < 60s → 直接返回缓存数据 ✅
+    │
+    └─ 缓存不存在或 ≥ 60s → 发起 POST /api/reports/performance 请求
+                                    │
+                                    ▼
+                          数据返回 → 写入缓存（60s 有效期）
+                                    │
+                                    ▼
+                          组件接收数据 → 渲染页面
+```
+
+---
+
+### 5.3 /api/send 会话缓存（采集层）
+
+**设计目的**：避免每次上报都重新计算 sessionId 和 visitId（涉及加密哈希和数据库查询），提升上报性能。
+
+**缓存 Token 生成与传递流程**：
+
+```
+Tracker 脚本 (浏览器)                          /api/send (后端)
+       │                                            │
+       │ 首次上报（无 cache header）                 │
+       │───────────────────────────────────────────▶│
+       │                                            │ 计算 sessionId = hash(IP + UA + salt)
+       │                                            │ 计算 visitId = hash(sessionId + hourSalt)
+       │                                            │ 生成 JWT Token = sign({sessionId, visitId, iat})
+       │                                            │
+       │ 响应：{ cache: Token, sessionId, visitId } │
+       │◀───────────────────────────────────────────│
+       │                                            │
+       │ 保存 Token 到内存变量 cache                │
+       │                                            │
+       │ 后续上报（携带 x-umami-cache: Token）      │
+       │───────────────────────────────────────────▶│
+       │                                            │ 验证 Token 签名
+       │                                            │ 解析 sessionId、visitId、iat
+       │                                            │ 检查 iat 是否在 30 分钟内
+       │                                            │ 未过期 → 复用，无需重新计算
+       │                                            │
+```
+
+**Token 内容与验证**：
 
 ```typescript
 // src/app/api/send/route.ts:100-112
-let cache: Cache | null = null;
+interface Cache {
+  websiteId: string;   // 网站 ID
+  sessionId: string;   // 会话 ID（基于 IP + UA + 盐值哈希）
+  visitId: string;     // 访问 ID（基于会话 ID + 小时盐值哈希）
+  iat: number;         // 签发时间（Unix 时间戳）
+}
+
+// 后端验证逻辑
 if (websiteId) {
   const cacheHeader = request.headers.get('x-umami-cache');
   if (cacheHeader) {
     const result = await parseToken(cacheHeader, secret());
     if (result) {
-      cache = result;  // { websiteId, sessionId, visitId, iat }
+      cache = result;  // Token 验证通过，复用缓存值
     }
   }
 }
 ```
 
-**Token 内容**：
-- `websiteId`：网站 ID
-- `sessionId`：会话 ID（基于 IP + UA + 盐值哈希）
-- `visitId`：访问 ID（基于会话 ID + 小时盐值哈希）
-- `iat`：签发时间
-
 **过期机制**：
-- Visit ID 有效期 30 分钟
-- 超过有效期后重新生成 visitId
+- **Visit ID 过期**：`now - iat > 1800`（30 分钟），重新生成 visitId
+- **Session ID 过期**：随盐值轮换周期（默认按月），与 `SALT_ROTATION` 环境变量相关
+- **页面级失效**：Tracker 脚本随着页面刷新/关闭而销毁，内存中的 `cache` 变量丢失
+
+> **注意**：此缓存仅存在于 Tracker 采集场景，与 Performance 报表查询完全无关。报表查询使用的是用户登录态 JWT（Authorization header），而非此 Tracker Token。
 
 ---
 
