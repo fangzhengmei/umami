@@ -530,7 +530,7 @@ Performance 报表查询存在 **两条完全独立的鉴权链路**，分别服
       ├─ isSharePath = pathname.startsWith('/share') → true
       ├─ shareToken = useApp(state => state.shareToken) → 从 zustand 读取
       └─ 构建请求头：
-         ├─ Authorization: Bearer <空>  // 无登录态
+         ├─ Authorization: Bearer ${getClientAuthToken()}  // 分享场景无登录态，返回空字符串
          ├─ x-umami-share-token: <shareToken>
          └─ x-umami-share-context: '1'
 
@@ -538,7 +538,8 @@ Performance 报表查询存在 **两条完全独立的鉴权链路**，分别服
    POST /api/reports/performance
    └─ parseRequest(request, schema)  // 无 skipAuth
       └─ checkAuth(request)
-         ├─ Authorization 头为空 → user = null
+         ├─ getBearerToken(request) → 从 Authorization 头提取 token（空字符串）
+         ├─ parseSecureToken('') → 解析失败 → payload = null
          ├─ parseShareToken(request) → 解析 x-umami-share-token 头
          ├─ 验证 shareToken 签名有效
          ├─ 检查 x-umami-share-context 头存在
