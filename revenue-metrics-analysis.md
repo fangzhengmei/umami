@@ -418,7 +418,7 @@ join (
 ) we
 on we.website_id = revenue_data.website_id
   and we.session_id = revenue_data.session_id
-  and we.created_at = revenue_data.created_at  -- ⚠️ 同秒多事件问题
+  and we.created_at = revenue_data.created_at  -- ⚠️ 首事件时间戳完全一致时可能重复归因
 group by we.referrer_domain
 order by value desc
 ```
@@ -837,8 +837,9 @@ async function relationalQuery(data: SaveRevenueArgs) {
 
 ### 10.1 归因模型
 - **首次接触归因**: 将 revenue 归因为用户会话的第一个事件来源
-- **实现方式**: 通过 `min(created_at)` 找到会话首个事件，关联其来源信息
-- **已知问题**: 同秒多事件会导致金额重复计算（详见 4.3.2 节）
+- **实现方式**: 通过 `min(created_at)` 找到会话首个事件的时间戳，关联其来源信息
+- **已知问题**: 当首事件时间戳完全一致时（PostgreSQL 同毫秒，ClickHouse 同秒），金额会被重复计算（详见 4.3.2 节）
+- **统计口径差异**: 来源/渠道分析的金额之和可能大于总收入，这是归因逻辑的已知特性
 
 ### 10.2 货币处理
 - **单货币查询**: 每次查询只能选择一种货币，不进行汇率转换
@@ -848,6 +849,7 @@ async function relationalQuery(data: SaveRevenueArgs) {
 ### 10.3 筛选条件
 - **excludeBounce 不生效**: 在 revenue 查询中未使用 `excludeBounceQuery`（详见 3.5.2 节）
 - **通用筛选框架**: 统一的 `parseFilters` 机制，支持动态字段和操作符
+- **生效范围**: `cohort` 筛选和字段筛选正常生效，`excludeBounce` 仅在 pageview/session 统计中生效
 
 ### 10.4 性能优化
 - **并行查询**: 三个主查询通过 `Promise.all` 并行执行
