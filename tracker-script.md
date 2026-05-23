@@ -826,7 +826,260 @@ umami.track({
 
 ---
 
-### 9.7 缓解建议
+### 9.7 CORS 策略、参数校验与 URL 解析的共同影响
+
+#### 9.7.1 CORS 全放开策略：风险可达的基础
+
+**配置位置**：`next.config.ts:63-84`、`docker/proxy.ts:13-18`
+
+```javascript
+// next.config.ts 中 /api/:path* 的全局 CORS 配置
+const apiHeaders = [
+  {
+    key: 'Access-Control-Allow-Origin',
+    value: '*',  // 允许任意来源
+  },
+  {
+    key: 'Access-Control-Allow-Headers',
+    value: '*',  // 允许任意请求头
+  },
+  {
+    key: 'Access-Control-Allow-Methods',
+    value: 'GET, DELETE, POST, PUT',  // 允许所有常用方法
+  },
+];
+```
+
+**CORS 配置覆盖范围**：
+
+| 端点 | CORS 配置 | 说明 |
+|-----|----------|------|
+| `/api/:path*` | `Origin: *` | 所有 API 端点，包括 `/api/send` |
+| `/script.js` | `Origin: *` | Tracker 脚本本身也允许跨域加载 |
+| 自定义 `COLLECT_API_ENDPOINT` | 继承 apiHeaders | 通过 middleware 重写后应用相同配置 |
+| `/q/:slug`、`/p/:slug` | 继承默认 headers | 通过 `GET` 请求调用，不受 CORS 限制 |
+
+**风险可达性分析**：
+
+1. **任何网站都可直接调用**：由于 `Access-Control-Allow-Origin: *`，任何网页（包括恶意网站）都可以直接向 Umami 实例发送数据。
+
+2. **无需凭证即可发送**：Tracker 脚本中 `credentials: 'omit'`（`src/tracker/index.js:38`），且 CORS 配置允许 `*`，因此不需要 Cookie 或认证。
+
+3. **跨站伪造请求完全可行**：攻击者可以在任意页面构造 fetch 请求：
+   ```javascript
+   fetch('https://umami.example.com/api/send', {
+     method: 'POST',
+     headers: { 'Content-Type': 'application/json' },
+     body: JSON.stringify({
+       type: 'event',
+       payload: {
+         website: 'target-website-uuid',
+         hostname: 'fake.com',
+         url: '/page',
+         referrer: 'https://example.com'
+       }
+     })
+   });
+   ```
+
+4. **Collect 端点的特殊风险**：`/q/:slug` 和 `/p/:slug` 通过 `GET` 请求调用，可以通过 `<img>` 标签触发，甚至不需要 JavaScript 执行权限：
+   ```html
+   <img src="https://umami.example.com/q/tracking-pixel?url=https://fake.com/page" />
+   ```
+
+**对比 (collect) 路由与 /api/send 路由**：
+
+| 特性 | `/api/send` | `/q/:slug`、`/p/:slug` |
+|-----|------------|---------------------|
+| 请求方法 | `POST` | `GET` |
+| CORS 限制 | 无（`Origin: *`） | 无（GET 不受 CORS 限制） |
+| Payload 可控性 | 完全可控（JSON body） | 部分可控（URL 查询参数） |
+| Hostname 可控性 | ✅ 可传入任意值 | ❌ 不可直接传入（使用 request.url） |
+| Referrer 可控性 | ✅ 可传入任意值 | ❌ 使用 `request.headers.get('referer')` |
+| 触发方式 | 需要 fetch/XHR | `<img>` 标签即可 |
+
+> **关键结论**：CORS 全放开策略使得**任何网站都可以向任何 Umami 实例发送伪造数据**，这是风险能够真正到达服务端的前提条件。
+
+---
+
+#### 9.7.2 urlOrPathParam 校验：看似严格，实则宽松
+
+**校验定义**：`src/lib/schema.ts:92-104`
+
+```typescript
+export const urlOrPathParam = z.string().refine(
+  value => {
+    try {
+      new URL(value, 'https://localhost');  // 关键：base 固定为 https://localhost
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  { message: 'Invalid URL.' }
+);
+```
+
+**校验边界分析**：
+
+使用 `new URL(value, 'https://localhost')` 进行校验是一个**非常宽松**的校验：
+
+| 输入值 | 校验结果 | 实际解析结果 |
+|-------|---------|------------|
+| `/page` | ✅ PASS | `https://localhost/page` |
+| `page` | ✅ PASS | `https://localhost/page` |
+| `//evil.com/page` | ✅ PASS | `https://evil.com/page`（协议相对 URL） |
+| `https://real.com/page` | ✅ PASS | `https://real.com/page`（绝对 URL，忽略 base） |
+| `?query=1` | ✅ PASS | `https://localhost/?query=1` |
+| `#hash` | ✅ PASS | `https://localhost/#hash` |
+| `../escape` | ✅ PASS | `https://localhost/../escape` → `https://localhost/escape` |
+| `javascript:alert(1)` | ✅ PASS | `javascript:alert(1)`（特殊协议） |
+| `data:text/html,test` | ✅ PASS | `data:text/html,test`（特殊协议） |
+| `https://` | ❌ FAIL | `Invalid URL`（协议后缺少 host） |
+| ` http://example.com` | ❌ FAIL | `Invalid URL`（开头有空格） |
+
+**关键风险点**：
+
+1. **协议相对 URL 可绕过**：`//evil.com/page` 会被解析为 `https://evil.com/page`，完全绕过 `localhost` base。
+
+2. **绝对 URL 忽略 base**：`https://real.com/page` 会忽略 `https://localhost` base，直接使用自身的 hostname。
+
+3. **特殊协议可通过**：`javascript:`、`data:` 等协议可通过校验，但入库后 hostname 为空字符串。
+
+4. **无长度限制**：校验没有限制 URL 长度（虽然后续有其他字段限制）。
+
+> **关键结论**：`urlOrPathParam` 校验本质上只验证了"字符串可以被 URL 构造器解析"，但没有限制**最终解析出的 hostname 是什么**。这为伪造 hostname 打开了大门。
+
+---
+
+#### 9.7.3 new URL 入库链路：伪造 hostname 的完整路径
+
+**核心代码**：`src/app/api/send/route.ts:177-215`
+
+```javascript
+if (type === COLLECTION_TYPE.event) {
+  // 第 178 行：base 完全由 payload.hostname 控制
+  const base = hostname ? `https://${hostname}` : 'https://localhost';
+  
+  // 第 179 行：解析 url（url 已通过 urlOrPathParam 校验）
+  const currentUrl = new URL(url, base);
+  
+  // 第 184 行：从解析结果提取 hostname（去 www 前缀）
+  const urlDomain = currentUrl.hostname.replace(/^www./, '');
+  
+  // ...
+  
+  if (referrer) {
+    // 第 210 行：解析 referrer 时复用同一个 base
+    const referrerUrl = new URL(referrer, base);
+    referrerDomain = referrerUrl.hostname.replace(/^www./, '');
+  }
+  
+  // 第 234 行：入库时优先使用 payload.hostname
+  hostname: hostname || urlDomain,
+}
+```
+
+**完整风险链路分析**：
+
+```
+攻击者控制的输入
+    │
+    ├─► payload.hostname = 'evil.com'  ───────────────────┐
+    │                                                      │
+    ├─► payload.url = '/landing-page'  ────────┐          │
+    │                                          ▼          ▼
+    │                               new URL(url, base) = 'https://evil.com/landing-page'
+    │                                          │
+    │                                          ├─► urlDomain = 'evil.com'（去 www）
+    │                                          │
+    ├─► payload.referrer = 'https://example.com/home'  ───┐
+    │                                          ▼          │
+    │                               new URL(referrer, base) = 'https://example.com/home'
+    │                                          │
+    │                                          ├─► referrerDomain = 'example.com'（去 www）
+    │                                          │
+    └──────────────────────────────────────────┼──────────┘
+                                               ▼
+                          入库：hostname = 'evil.com'（优先使用 payload 值）
+                               referrerDomain = 'example.com'
+                                               │
+                                               ▼
+                    查询过滤：referrer_domain ('example.com') != hostname ('evil.com')
+                                               │
+                                               ▼
+                                 ✅ 被统计为外部来源（伪造成功）
+```
+
+**四种典型攻击场景的完整路径**：
+
+| 攻击目标 | payload.hostname | payload.url | payload.referrer | 最终效果 |
+|---------|-----------------|------------|------------------|---------|
+| 虚高外部来源 | `fake-external.com` | `/page` | `https://example.com/home` | 内部跳转变外部来源 |
+| 掩盖真实来源 | `google.com` | `/page` | `https://google.com/search` | 真实外部来源被过滤 |
+| 统计碎片化 | 随机字符串 | `/page` | 真实 referrer | hostname 维度完全不可用 |
+| 协议相对 URL 攻击 | `undefined`（不传） | `//evil.com/page` | `https://example.com` | hostname 被篡改为 `evil.com` |
+
+**场景 4 特别说明**：即使不传入 `payload.hostname`，也可以通过 `payload.url` 伪造 hostname：
+
+```javascript
+// payload: { hostname: undefined, url: '//evil.com/page', referrer: '...' }
+const base = 'https://localhost';
+const currentUrl = new URL('//evil.com/page', 'https://localhost');
+// 解析结果: hostname = 'evil.com'
+const urlDomain = 'evil.com';
+// 入库: hostname = 'evil.com'（因为 hostname 为 undefined，使用 urlDomain）
+```
+
+> **关键结论**：`new URL(url, base)` 的解析行为，加上 `payload.hostname` 和 `payload.url` 的双重可控性，形成了完整的伪造路径。攻击者可以通过**两种独立方式**控制最终入库的 hostname。
+
+---
+
+#### 9.7.4 三者共同作用下的统计口径偏差矩阵
+
+| CORS 放开 | urlOrPathParam 宽松 | new URL 可控 | 最终风险 | 统计影响 |
+|----------|-------------------|-------------|---------|---------|
+| ❌ 限制 | ✅ 严格 | ✅ 可控 | ⭐ | 仅本站可发送，风险可控 |
+| ✅ 放开 | ❌ 严格 | ✅ 可控 | ⭐⭐ | 可跨站发送，但 URL 格式受限 |
+| ✅ 放开 | ✅ 宽松 | ❌ 不可控 | ⭐⭐⭐ | 可跨站发送，但 hostname 由 URL 解析决定 |
+| ✅ 放开 | ✅ 宽松 | ✅ 可控 | ⭐⭐⭐⭐⭐ | **完全失控**，任意伪造 |
+
+**真实的风险可达路径（从攻击者视角）**：
+
+```
+1. 目标识别：获取目标网站的 website-id（可从公开页面的 script 标签获取）
+2. 构造 payload：
+   {
+     type: 'event',
+     payload: {
+       website: 'target-uuid',
+       hostname: 'fake.com',     // 伪造 hostname
+       url: '/page',             // 相对路径，使用伪造的 base
+       referrer: 'https://google.com/search'  // 真实或伪造的来源
+     }
+   }
+3. 发送请求（从任意网站）：
+   fetch('https://umami.example.com/api/send', {
+     method: 'POST',
+     headers: { 'Content-Type': 'application/json' },
+     body: JSON.stringify(payload)
+   })
+4. 结果：伪造数据成功入库，统计口径被污染
+```
+
+**统计偏差的具体表现**：
+
+| 统计维度 | 偏差表现 | 对业务决策的影响 |
+|---------|---------|----------------|
+| Hostname 统计 | 出现大量伪造域名 | 无法按域名聚合分析 |
+| Referrer Domain | 虚高或虚低外部来源 | 渠道投放 ROI 计算错误 |
+| Direct 流量 | 被掩盖或虚高 | 品牌流量评估失真 |
+| UTM 参数 | 与伪造 hostname 混淆 | 营销活动归因错误 |
+| 会话追踪 | hostname 频繁变化导致会话断裂 | 用户行为路径分析失效 |
+
+---
+
+### 9.8 缓解建议
 
 > **说明**：以下建议仅为基于代码分析的技术探讨，不构成修改建议。
 
@@ -853,6 +1106,64 @@ if (website?.domain) {
 
 // 4. 统一归一化规则
 const normalizedHostname = effectiveHostname.replace(/^www\./, '').toLowerCase();
+```
+
+**针对 CORS、参数校验和 URL 解析的补充建议**：
+
+```typescript
+// 1. 限制 CORS 来源（替换 Origin: *）
+// next.config.ts
+const apiHeaders = [
+  {
+    key: 'Access-Control-Allow-Origin',
+    value: process.env.ALLOWED_ORIGINS || '*',  // 可配置白名单
+  },
+];
+
+// 2. 强化 urlOrPathParam 校验，禁止协议相对 URL 和绝对 URL
+// src/lib/schema.ts
+export const urlOrPathParam = z.string().refine(
+  value => {
+    try {
+      // 禁止以 // 开头的协议相对 URL
+      if (value.startsWith('//')) return false;
+      
+      const u = new URL(value, 'https://localhost');
+      // 禁止解析出的 hostname 不是 localhost
+      if (u.hostname !== 'localhost') return false;
+      // 禁止特殊协议
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+      
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  { message: 'Invalid URL.' }
+);
+
+// 3. 在 new URL 解析前验证 payload.hostname
+// src/app/api/send/route.ts
+if (type === COLLECTION_TYPE.event) {
+  // 校验 payload.hostname 是否在允许的域名列表中
+  if (hostname && website?.domain) {
+    const allowedDomains = website.domain.split(',').map(d => 
+      d.trim().toLowerCase().replace(/^www\./, '')
+    );
+    const normalizedHostname = hostname.toLowerCase().replace(/^www\./, '');
+    
+    if (!allowedDomains.includes(normalizedHostname)) {
+      return badRequest({ message: 'Invalid hostname.' });
+    }
+  }
+  
+  // 强制使用验证后的域名作为 base
+  const safeHostname = hostname 
+    ? hostname.toLowerCase().replace(/^www\./, '')
+    : website?.domain?.split(',')[0]?.trim().toLowerCase().replace(/^www\./, '');
+  
+  const base = safeHostname ? `https://${safeHostname}` : 'https://localhost';
+}
 ```
 
 ---
@@ -885,9 +1196,15 @@ const normalizedHostname = effectiveHostname.replace(/^www\./, '').toLowerCase()
 > 
 > 5. **机器人检测可被欺骗**：`isbot()` 依赖 User-Agent 头，可被伪造。
 > 
-> 6. **Hostname 完全可控**：`payload.hostname` 可通过 `track()` 或 `beforeSend` 任意修改，服务端无校验，Referrer Domain 统计存在严重伪造风险（详见第九章）。
+> 6. **CORS 全放开**：`/api/:path*` 配置了 `Access-Control-Allow-Origin: *`，任何网站都可以向 Umami 实例发送数据。
 > 
-> 7. **归一化规则不一致**：三处 hostname 处理的归一化规则不一致，即使正常使用也可能出现统计偏差。
+> 7. **urlOrPathParam 校验宽松**：仅校验字符串可被 URL 解析，不限制最终 hostname，允许协议相对 URL 和绝对 URL。
+> 
+> 8. **Hostname 完全可控**：`payload.hostname` 可通过 `track()`、`beforeSend` 或 `payload.url`（协议相对 URL）任意修改，服务端无校验，Referrer Domain 统计存在严重伪造风险（详见第九章）。
+> 
+> 9. **归一化规则不一致**：三处 hostname 处理的归一化规则不一致，即使正常使用也可能出现统计偏差。
+> 
+> 10. **new URL 解析可被滥用**：`base` 完全由 `payload.hostname` 控制，结合 `urlOrPathParam` 的宽松校验，形成完整的伪造路径。
 
 ---
 
@@ -913,3 +1230,11 @@ const normalizedHostname = effectiveHostname.replace(/^www\./, '').toLowerCase()
 | 查询时 referrer 过滤 | `src/queries/sql/getValues.ts:26-27`、`83` |
 | track() 函数重载定义 | `src/tracker/index.d.ts:128-147` |
 | beforeSend 回调 | `src/tracker/index.js:166-170` |
+| **CORS 与参数校验** | |
+| /api/* CORS 配置 | `next.config.ts:63-84`、`113-123` |
+| Docker 代理 CORS 配置 | `docker/proxy.ts:13-18` |
+| Middleware 重写逻辑 | `docker/proxy.ts:26-37` |
+| urlOrPathParam 校验 | `src/lib/schema.ts:92-104` |
+| /api/send new URL 解析 | `src/app/api/send/route.ts:177-215` |
+| (collect) /q/:slug 端点 | `src/app/(collect)/q/[slug]/route.ts:10-60` |
+| (collect) /p/:slug 端点 | `src/app/(collect)/p/[slug]/route.ts:12-70` |
