@@ -457,6 +457,196 @@ SQL: AND session.country = ANY({country}) AND session.country != ALL({country1})
 
 ---
 
+## 3.5 分群筛选与页面临时筛选的合并规则
+
+### 3.5.1 合并顺序与覆盖优先级
+
+**核心代码：** `src/lib/request.ts:116,127,151`
+
+```typescript
+const filters = getRequestFilters(params);                         // 1. 先提取页面临时筛选（ad-hoc）
+
+if (params.segment) {
+  Object.assign(filters, filtersArrayToObject(segmentParams.filters));  // 2. 分群筛选 MERGE INTO 临时筛选
+  if (segmentParams.match) match = segmentParams.match;               // 3. 分群 match 覆盖临时 match
+}
+
+if (params.cohort) {
+  Object.assign(filters, { ...filtersArrayToObject(cohortFilters) }); // 4. 队列筛选最后合并（加前缀，无冲突）
+}
+```
+
+**关键机制：** `Object.assign(target, source)` —— **source 的同 key 属性会覆盖 target**
+
+| 合并顺序 | 来源 | 优先级 | 同 key 处理 |
+|----------|------|--------|-------------|
+| 第 1 层 | 页面临时筛选（URL params） | 低（被覆盖） | 作为合并基底 |
+| 第 2 层 | 分群筛选（Segment DB） | 高（覆盖） | ⚠️ **同 key 完全覆盖临时筛选** |
+| 第 3 层 | 队列筛选（Cohort DB） | 最高 | 加 `cohort_` 前缀，无冲突 |
+
+### 3.5.2 match 参数的覆盖规则
+
+**代码：** `src/lib/request.ts:118,129-131`
+
+```typescript
+let match = params?.match;                    // 初始为 URL 中的 match
+
+if (segmentParams.match) {
+  match = segmentParams.match;                // 分群有 match 则覆盖
+}
+```
+
+| 临时筛选 match | 分群 match | 最终 match |
+|---------------|-----------|-----------|
+| `all` (默认) | `any` | `any`（分群覆盖） |
+| `any` | `all` | `all`（分群覆盖） |
+| `any` | undefined | `any`（分群无 match，保留临时） |
+| undefined | `any` | `any`（分群覆盖） |
+
+**重要：** 合并后所有筛选条件（临时 + 分群）共享同一个 `match` 逻辑，由分群的 `match` 决定（如果分群设置了的话）。
+
+### 3.5.3 同名字段冲突的具体场景分析
+
+#### 场景 1：单条件完全覆盖
+
+**页面临时筛选：** `country=eq.CN`  
+**分群筛选：** `[{name: 'country', op: 'neq', value: 'US'}]`
+
+```
+步骤 1: getRequestFilters(params)
+  → filters = { country: 'eq.CN' }
+
+步骤 2: filtersArrayToObject(segment.filters)
+  → { country: 'neq.US' }  （segment 只有 1 个 country，从 0 开始编号）
+
+步骤 3: Object.assign(filters, { country: 'neq.US' })
+  → filters = { country: 'neq.US' }  ⚠️ 临时筛选的 country 被完全覆盖！
+```
+
+**最终 SQL：** `session.country != ALL({{country}})` —— 只有分群条件生效
+
+---
+
+#### 场景 2：多条件部分覆盖（数字后缀错位）
+
+**页面临时筛选：** `country=eq.CN&country1=neq.US`（2 个 country 条件）  
+**分群筛选：** `[{name: 'country', op: 'eq', value: 'JP'}]`（只有 1 个 country 条件）
+
+```
+步骤 1: filters = { country: 'eq.CN', country1: 'neq.US' }
+
+步骤 2: segment 转换 → { country: 'eq.JP' }  （segment 只有 1 个，后缀从 0 开始）
+
+步骤 3: Object.assign(filters, { country: 'eq.JP' })
+  → filters = { 
+       country: 'eq.JP',     // ⚠️ 被分群覆盖
+       country1: 'neq.US'    // ✅ 保留自临时筛选（segment 没有 country1）
+     }
+```
+
+**最终 Filter[]：**
+```typescript
+[
+  { name: 'country', paramName: undefined, op: 'eq', value: ['JP'] },   // 来自分群
+  { name: 'country', paramName: 'country1', op: 'neq', value: ['US'] }  // 来自临时筛选
+]
+```
+
+**最终 SQL（match=all）：**
+```sql
+AND session.country = ANY({{country}})     -- JP（分群）
+AND session.country != ALL({{country1}})   -- US（临时筛选）
+```
+
+**⚠️ 微妙之处：** `country1` 保留是因为分群的 `filtersArrayToObject` 只生成 `country`（无后缀），不生成 `country1`。如果分群也有 2 个 country 条件，那么 `country1` 也会被覆盖。
+
+---
+
+#### 场景 3：多条件完全覆盖（数字后缀对齐）
+
+**页面临时筛选：** `country=eq.CN&country1=neq.US`  
+**分群筛选：** `[{name:'country',op:'eq',val:'JP'}, {name:'country',op:'neq',val:'KR'}]`
+
+```
+步骤 1: filters = { country: 'eq.CN', country1: 'neq.US' }
+
+步骤 2: segment 转换 → { country: 'eq.JP', country1: 'neq.KR' }  （2 个条件，后缀 0 和 1）
+
+步骤 3: Object.assign(filters, { country: 'eq.JP', country1: 'neq.KR' })
+  → filters = { 
+       country: 'eq.JP',      // ⚠️ 覆盖
+       country1: 'neq.KR'     // ⚠️ 覆盖
+     }
+```
+
+**结果：** 临时筛选的 2 个 country 条件被完全清除，只有分群的条件生效。
+
+---
+
+#### 场景 4：不同字段无冲突合并
+
+**页面临时筛选：** `browser=eq.Chrome`  
+**分群筛选：** `[{name: 'country', op: 'eq', value: 'CN'}]`
+
+```
+步骤 1: filters = { browser: 'eq.Chrome' }
+步骤 2: segment → { country: 'eq.CN' }
+步骤 3: Object.assign → { browser: 'eq.Chrome', country: 'eq.CN' }  ✅ 两者都保留
+```
+
+**最终 SQL（match=all）：**
+```sql
+AND session.browser = ANY({{browser}})   -- 来自临时筛选
+AND session.country = ANY({{country}})   -- 来自分群
+```
+
+### 3.5.4 合并后对 SQL 参数绑定的影响
+
+合并发生在**扁平对象层**（`filters: Record<string, any>`），因此数字后缀在 key 中保留，后续 `filtersObjectToArray` 和 SQL 生成不受影响：
+
+```
+合并后的 filters 对象：
+{ country: 'eq.JP', country1: 'neq.US', browser: 'eq.Chrome' }
+  ↓ filtersObjectToArray()
+[
+  { name: 'country', paramName: undefined, value: ['JP'] },
+  { name: 'country', paramName: 'country1', value: ['US'] },
+  { name: 'browser', paramName: undefined, value: ['Chrome'] }
+]
+  ↓ getQueryParams()
+{
+  country: ['JP'],      // key = paramName ?? name → 'country'
+  country1: ['US'],     // key = paramName ?? name → 'country1'
+  browser: ['Chrome']   // key = 'browser'
+}
+  ↓ mapFilter()
+SQL:
+  session.country = ANY({{country}})
+  session.country != ALL({{country1}})
+  session.browser = ANY({{browser}})
+```
+
+**✅ 参数绑定正确性保证：** 由于 `paramName` 保留了原始 key（带数字后缀），即使 `name` 字段相同，SQL 参数占位符也不会冲突。
+
+### 3.5.5 队列（Cohort）的特殊处理
+
+**代码：** `src/lib/request.ts:140-143`
+
+```typescript
+const cohortFilters = cohortParams.filters.map(({ name, ...props }) => ({
+  ...props,
+  name: `cohort_${name}`,  // ⭐ 添加 cohort_ 前缀，彻底避免命名冲突
+}));
+```
+
+队列筛选永远不会与临时筛选或分群筛选冲突，因为所有字段名都加上了 `cohort_` 前缀：
+- `country` → `cohort_country`
+- `browser` → `cohort_browser`
+
+同时队列还有独立的 `cohort_match` 和 `cohort_actionName` 参数。
+
+---
+
 ## 四、URL 参数 → 后端查询编排
 
 ### 4.1 参数解析流程
@@ -498,8 +688,8 @@ return useMemo(() => {
 `getQueryFilters()` 是核心编排函数，负责：
 1. 解析日期范围
 2. 提取普通筛选参数（含带后缀参数）
-3. **合并分群（Segment）筛选条件**
-4. **合并队列（Cohort）筛选条件**
+3. **合并分群（Segment）筛选条件**（同 key 覆盖，详见 3.5 节）
+4. **合并队列（Cohort）筛选条件**（加前缀，无冲突）
 
 ```typescript
 export async function getQueryFilters(
@@ -512,7 +702,7 @@ export async function getQueryFilters(
   let match = params?.match;
 
   if (websiteId) {
-    // 合并分群筛选条件
+    // 合并分群筛选条件（⚠️ 同 key 覆盖临时筛选）
     if (params.segment) {
       const segmentParams = (await getWebsiteSegment(websiteId, params.segment))
         ?.parameters as Record<string, any>;
@@ -524,7 +714,7 @@ export async function getQueryFilters(
       }
     }
 
-    // 合并队列筛选条件（前缀 cohort_）
+    // 合并队列筛选条件（前缀 cohort_，无冲突）
     if (params.cohort) {
       const cohortParams = (await getWebsiteSegment(websiteId, params.cohort))
         ?.parameters as Record<string, any>;
@@ -743,7 +933,7 @@ function parseFilters(filters: Record<string, any>, options?: QueryOptions) {
 
 ## 六、完整数据流示例
 
-### 场景：创建分群「中国 Chrome 用户」
+### 场景 1：创建分群「中国 Chrome 用户」
 
 #### 步骤 1：UI 操作
 1. 在 FilterEditForm 中添加字段 `country`，操作符 `等于`，值选择 `China`
@@ -797,6 +987,84 @@ WHERE website_event.website_id = {websiteId}
   AND session.country = ANY(ARRAY['CN'])
   AND session.browser = ANY(ARRAY['Chrome'])
 ```
+
+---
+
+### 场景 2：分群 + 页面临时筛选同时存在（含冲突）
+
+#### 前置条件
+- 分群「中国用户」：`country=eq.CN`，`match=any`
+- 页面临时筛选：`country=neq.US&os=eq.Windows`，`match=all`
+
+#### 请求 URL
+```
+/api/websites/{id}/stats?country=neq.US&os=eq.Windows&match=all&segment={segmentId}
+```
+
+#### 后端处理流程
+```
+步骤 1：getRequestFilters(params)
+  → filters = { country: 'neq.US', os: 'eq.Windows' }
+  → match = 'all'
+
+步骤 2：读取 segment 表
+  → segmentParams.filters = [{name:'country', op:'eq', value:'CN'}]
+  → segmentParams.match = 'any'
+
+步骤 3：filtersArrayToObject(segmentParams.filters)
+  → { country: 'eq.CN' }
+
+步骤 4：Object.assign(filters, { country: 'eq.CN' })
+  → filters = {
+       country: 'eq.CN',     // ⚠️ 分群覆盖了临时筛选的 country
+       os: 'eq.Windows'      // ✅ 临时筛选的 os 保留
+     }
+
+步骤 5：match 覆盖
+  → match = 'any'（分群的 match 覆盖了临时筛选的 'all'）
+
+步骤 6：filtersObjectToArray(filters)
+  → [
+      { name:'country', paramName:undefined, op:'eq', value:['CN'] },  // 来自分群
+      { name:'os', paramName:undefined, op:'eq', value:['Windows'] }   // 来自临时筛选
+    ]
+
+步骤 7：getQueryParams()
+  → {
+      country: ['CN'],      // 分群值
+      os: ['Windows'],      // 临时筛选值
+      match: 'any'          // 分群的 match
+    }
+
+步骤 8：mapFilter() → SQL 条件
+  session.country = ANY({{country}})
+  session.os = ANY({{os}})
+
+步骤 9：getFilterQuery() 逻辑组合（match='any'）
+  and (
+    session.country = ANY({{country}})
+    or session.os = ANY({{os}})
+  )
+```
+
+#### 最终 SQL
+```sql
+SELECT ...
+FROM website_event
+INNER JOIN session ON ...
+WHERE website_event.website_id = {websiteId}
+  AND website_event.created_at BETWEEN ...
+  AND (
+    session.country = ANY(ARRAY['CN'])      -- 分群条件
+    OR session.os = ANY(ARRAY['Windows'])   -- 临时筛选条件
+  )
+```
+
+**⚠️ 关键结果：**
+1. 临时筛选的 `country != US` 被分群的 `country = CN` 完全覆盖，不复存在
+2. 临时筛选的 `os = Windows` 保留，因为分群没有 os 筛选
+3. `match` 逻辑从 `all`（AND）被改为 `any`（OR），由分群决定
+4. 两个条件最终以 OR 组合，而非用户在临时筛选中设置的 AND
 
 ---
 
