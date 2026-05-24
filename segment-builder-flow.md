@@ -647,6 +647,206 @@ const cohortFilters = cohortParams.filters.map(({ name, ...props }) => ({
 
 ---
 
+## 3.6 GET vs POST 入口下的筛选参数处理差异
+
+### 3.6.1 两种请求入口概览
+
+| 入口类型 | 典型场景 | 参数来源 | 路径示例 |
+|----------|---------|---------|---------|
+| **GET** | 统计面板、实时数据 | URL query string | `/api/websites/{id}/stats?country=eq.CN&country1=neq.US` |
+| **POST** | 报表查询（漏斗、细分、留存等） | Request Body（`filters` 字段） | `POST /api/reports/funnel`  body: `{ filters: {...} }` |
+
+### 3.6.2 Schema 校验与数字后缀处理对比
+
+**核心差异代码：** `src/lib/request.ts:23-41`
+
+```typescript
+if (schema) {
+  const isGet = request.method === 'GET';
+  const rawQuery = query;
+  const result = schema.safeParse(isGet ? query : body);  // GET 解析 query，POST 解析 body
+
+  if (!result.success) {
+    error = () => badRequest(z.treeifyError(result.error));
+  } else if (isGet) {
+    query = result.data;
+
+    // ⭐ 仅 GET：重新添加被 Zod 剥离的带后缀参数
+    for (const key of Object.keys(rawQuery)) {
+      if (/\d+$/.test(key) && !(key in query)) {
+        query[key] = rawQuery[key];
+      }
+    }
+  } else {
+    body = result.data;  // ❌ POST：没有后缀重新添加逻辑！
+  }
+}
+```
+
+### 3.6.3 GET 请求完整链路（数字后缀保留）
+
+**URL：** `?country=eq.CN&country1=neq.US&segment=xxx`
+
+```
+步骤 1: parseRequest(schema)
+  rawQuery = { country: 'eq.CN', country1: 'neq.US', segment: 'xxx' }
+  schema.safeParse(rawQuery)
+    → Zod 校验：filterParams 中只有 'country'，没有 'country1'
+    → result.data = { country: 'eq.CN', segment: 'xxx' }  （country1 被剥离）
+  query = result.data
+
+步骤 2: GET 分支后缀回填（request.ts:33-38）
+  for (const key of Object.keys(rawQuery)) {
+    if (/\d+$/.test(key) && !(key in query)) {  // key='country1' 匹配
+      query[key] = rawQuery[key];  // 回填 country1
+    }
+  }
+  → query = { country: 'eq.CN', country1: 'neq.US', segment: 'xxx' }  ✅ 完整保留
+
+步骤 3: getQueryFilters(query, websiteId)
+  filters = getRequestFilters(query)
+    → { country: 'eq.CN', country1: 'neq.US', segment: 'xxx' }
+
+步骤 4: 合并分群筛选
+  Object.assign(filters, filtersArrayToObject(segment.filters))
+  → { country: 'eq.CN', country1: 'neq.US', segment: 'xxx', browser: 'eq.Chrome' }
+
+步骤 5: 最终 Filter[]（3 个条件）
+  [
+    { name: 'country', op: 'eq', value: ['CN'] },
+    { name: 'country', paramName: 'country1', op: 'neq', value: ['US'] },
+    { name: 'browser', op: 'eq', value: ['Chrome'] }
+  ]
+```
+
+### 3.6.4 POST 请求完整链路（数字后缀丢失）
+
+**前端流程：**
+1. URL：`?country=eq.CN&country1=neq.US&segment=xxx`
+2. `useFilterParameters()` 从 URL 提取 → `{ country: 'eq.CN', country1: 'neq.US', segment: 'xxx' }`
+3. `useResultQuery()` 发送 POST 请求：
+   ```typescript
+   post('/reports/funnel', {
+     websiteId,
+     type: 'funnel',
+     filters,  // 包含 country1
+     parameters: { ... }
+   })
+   ```
+
+**后端流程：**
+```
+步骤 1: parseRequest(reportResultSchema)
+  body = {
+    websiteId: 'xxx',
+    type: 'funnel',
+    filters: { country: 'eq.CN', country1: 'neq.US', segment: 'xxx' },
+    parameters: { ... }
+  }
+  schema.safeParse(body)
+    → reportResultSchema.filters = z.object({ ...filterParams })
+    → filterParams 中只有 'country'，没有 'country1'
+    → result.data.filters = { country: 'eq.CN', segment: 'xxx' }  （country1 被剥离！）
+  body = result.data  ❌ POST 分支没有后缀回填逻辑
+
+步骤 2: getQueryFilters(body.filters, websiteId)
+  filters = getRequestFilters(body.filters)
+    → { country: 'eq.CN', segment: 'xxx' }  （country1 已经丢失）
+
+步骤 3: 合并分群筛选
+  Object.assign(filters, filtersArrayToObject(segment.filters))
+  → { country: 'eq.CN', segment: 'xxx', browser: 'eq.Chrome' }
+
+步骤 4: 最终 Filter[]（只有 2 个条件！）
+  [
+    { name: 'country', op: 'eq', value: ['CN'] },
+    { name: 'browser', op: 'eq', value: ['Chrome'] }
+  ]
+```
+
+### 3.6.5 差异对比总结表
+
+| 处理环节 | GET 请求 | POST 请求 | 差异影响 |
+|----------|---------|----------|---------|
+| Zod 校验对象 | `query` | `body.filters` | 校验层级不同 |
+| 后缀参数剥离 | ✅ 是 | ✅ 是 | 相同 |
+| 后缀参数回填 | ✅ 有（`rawQuery` → `query`） | ❌ 无 | **核心差异** |
+| 最终 `country1` 保留 | ✅ 保留 | ❌ 丢失 | 条件数量不同 |
+| `getRequestFilters()` 输入 | 含后缀 | 不含后缀 | 结果不同 |
+| 分群合并基底 | 完整临时筛选 | 残缺临时筛选 | **查询结果不一致** |
+
+### 3.6.6 对分群 + 临时筛选组合查询的一致性影响
+
+**⚠️ 关键问题：** GET 和 POST 对同一份筛选条件（URL 相同）会产生不同的查询结果
+
+#### 对比示例（同 URL 不同入口）
+
+**前置条件：**
+- URL：`?country=eq.CN&country1=neq.US&segment=xxx`
+- Segment「Chrome 用户」：`[{ name: 'browser', op: 'eq', value: 'Chrome' }]`, `match=all`
+
+| 入口 | 有效条件 | 最终 SQL（match=all） | 查询结果 |
+|------|---------|----------------------|---------|
+| **GET /stats** | `country=CN` AND `country≠US` AND `browser=Chrome` | `session.country = ANY(ARRAY['CN']) AND session.country != ALL(ARRAY['US']) AND session.browser = ANY(ARRAY['Chrome'])` | 中国（非美国）的 Chrome 用户 |
+| **POST /reports/funnel** | `country=CN` AND `browser=Chrome` | `session.country = ANY(ARRAY['CN']) AND session.browser = ANY(ARRAY['Chrome'])` | 中国的 Chrome 用户（包含美国用户） |
+
+**一致性影响：**
+1. **查询结果不一致**：同一页面的 GET 统计和 POST 报表显示不同的用户数量
+2. **条件静默丢失**：无任何错误提示，`country1` 条件默默消失
+3. **分群覆盖逻辑受影响**：如果分群也有 `country` 条件，POST 中临时筛选的 `country` 被覆盖后，`country1` 又丢失，可能导致所有 country 相关临时筛选全部失效
+4. **match 逻辑影响**：如果丢失的是 OR 组合中的关键条件，可能导致逻辑完全改变
+
+#### 极端场景（分群 + 多同名字段）
+
+**临时筛选：** `country=eq.CN&country1=neq.US&country2=neq.JP&match=any`  
+**分群：** `[{ name: 'country', op: 'eq', value: 'KR' }]`（1 个 country 条件）
+
+| 入口 | 合并后条件 | 最终逻辑（match=any） |
+|------|-----------|----------------------|
+| **GET** | `country=KR`（分群覆盖）+ `country1≠US` + `country2≠JP` | `KR OR ≠US OR ≠JP` → 几乎所有用户 |
+| **POST** | `country=KR`（分群覆盖） | `KR` → 仅韩国用户 |
+
+**结果差异：** GET 返回几乎全部数据，POST 只返回韩国用户，结果天差地别。
+
+### 3.6.7 根本原因分析
+
+**Schema 定义问题：** `src/lib/schema.ts:45-71`
+
+```typescript
+export const filterParams = {
+  country: z.string().optional(),   // 只定义了 'country'
+  browser: z.string().optional(),
+  // ... 其他字段
+  // ❌ 缺少动态后缀支持：没有 country1, country2, browser1 等
+};
+
+export const reportResultSchema = z.intersection(
+  z.object({
+    websiteId: z.uuid(),
+    filters: z.object({ ...filterParams }),  // ❌ 使用静态 filterParams 校验动态 filters
+  }),
+  reportTypeSchema,
+);
+```
+
+**回填逻辑不完整：** `src/lib/request.ts:33-38`
+
+```typescript
+else if (isGet) {
+  query = result.data;
+  // ⚠️ 只处理了 GET 的 query，没有处理 POST 的 body.filters
+  for (const key of Object.keys(rawQuery)) {
+    if (/\d+$/.test(key) && !(key in query)) {
+      query[key] = rawQuery[key];
+    }
+  }
+} else {
+  body = result.data;  // ❌ POST 没有类似的后缀回填逻辑
+}
+```
+
+---
+
 ## 四、URL 参数 → 后端查询编排
 
 ### 4.1 参数解析流程
@@ -687,7 +887,7 @@ return useMemo(() => {
 
 `getQueryFilters()` 是核心编排函数，负责：
 1. 解析日期范围
-2. 提取普通筛选参数（含带后缀参数）
+2. 提取普通筛选参数（含带后缀参数，POST 入口下可能已丢失）
 3. **合并分群（Segment）筛选条件**（同 key 覆盖，详见 3.5 节）
 4. **合并队列（Cohort）筛选条件**（加前缀，无冲突）
 
@@ -1066,6 +1266,8 @@ WHERE website_event.website_id = {websiteId}
 3. `match` 逻辑从 `all`（AND）被改为 `any`（OR），由分群决定
 4. 两个条件最终以 OR 组合，而非用户在临时筛选中设置的 AND
 
+**⚠️ GET vs POST 一致性提醒：** 以上流程假设是 GET 请求。如果是 POST 报表请求（如漏斗、细分），且临时筛选包含带数字后缀的同名字段（如 `country1`），则在 Schema 校验后后缀字段会丢失，导致查询条件与 GET 入口不一致。详见 3.6 节。
+
 ---
 
 ## 七、关键文件索引
@@ -1075,15 +1277,18 @@ WHERE website_event.website_id = {websiteId}
 | 类型定义 | `src/lib/types.ts` | Filter, QueryFilters, Operator 等类型 |
 | 常量定义 | `src/lib/constants.ts` | OPERATORS, FILTER_COLUMNS, 字段分组 |
 | 参数编解码 | `src/lib/params.ts` | filtersArrayToObject, filtersObjectToArray, parseFilterValue, isSearchOperator |
-| 请求解析 | `src/lib/request.ts` | parseRequest（后缀回填）, getQueryFilters（分群/队列合并）, getRequestFilters |
+| 请求解析 | `src/lib/request.ts` | parseRequest（GET 后缀回填，POST 无）, getQueryFilters（分群/队列合并）, getRequestFilters |
 | PG 查询转换 | `src/lib/prisma.ts` | mapFilter, getFilterQuery, parseFilters, getQueryParams |
 | CH 查询转换 | `src/lib/clickhouse.ts` | 同上，ClickHouse 版本 |
 | 字段元数据 | `src/components/hooks/useFields.ts` | 字段分组、标签定义 |
 | 操作符标签 | `src/components/hooks/useOperatorLabels.ts` | 操作符枚举 → 显示文本映射 |
 | 筛选 Hook | `src/components/hooks/useFilters.ts` | 操作符类型映射（typeFilters）、URL → Filter[] |
 | 参数提取 | `src/components/hooks/useFilterParameters.ts` | 从 URL 提取筛选参数 |
+| 报表查询 | `src/components/hooks/queries/useResultQuery.ts` | POST 报表请求构建（filters 取自 URL） |
 | 字段筛选 UI | `src/components/input/FieldFilters.tsx` | 筛选条件列表 |
 | 单条筛选 UI | `src/components/common/FilterRecord.tsx` | 单条筛选条件行（含操作符下拉逻辑） |
 | 筛选编辑弹窗 | `src/components/input/FilterEditForm.tsx` | 完整筛选编辑器 |
 | 分群编辑 | `src/app/(main)/websites/[websiteId]/segments/SegmentEditForm.tsx` | 分群保存表单 |
-| Schema 验证 | `src/lib/schema.ts` | segmentParamSchema, operatorParam, filterParams |
+| 报表 API | `src/app/api/reports/funnel/route.ts` | 漏斗报表 POST 入口 |
+| 报表 API | `src/app/api/reports/breakdown/route.ts` | 细分报表 POST 入口 |
+| Schema 验证 | `src/lib/schema.ts` | segmentParamSchema, operatorParam, filterParams, reportResultSchema |
