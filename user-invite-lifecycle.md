@@ -104,7 +104,268 @@ ROLES = {
 | `canUpdateUser` | 系统管理员 OR 编辑自己 |
 | `canDeleteUser` | 系统管理员 |
 
-### 2.4 邀请链路的真实入口与权限边界
+### 2.4 指定团队归属的主路径
+
+团队归属的指定发生在**团队创建时**，通过 `ownerId` 参数决定团队的所有权归属。这是整个邀请链路和权限体系的"根"。
+
+---
+
+#### 第一层：创建团队时 ownerId 的决定逻辑
+
+**API 端点**：`POST /api/teams`  
+`src/app/api/teams/route.ts:30-78`
+
+✅ **已证实（代码原文）**：请求参数定义
+```typescript
+const schema = z.object({
+  name: z.string().max(50),
+  ownerId: z.uuid().optional(),  // ❗ ownerId 是可选参数
+});
+```
+
+✅ **已证实（代码原文）**：ownerId 决定逻辑 `src/app/api/teams/route.ts:46-58`
+```typescript
+const { name, ownerId } = body;
+
+const teamId = uuid();
+const teamOwnerId = ownerId ?? auth.user.id;  // ❗ 关键逻辑
+// - 如果请求中提供了 ownerId，使用指定的用户作为 owner
+// - 如果没有提供，默认使用当前登录用户作为 owner
+
+const team = await createTeam(
+  {
+    id: teamId,
+    name,
+    accessCode: `team_${getRandomChars(16)}`,
+  },
+  teamOwnerId,  // 传入 ownerId 到 createTeam
+);
+```
+
+**数据层实现**：`createTeam` 函数 `src/queries/prisma/team.ts:110-127`
+```typescript
+export async function createTeam(data: Prisma.TeamCreateInput, userId: string): Promise<any> {
+  const { id } = data;
+  const { client, transaction } = prisma;
+
+  return transaction([
+    client.team.create({ data }),  // 创建 Team 记录
+    client.teamUser.create({
+      data: {
+        id: uuid(),
+        teamId: id,
+        userId,
+        role: ROLES.teamOwner,  // ❗ 自动授予 teamOwner 角色
+      },
+    }),
+  ]);
+}
+```
+
+**关键联动**：创建团队时，除了创建 Team 记录，还会**自动创建一条 TeamUser 记录**，将指定的 owner 用户以 `teamOwner` 角色加入团队。
+
+---
+
+#### 谁有资格指定 ownerId？
+
+**前端控制**：`src/app/(main)/teams/TeamAddForm.tsx:38-42`
+```typescript
+{isAdmin && (
+  <FormField name="ownerId" label={t(labels.teamOwner)}>
+    <UserSelect buttonProps={{ style: { outline: 'none' } }} />
+  </FormField>
+)}
+```
+✅ **已证实**：只有 `isAdmin` 为 true 时，前端才会显示 `ownerId` 选择框。普通用户创建团队时看不到这个选项。
+
+**权限检查**：`canCreateTeam` 函数 `src/permissions/team.ts:18-28`
+```typescript
+export async function canCreateTeam({ user }: Auth) {
+  if (!user) return false;
+  if (user.isAdmin) return true;  // ✅ admin 可以创建
+  return hasPermission(user.role, PERMISSIONS.teamCreate);  // ✅ 普通用户需要 team:create 权限
+}
+```
+
+**资格总结表**：
+
+| 用户角色 | 能否创建团队 | 能否指定 ownerId | 实际 owner |
+|---------|-------------|-----------------|------------|
+| admin | ✅ 可以 | ✅ 可以指定任意用户 | 指定的用户 |
+| 普通用户（user） | ✅ 可以（有 `team:create` 权限） | ❌ 不能指定 | 当前用户自己 |
+| viewOnly | ❌ 不可以 | - | - |
+
+✅ **已证实（代码原文）**：普通用户的 `team:create` 权限定义 `src/lib/constants.ts:188-193`
+```typescript
+[ROLES.user]: [
+  PERMISSIONS.websiteCreate,
+  PERMISSIONS.websiteUpdate,
+  PERMISSIONS.websiteDelete,
+  PERMISSIONS.teamCreate,  // ✅ 普通用户有创建团队的权限
+],
+```
+
+---
+
+#### 第二层：归属关系与后续操作的联动
+
+团队归属关系（即 TeamUser 记录中的 `role = teamOwner`）是后续所有权限的基础。
+
+##### 联动一：归属关系 → 邀请成员权限
+
+邀请成员的权限检查函数 `canUpdateTeam` `src/permissions/team.ts:30-42`：
+```typescript
+export async function canUpdateTeam({ user }: Auth, teamId: string) {
+  if (!user) return false;
+  if (user.isAdmin) return true;
+  
+  const teamUser = await getTeamUser(teamId, user.id);  // 查询 TeamUser 记录
+  return teamUser && hasPermission(teamUser.role, PERMISSIONS.teamUpdate);
+}
+```
+
+✅ **已证实**：`teamOwner` 角色的权限 `src/lib/constants.ts:195-203`
+```typescript
+[ROLES.teamOwner]: [
+  PERMISSIONS.teamUpdate,      // ✅ 拥有 team:update 权限
+  PERMISSIONS.teamDelete,
+  PERMISSIONS.websiteCreate,
+  PERMISSIONS.websiteUpdate,
+  PERMISSIONS.websiteDelete,
+  PERMISSIONS.websiteTransferToTeam,  // ✅ 拥有 website:transfer-to-team 权限
+  PERMISSIONS.websiteTransferToUser,
+],
+```
+
+**联动链**：
+```
+创建团队 → 自动创建 TeamUser(role=teamOwner) → 拥有 team:update 权限 → 可以邀请成员
+```
+
+##### 联动二：归属关系 → 网站转移权限
+
+网站转移到团队的权限检查函数 `canTransferWebsiteToTeam` `src/permissions/website.ts:134-152`：
+```typescript
+export async function canTransferWebsiteToTeam({ user }: Auth, websiteId: string, teamId: string) {
+  if (!user) return false;
+  // ❗ 没有 admin 豁免！
+  
+  const website = await getWebsite(websiteId);
+  if (!website) return false;
+  
+  // 条件1：必须是网站的当前个人所有者
+  if (website.userId && website.userId === user.id) {
+    // 条件2：在目标团队中必须有 transfer 权限
+    const teamUser = await getTeamUser(teamId, user.id);
+    return teamUser && hasPermission(teamUser.role, PERMISSIONS.websiteTransferToTeam);
+  }
+  
+  return false;
+}
+```
+
+✅ **已证实**：`teamOwner` 和 `teamManager` 拥有 `website:transfer-to-team` 权限 `src/lib/constants.ts:195-210`
+```typescript
+[ROLES.teamOwner]: [
+  // ...
+  PERMISSIONS.websiteTransferToTeam,  // ✅ 有转移权限
+  PERMISSIONS.websiteTransferToUser,
+],
+[ROLES.teamManager]: [
+  PERMISSIONS.teamUpdate,
+  PERMISSIONS.websiteCreate,
+  PERMISSIONS.websiteUpdate,
+  PERMISSIONS.websiteDelete,
+  PERMISSIONS.websiteTransferToTeam,  // ✅ 也有转移权限
+],
+```
+
+**联动链**：
+```
+创建网站（归属个人） → 用户是 website.userId → 作为 teamOwner/manager 加入团队
+→ 拥有 website:transfer-to-team 权限 → 可以将网站转移到团队
+```
+
+##### 联动三：归属关系 → 网站创建归属
+
+创建网站时可以指定 `teamId`，此时归属关系如下 `src/app/api/websites/route.ts:71-81`：
+```typescript
+const data: any = {
+  id: id ?? uuid(),
+  createdBy: auth.user.id,
+  name,
+  domain,
+  teamId,
+};
+
+if (!teamId) {
+  data.userId = auth.user.id;  // ❗ 不指定 teamId 则归属个人
+}
+```
+
+✅ **已证实**：指定 `teamId` 创建网站时的权限检查 `src/app/api/websites/route.ts:67-69`
+```typescript
+if ((teamId && !(await canCreateTeamWebsite(auth, teamId))) || !(await canCreateWebsite(auth))) {
+  return unauthorized();
+}
+```
+
+`canCreateTeamWebsite` 函数 `src/permissions/team.ts:76-88`：
+```typescript
+export async function canCreateTeamWebsite({ user }: Auth, teamId: string) {
+  if (!user) return false;
+  if (user.isAdmin) return true;
+  
+  const teamUser = await getTeamUser(teamId, user.id);
+  return teamUser && hasPermission(teamUser.role, PERMISSIONS.websiteCreate);
+}
+```
+
+**联动链**：
+```
+用户是 teamOwner/manager → 拥有 website:create 权限 → 可以在团队下创建网站
+→ 网站归属团队（website.teamId = teamId, website.userId = null）
+```
+
+---
+
+#### 归属关系全景图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    指定团队归属（创建团队时）                     │
+│                                                                 │
+│  POST /api/teams                                                 │
+│  ├─ 参数：name, ownerId(可选)                                    │
+│  ├─ 权限：canCreateTeam                                          │
+│  └─ 逻辑：teamOwnerId = ownerId ?? auth.user.id                 │
+│                                                                 │
+│         ↓ 自动创建 TeamUser(role=teamOwner)                     │
+│                                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                    归属关系的权限联动                            │
+│                                                                 │
+│  TeamUser.role = teamOwner                                      │
+│  ├─ 拥有 team:update 权限 → 可以邀请成员、修改团队设置           │
+│  ├─ 拥有 team:delete 权限 → 可以删除团队                         │
+│  ├─ 拥有 website:create 权限 → 可以在团队下创建网站              │
+│  ├─ 拥有 website:transfer-to-team 权限 → 可以转移网站到团队      │
+│  └─ 拥有 website:transfer-to-user 权限 → 可以转移网站到个人      │
+│                                                                 │
+│  TeamUser.role = teamManager                                    │
+│  ├─ 拥有 team:update 权限 → 可以邀请成员、修改团队设置           │
+│  ├─ 拥有 website:create 权限 → 可以在团队下创建网站              │
+│  └─ 拥有 website:transfer-to-team 权限 → 可以转移网站到团队      │
+│                                                                 │
+│  TeamUser.role = teamMember                                     │
+│  └─ 拥有 website:create 权限 → 可以在团队下创建网站              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 2.5 邀请链路的真实入口与权限边界
 
 > ✅ **已证实**：邀请链路（即"添加团队成员"）与"网站转移（归属变更）"是**完全独立**的两个功能，不应混为一谈。
 
@@ -134,7 +395,43 @@ export async function canUpdateTeam({ user }: Auth, teamId: string) {
 
 **邀请链路的另一个入口**：用户通过访问码主动加入  
 **API 端点**：`POST /api/teams/join`  
-**权限检查**：无特殊权限要求，只要登录用户 + 有效访问码即可加入
+
+✅ **已证实（代码原文）**：`src/app/api/teams/join/route.ts:7-38`
+```typescript
+const schema = z.object({
+  accessCode: z.string(),  // 只需要访问码
+});
+
+const { auth, body, error } = await parseRequest(request, schema);
+
+if (error) {
+  return error();
+}
+
+const { accessCode } = body;
+
+// ❗ 关键：没有特殊权限检查，只要是登录用户即可
+const team = await findTeam({
+  where: {
+    accessCode,
+  },
+});
+
+if (!team) {
+  return notFound({ message: 'Team not found.', code: 'team-not-found' });
+}
+
+const teamUser = await getTeamUser(team.id, auth.user.id);
+
+if (teamUser) {
+  return badRequest({ message: 'User is already a team member.' });
+}
+
+// 自动授予 team-member 角色
+const user = await createTeamUser(auth.user.id, team.id, ROLES.teamMember);
+```
+
+✅ **已证实**：无特殊权限要求，只要登录用户 + 有效访问码即可加入，自动获得 `team-member` 角色。
 
 ---
 
@@ -897,19 +1194,26 @@ export async function deleteTeam(teamId: string) {
 | 角色权限定义 | `src/lib/constants.ts` | 164-217 |
 | 权限检查（团队） | `src/permissions/team.ts` | 1-92 |
 | 权限检查（用户） | `src/permissions/user.ts` | 1-37 |
+| 权限检查（网站） | `src/permissions/website.ts` | 1-152 |
+| **团队创建 API（归属指定）** | `src/app/api/teams/route.ts` | **30-78** |
 | 添加团队成员 API | `src/app/api/teams/[teamId]/users/route.ts` | 54-83 |
 | 访问码加入 API | `src/app/api/teams/join/route.ts` | 7-39 |
 | 团队成员管理 API | `src/app/api/teams/[teamId]/users/[userId]/route.ts` | 1-85 |
+| **网站创建 API（归属指定）** | `src/app/api/websites/route.ts` | **38-100** |
+| **网站转移 API（归属变更）** | `src/app/api/websites/[websiteId]/transfer/route.ts` | **7-49** |
 | 用户创建 API | `src/app/api/users/route.ts` | 11-45 |
 | 用户删除 API | `src/app/api/users/[userId]/route.ts` | 83-106 |
 | 登录验证 | `src/app/api/auth/login/route.ts` | 12-48 |
 | 用户查询 | `src/queries/prisma/user.ts` | 1-206 |
 | 团队操作 | `src/queries/prisma/team.ts` | 1-172 |
 | 团队用户关联操作 | `src/queries/prisma/teamUser.ts` | 1-66 |
+| 网站操作 | `src/queries/prisma/website.ts` | 1-323 |
 | 认证中间件 | `src/lib/auth.ts` | 17-60 |
+| **团队创建表单（owner选择）** | `src/app/(main)/teams/TeamAddForm.tsx` | **1-53** |
 | 添加成员表单 | `src/app/(main)/teams/TeamMemberAddForm.tsx` | 1-72 |
 | 加入团队表单 | `src/app/(main)/teams/TeamJoinForm.tsx` | 1-40 |
 | 团队设置 | `src/app/(main)/teams/[teamId]/TeamSettings.tsx` | 1-55 |
+| **网站转移表单** | `src/app/(main)/websites/[websiteId]/settings/WebsiteTransferForm.tsx` | **1-70** |
 
 ---
 
@@ -988,27 +1292,73 @@ export async function deleteTeam(teamId: string) {
 
 ### 7.1 已证实（代码原文可证）
 
+✅ **团队归属相关（第一层：创建团队时）**：
+1. 团队归属在创建时通过 `ownerId` 参数指定，`ownerId` 是可选参数
+   - 代码依据：`src/app/api/teams/route.ts:33` - `ownerId: z.uuid().optional()`
+2. `ownerId` 的决定逻辑：`teamOwnerId = ownerId ?? auth.user.id`
+   - 提供了 `ownerId` 则使用指定用户，否则使用当前登录用户
+   - 代码依据：`src/app/api/teams/route.ts:49`
+3. 创建团队时自动创建 TeamUser 记录，`role = ROLES.teamOwner`
+   - 代码依据：`src/queries/prisma/team.ts:118-124`
+4. 只有 admin 能在前端看到 `ownerId` 选择框，普通用户看不到
+   - 代码依据：`src/app/(main)/teams/TeamAddForm.tsx:38-42` - `{isAdmin && (...)}`
+5. 普通用户有创建团队的权限（`team:create`），但只能将 owner 设为自己
+   - 代码依据：`src/lib/constants.ts:192` - `PERMISSIONS.teamCreate` 在 `ROLES.user` 中
+6. `canCreateTeam` 权限：admin 直接通过，普通用户需要 `team:create` 权限
+   - 代码依据：`src/permissions/team.ts:18-28`
+
+✅ **团队归属相关（第二层：联动影响）**：
+1. `teamOwner` 角色拥有 `team:update` 权限 → 可以邀请成员、修改团队设置
+   - 代码依据：`src/lib/constants.ts:196`
+2. `teamOwner` 角色拥有 `team:delete` 权限 → 可以删除团队
+   - 代码依据：`src/lib/constants.ts:197`
+3. `teamOwner` 和 `teamManager` 角色拥有 `website:transfer-to-team` 权限 → 可以转移网站到团队
+   - 代码依据：`src/lib/constants.ts:201, 209`
+4. 只有 `teamOwner` 拥有 `website:transfer-to-user` 权限 → 可以转移网站到个人
+   - 代码依据：`src/lib/constants.ts:202`，`teamManager` 权限列表中无此项
+5. 创建网站时指定 `teamId`，网站归属团队（`website.teamId = teamId, userId = null`）
+   - 代码依据：`src/app/api/websites/route.ts:76-80`
+6. 创建团队网站需要 `canCreateTeamWebsite` 权限，检查团队内 `website:create` 权限
+   - 代码依据：`src/permissions/team.ts:76-88`
+7. 查询用户网站时，`getAllUserWebsitesIncludingTeamOwner` 会返回：
+   - 个人网站（`website.userId = userId`）
+   - 作为 teamOwner 的团队的网站
+   - 代码依据：`src/queries/prisma/website.ts:49-62`
+
 ✅ **邀请链路相关**：
 1. 邀请链路的真实入口只有两个：
    - `POST /api/teams/{teamId}/users` - 管理员直接添加成员
    - `POST /api/teams/join` - 用户通过访问码加入
-2. 网站转移（`POST /api/websites/{websiteId}/transfer`）不属于邀请链路，是独立的资源归属管理功能
-3. `canUpdateTeam`（用于邀请）有 `isAdmin` 豁免，admin 可直接添加成员
-4. `canTransferWebsiteToTeam` **没有** `isAdmin` 豁免，admin 也必须是网站所有者 + 在目标团队有 transfer 权限
-5. `canTransferWebsiteToUser` **没有** `isAdmin` 豁免，且只能转移给自己
-6. 网站转移是唯一没有 admin 豁免的权限检查，与其他 7 个权限函数不一致
-7. `findTeam` 和 `getTeam` 没有过滤 `deletedAt`，与 `findUser` 行为不一致
-8. `getTeamUser` 没有关联检查 `team.deletedAt` 或 `user.deletedAt`
+2. 访问码加入无特殊权限要求，只要登录用户 + 有效访问码即可，自动获得 `team-member` 角色
+   - 代码依据：`src/app/api/teams/join/route.ts:7-38`
+3. 网站转移（`POST /api/websites/{websiteId}/transfer`）不属于邀请链路，是独立的资源归属管理功能
+4. `canUpdateTeam`（用于邀请）有 `isAdmin` 豁免，admin 可直接添加成员
+   - 代码依据：`src/permissions/team.ts:35` - `if (user.isAdmin) return true;`
+5. `canTransferWebsiteToTeam` **没有** `isAdmin` 豁免，admin 也必须是网站所有者 + 在目标团队有 transfer 权限
+   - 代码依据：`src/permissions/website.ts:134-152` - 无 `isAdmin` 检查
+6. `canTransferWebsiteToUser` **没有** `isAdmin` 豁免，且只能转移给自己
+   - 代码依据：`src/permissions/website.ts:114-132` - 无 `isAdmin` 检查，且 `user.id === userId`
+7. 网站转移是唯一没有 admin 豁免的权限检查，与其他 7 个权限函数不一致
+8. `findTeam` 和 `getTeam` 没有过滤 `deletedAt`，与 `findUser` 行为不一致
+   - 代码依据：`src/queries/prisma/team.ts:9-25`
+9. `getTeamUser` 没有关联检查 `team.deletedAt` 或 `user.deletedAt`
+   - 代码依据：`src/queries/prisma/teamUser.ts:12-19`
 
 ✅ **禁用状态相关**：
 1. 团队被禁用（`deletedAt IS NOT NULL`）后，仍然可以通过访问码加入
+   - 代码依据：`src/app/api/teams/join/route.ts:18-22` - `findTeam({ where: { accessCode } })` 不过滤 `deletedAt`
 2. 团队被禁用后，管理员仍然可以向该团队添加新成员
+   - 代码依据：`src/permissions/team.ts:30-42` - `canUpdateTeam` 不过滤 `deletedAt`
 3. 用户被禁用后，管理员仍然可以向该用户添加团队成员关系（数据库写入成功）
+   - 代码依据：`src/app/api/teams/[teamId]/users/route.ts:68-82` - 添加成员时不调用 `getUser` 检查状态
 4. 团队成员列表查询会过滤 `user.deletedAt = null`，禁用用户不会显示在列表中
+   - 代码依据：`src/app/api/teams/[teamId]/users/route.ts:28-35` - `where: { user: { deletedAt: null } }`
 5. 用户登录时 `getUserByUsername` 默认过滤 `deletedAt = null`，禁用用户无法登录
+   - 代码依据：`src/queries/prisma/user.ts:14-31` - `findUser` 默认 `showDeleted = false`
 
 ✅ **删除账号相关**：
 1. 云模式删除用户时，只软删除用户和其网站，**完全不处理** TeamUser 关联和用户拥有的团队
+   - 代码依据：`src/queries/prisma/user.ts:129-147` - 只包含 `client.website.updateMany` 和 `client.user.update`
 2. 非云模式删除用户时，级联删除：
    - 用户的所有网站及其关联数据
    - 用户作为 owner 的团队的所有成员关联
@@ -1016,9 +1366,13 @@ export async function deleteTeam(teamId: string) {
    - 用户拥有的团队
    - 用户的所有报表
    - 用户本身（物理删除）
+   - 代码依据：`src/queries/prisma/user.ts:149-206` - 完整的 transaction 链
 3. 云模式删除团队时，只软删除团队本身，**不处理** TeamUser 关联和团队的网站
+   - 代码依据：`src/queries/prisma/team.ts:147-157` - 只包含 `client.team.update`
 4. 非云模式删除团队时，删除所有 TeamUser 关联后物理删除团队
+   - 代码依据：`src/queries/prisma/team.ts:160-171` - `client.teamUser.deleteMany` + `client.team.delete`
 5. `getTeamOwner` 函数不过滤 `user.deletedAt`，可能返回已禁用的用户
+   - 代码依据：`src/queries/prisma/team.ts:103-108` - `where: { teamId, role: ROLES.teamOwner }` 无 `deletedAt` 过滤
 
 ### 7.2 待验证（需要运行时测试或边界场景验证）
 
