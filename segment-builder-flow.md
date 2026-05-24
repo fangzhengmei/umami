@@ -12,13 +12,13 @@
 
 ```typescript
 export interface Filter {
-  name: string;           // 字段名（如 path, country, browser）
+  name: string;           // 字段基础名（如 path, country, browser，去掉数字后缀）
   operator: Operator;     // 操作符（枚举值）
   value: string | string[]; // 筛选值
   type?: string;          // 数据类型（string, number, boolean, date, array, uuid）
   column?: string;        // 数据库列名（映射自 FILTER_COLUMNS）
   prefix?: string;        // 表前缀
-  paramName?: string;     // 参数名（用于多同名字段区分）
+  paramName?: string;     // 原始参数名（带数字后缀，用于 SQL 参数绑定去重）
 }
 ```
 
@@ -168,12 +168,63 @@ FilterEditForm (src/components/input/FilterEditForm.tsx)
 单个筛选条件行的 UI 组件，包含三部分：
 
 1. **字段标签**：通过 `useFields()` 查找 `name` 对应的显示标签
-2. **操作符下拉**：根据字段类型过滤可用操作符（`useFilters().typeFilters`）
+2. **操作符下拉**：⚠️ **硬编码仅显示 string 类型操作符**（`FilterRecord.tsx:82-89`）
 3. **值输入**：
    - 搜索类操作符（`c`, `dnc`, `re`, `nre`）→ `TextField` 自由输入
    - 其他操作符 → `MultiSelect` 从后端枚举值中选择，调用 `useWebsiteValuesQuery` 动态加载可选值
 
-### 2.4 数据流向（UI 状态 → URL 参数）
+#### ⚠️ 操作符选择逻辑的理解纠正
+
+**之前的理解偏差**：操作符下拉会根据字段类型动态过滤可用操作符（使用 `useFilters().typeFilters`）
+
+**实际代码实现**（`FilterRecord.tsx:82-89`）：
+
+```typescript
+<Select value={operator} onChange={handleSelectOperator}>
+  {operators
+    .filter(({ type }) => type === 'string')  // 硬编码只显示 string 类型操作符！
+    .map(({ name, label }: any) => (
+      <ListItem key={name} id={name}>
+        {label}
+      </ListItem>
+    ))}
+</Select>
+```
+
+**真相**：当前实现中，**所有字段的操作符下拉都只显示 string 类型的 6 个操作符**（`eq`, `neq`, `c`, `dnc`, `re`, `nre`）。`useFilters.ts` 中虽然定义了 `typeFilters` 和 `getFilters(type)` 函数（按类型返回对应操作符），但这些在 UI 中**并未被实际使用**。
+
+**`typeFilters` 定义**（`src/components/hooks/useFilters.ts:36-57`）：
+
+```typescript
+const typeFilters = {
+  string: [eq, neq, c, dnc, re, nre],      // 当前实际使用的
+  array: [c, dnc],
+  boolean: [t, f],
+  number: [eq, neq, gt, lt, gte, lte],     // 定义了但 UI 未使用
+  date: [bf, af],                           // 定义了但 UI 未使用
+  uuid: [eq],                               // 定义了但 UI 未使用
+};
+```
+
+### 2.4 操作符标签映射
+
+**文件：** `src/components/hooks/useOperatorLabels.ts`
+
+`useOperatorLabels()` 返回操作符枚举值到国际化显示文本的映射：
+
+```typescript
+{
+  eq: '是',
+  neq: '不是',
+  c: '包含',
+  dnc: '不包含',
+  re: '正则匹配',
+  nre: '正则不匹配',
+  // ...其他操作符的标签
+}
+```
+
+### 2.5 数据流向（UI 状态 → URL 参数）
 
 **文件：** `src/components/input/FilterEditForm.tsx:60-68`
 
@@ -217,17 +268,198 @@ export function filtersArrayToObject(filters: Filter[]) {
 
 // 输出（URL params）
 {
-  country: 'eq.CN,US',
+  country: 'eq.CN,US',    // 第一个 country 无后缀
   browser: 'c.Chrome',
-  country1: 'neq.JP'
+  country1: 'neq.JP'      // 第二个 country 加后缀 1
 }
 ```
 
 ---
 
-## 三、URL 参数 → 后端查询编排
+## 三、同名筛选条件数字后缀完整链路
 
-### 3.1 参数解析流程
+### 3.1 问题背景
+
+Zod Schema 中只定义了基础字段名（如 `country`, `browser`），未定义带数字后缀的字段（如 `country1`, `country2`）。因此在请求校验时，带后缀的参数会被 Zod 过滤掉，需要特殊处理。
+
+### 3.2 完整链路说明
+
+#### 阶段 1：前端生成带后缀参数
+
+```
+Filter[] 数组（含同名字段）
+  ↓ filtersArrayToObject() [src/lib/params.ts:78-90]
+URL 参数对象：{ country: 'eq.CN', country1: 'neq.US' }
+  ↓
+HTTP 请求：?country=eq.CN&country1=neq.US
+```
+
+#### 阶段 2：请求校验与后缀回填
+
+**文件：** `src/lib/request.ts:23-42`
+
+```typescript
+if (schema) {
+  const isGet = request.method === 'GET';
+  const rawQuery = query;                    // 1. 保存原始 query（含后缀）
+  const result = schema.safeParse(isGet ? query : body);  // 2. Zod 校验，会剥离 country1
+
+  if (!result.success) {
+    error = () => badRequest(z.treeifyError(result.error));
+  } else if (isGet) {
+    query = result.data;                     // 3. 此时 query 中已无 country1
+
+    // ⭐ 关键：回填被 Zod 剥离的带后缀参数
+    for (const key of Object.keys(rawQuery)) {
+      if (/\d+$/.test(key) && !(key in query)) {  // 检测数字后缀且不在校验结果中
+        query[key] = rawQuery[key];          // 4. 回填：{ country: 'eq.CN', country1: 'neq.US' }
+      }
+    }
+  }
+}
+```
+
+#### 阶段 3：筛选参数提取
+
+**文件：** `src/lib/request.ts:79-90`
+
+```typescript
+export function getRequestFilters(query: Record<string, any>) {
+  const result: Record<string, any> = {};
+
+  for (const key of Object.keys(query)) {
+    const baseName = key.replace(/\d+$/, '');  // 去掉数字后缀匹配字段
+    if (baseName in FILTER_COLUMNS) {
+      result[key] = query[key];               // 保留原始 key（带后缀）
+    }
+  }
+
+  return result;  // { country: 'eq.CN', country1: 'neq.US' }
+}
+```
+
+#### 阶段 4：参数 → Filter 对象数组转换
+
+**文件：** `src/lib/params.ts:42-76`
+
+```typescript
+export function filtersObjectToArray(filters: QueryFilters, options: QueryOptions = {}): Filter[] {
+  return Object.keys(filters).reduce((arr, key) => {
+    const filter = filters[key];
+
+    const baseName = key.replace(/\d+$/, '');       // 'country1' → 'country'
+    const paramName = key !== baseName ? key : undefined;  // 'country1' 作为 paramName 保留
+
+    const { operator, value } = parseFilterValue(filter);
+
+    return arr.concat({
+      name: baseName,        // 基础名：'country'（用于查表名、列名映射）
+      paramName,             // 原始参数名：'country1'（用于 SQL 参数绑定）
+      column: FILTER_COLUMNS[baseName],  // 'country'
+      operator,
+      value,
+      prefix: options?.prefix,
+    });
+  }, []);
+}
+```
+
+转换结果：
+```typescript
+[
+  { name: 'country', paramName: undefined, column: 'country', operator: 'eq', value: ['CN'] },
+  { name: 'country', paramName: 'country1', column: 'country', operator: 'neq', value: 'US' }
+]
+```
+
+#### 阶段 5：SQL 参数绑定（避免参数名冲突）
+
+**文件：** `src/lib/prisma.ts:208-230`
+
+```typescript
+function getQueryParams(filters: Record<string, any>) {
+  return {
+    ...filters,
+    ...filtersObjectToArray(filters).reduce((obj, { name, column, operator, value, paramName }) => {
+      const key = paramName ?? name;  // ⭐ 使用 paramName 避免参数名冲突
+
+      if (operator === 'c' || operator === 'dnc') {
+        obj[key] = `%${value}%`;
+      } else if (operator === 'eq' || operator === 'neq') {
+        obj[key] = Array.isArray(value) ? value : [value];
+      } else {
+        obj[key] = value;
+      }
+
+      return obj;
+    }, {}),
+  };
+}
+```
+
+最终参数对象：
+```typescript
+{
+  country: ['CN'],      // 对应第一个 country 条件
+  country1: ['US'],     // 对应第二个 country 条件（paramName 避免了冲突）
+  // ...其他参数
+}
+```
+
+#### 阶段 6：SQL 条件生成
+
+**文件：** `src/lib/prisma.ts:74-106`
+
+```typescript
+function mapFilter(column: string, operator: string, name: string, type: string = '', paramName?: string) {
+  const param = paramName ?? name;  // ⭐ 使用 paramName 作为参数占位符名
+  const value = `{{${param}${type ? `::${type}` : ''}}}`;
+
+  const table = SESSION_COLUMNS.includes(name) ? 'session' : 'website_event';
+
+  switch (operator) {
+    case 'eq':
+      return `${table}.${column} = ANY(${value})`;
+    case 'neq':
+      return `${table}.${column} != ALL(${value})`;
+    // ...
+  }
+}
+```
+
+生成的 SQL 条件片段：
+```sql
+AND session.country = ANY({{country}})
+AND session.country != ALL({{country1}})
+```
+
+#### 完整链路示意图
+
+```
+UI 添加 2 个 country 筛选条件
+  ↓
+Filter[]: [{name:'country',op:'eq',val:'CN'}, {name:'country',op:'neq',val:'US'}]
+  ↓ filtersArrayToObject()
+URL: ?country=eq.CN&country1=neq.US
+  ↓ parseRequest()
+  1. Zod 校验 → { country: 'eq.CN' } （country1 被剥离）
+  2. 后缀回填 → { country: 'eq.CN', country1: 'neq.US' }
+  ↓ getRequestFilters()
+filters: { country: 'eq.CN', country1: 'neq.US' }
+  ↓ filtersObjectToArray()
+Filter[]: [
+  { name:'country', paramName:undefined, column:'country', op:'eq', val:['CN'] },
+  { name:'country', paramName:'country1', column:'country', op:'neq', val:['US'] }
+]
+  ↓ getQueryParams() + mapFilter()
+SQL: AND session.country = ANY({country}) AND session.country != ALL({country1})
+```
+
+---
+
+## 四、URL 参数 → 后端查询编排
+
+### 4.1 参数解析流程
 
 #### 步骤 1：前端 → 后端 API 调用
 
@@ -242,7 +474,7 @@ return useMemo(() => {
   for (const key of Object.keys(query)) {
     const baseName = key.replace(/\d+$/, '');  // 去掉数字后缀
     if (FILTER_COLUMNS[baseName]) {
-      filterParams[key] = query[key];
+      filterParams[key] = query[key];         // 保留原始 key（带后缀）
     }
   }
 
@@ -265,7 +497,7 @@ return useMemo(() => {
 
 `getQueryFilters()` 是核心编排函数，负责：
 1. 解析日期范围
-2. 提取普通筛选参数
+2. 提取普通筛选参数（含带后缀参数）
 3. **合并分群（Segment）筛选条件**
 4. **合并队列（Cohort）筛选条件**
 
@@ -326,7 +558,7 @@ export async function getQueryFilters(
 }
 ```
 
-### 3.2 参数值解析
+### 4.2 参数值解析
 
 **文件：** `src/lib/params.ts:4-27`
 
@@ -354,49 +586,11 @@ export function parseFilterValue(param: any) {
 }
 ```
 
-### 3.3 参数 → Filter 对象数组
-
-**文件：** `src/lib/params.ts:42-76`
-
-`filtersObjectToArray()` 将扁平化参数对象转为结构化 Filter 数组：
-
-```typescript
-export function filtersObjectToArray(filters: QueryFilters, options: QueryOptions = {}): Filter[] {
-  return Object.keys(filters).reduce((arr, key) => {
-    const filter = filters[key];
-
-    const baseName = key.replace(/\d+$/, '');
-    const paramName = key !== baseName ? key : undefined;
-
-    // 已结构化的 Filter 对象直接使用
-    if (filter?.name && filter?.value !== undefined) {
-      return arr.concat({
-        ...filter,
-        column: options?.columns?.[baseName] ?? FILTER_COLUMNS[baseName],
-        paramName: paramName ?? filter.paramName,
-      });
-    }
-
-    // 解析 URL 参数字符串
-    const { operator, value } = parseFilterValue(filter);
-
-    return arr.concat({
-      name: baseName,
-      paramName,
-      column: options?.columns?.[baseName] ?? FILTER_COLUMNS[baseName],
-      operator,
-      value,
-      prefix: options?.prefix,
-    });
-  }, []);
-}
-```
-
 ---
 
-## 四、Filter → SQL 查询转换
+## 五、Filter → SQL 查询转换
 
-### 4.1 分库适配：PostgreSQL vs ClickHouse
+### 5.1 分库适配：PostgreSQL vs ClickHouse
 
 Umami 支持两种数据库后端，查询转换逻辑分别在：
 - **PostgreSQL**: `src/lib/prisma.ts:74-150`
@@ -404,7 +598,7 @@ Umami 支持两种数据库后端，查询转换逻辑分别在：
 
 两者结构完全一致，仅 SQL 语法不同。
 
-### 4.2 操作符 → SQL 映射（PostgreSQL）
+### 5.2 操作符 → SQL 映射（PostgreSQL）
 
 **文件：** `src/lib/prisma.ts:74-106`
 
@@ -435,7 +629,7 @@ function mapFilter(column: string, operator: string, name: string, type: string 
 }
 ```
 
-### 4.3 AND/OR 逻辑编排
+### 5.3 AND/OR 逻辑编排
 
 **文件：** `src/lib/prisma.ts:108-150`
 
@@ -486,7 +680,7 @@ function getFilterQuery(filters: Record<string, any>, options: QueryOptions = {}
 }
 ```
 
-### 4.4 查询参数值预处理
+### 5.4 查询参数值预处理
 
 **文件：** `src/lib/prisma.ts:208-230`
 
@@ -513,7 +707,7 @@ function getQueryParams(filters: Record<string, any>) {
 }
 ```
 
-### 4.5 完整查询组装
+### 5.5 完整查询组装
 
 **文件：** `src/lib/prisma.ts:232-253`
 
@@ -547,7 +741,7 @@ function parseFilters(filters: Record<string, any>, options?: QueryOptions) {
 
 ---
 
-## 五、完整数据流示例
+## 六、完整数据流示例
 
 ### 场景：创建分群「中国 Chrome 用户」
 
@@ -606,21 +800,22 @@ WHERE website_event.website_id = {websiteId}
 
 ---
 
-## 六、关键文件索引
+## 七、关键文件索引
 
 | 模块 | 文件路径 | 核心功能 |
 |------|----------|----------|
 | 类型定义 | `src/lib/types.ts` | Filter, QueryFilters, Operator 等类型 |
 | 常量定义 | `src/lib/constants.ts` | OPERATORS, FILTER_COLUMNS, 字段分组 |
-| 参数编解码 | `src/lib/params.ts` | filtersArrayToObject, filtersObjectToArray, parseFilterValue |
-| 请求解析 | `src/lib/request.ts` | getQueryFilters（分群/队列合并核心） |
-| PG 查询转换 | `src/lib/prisma.ts` | mapFilter, getFilterQuery, parseFilters |
+| 参数编解码 | `src/lib/params.ts` | filtersArrayToObject, filtersObjectToArray, parseFilterValue, isSearchOperator |
+| 请求解析 | `src/lib/request.ts` | parseRequest（后缀回填）, getQueryFilters（分群/队列合并）, getRequestFilters |
+| PG 查询转换 | `src/lib/prisma.ts` | mapFilter, getFilterQuery, parseFilters, getQueryParams |
 | CH 查询转换 | `src/lib/clickhouse.ts` | 同上，ClickHouse 版本 |
 | 字段元数据 | `src/components/hooks/useFields.ts` | 字段分组、标签定义 |
-| 筛选 Hook | `src/components/hooks/useFilters.ts` | 操作符类型映射、URL → Filter[] |
+| 操作符标签 | `src/components/hooks/useOperatorLabels.ts` | 操作符枚举 → 显示文本映射 |
+| 筛选 Hook | `src/components/hooks/useFilters.ts` | 操作符类型映射（typeFilters）、URL → Filter[] |
 | 参数提取 | `src/components/hooks/useFilterParameters.ts` | 从 URL 提取筛选参数 |
 | 字段筛选 UI | `src/components/input/FieldFilters.tsx` | 筛选条件列表 |
-| 单条筛选 UI | `src/components/common/FilterRecord.tsx` | 单条筛选条件行 |
+| 单条筛选 UI | `src/components/common/FilterRecord.tsx` | 单条筛选条件行（含操作符下拉逻辑） |
 | 筛选编辑弹窗 | `src/components/input/FilterEditForm.tsx` | 完整筛选编辑器 |
 | 分群编辑 | `src/app/(main)/websites/[websiteId]/segments/SegmentEditForm.tsx` | 分群保存表单 |
-| Schema 验证 | `src/lib/schema.ts` | segmentParamSchema, operatorParam |
+| Schema 验证 | `src/lib/schema.ts` | segmentParamSchema, operatorParam, filterParams |
