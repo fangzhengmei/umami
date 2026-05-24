@@ -92,7 +92,91 @@ export const FILTER_COLUMNS = {
 };
 ```
 
-### 1.5 分群（Segment）存储模型
+### 1.5 参数分类：过滤参数 vs 控制参数
+
+**⚠️ 关键概念区分：** `FILTER_COLUMNS`（过滤参数）与 `filterParams`（Schema 校验字段）是两个不同的集合。
+
+#### 过滤参数（Filter Parameters）
+- **定义来源：** `FILTER_COLUMNS`（`src/lib/constants.ts:72-97`）
+- **提取函数：** `getRequestFilters()`（`src/lib/request.ts:79-90`）
+- **判定逻辑：** `if (baseName in FILTER_COLUMNS)` 才会进入 `filters` 条件集合
+- **作用：** 最终会被转换为 SQL WHERE 条件
+
+| 过滤参数 | 数据库列 |
+|---------|---------|
+| path, referrer, hostname, distinctId, title, query | website_event 表字段 |
+| os, browser, device, country, region, city, language | session 表字段（SESSION_COLUMNS） |
+| event, tag, eventType | website_event 表字段 |
+| utmSource, utmMedium, utmCampaign, utmContent, utmTerm | website_event 表字段 |
+
+#### 控制参数（Control Parameters）
+- **定义来源：** `filterParams`（`src/lib/schema.ts:45-71`）- 用于 Zod Schema 校验
+- **特点：** NOT IN `FILTER_COLUMNS`，不会被 `getRequestFilters()` 提取
+- **作用：** 控制查询行为，不直接转为 SQL WHERE 条件
+
+| 控制参数 | 处理方式 | 是否进入 filters 集合 |
+|---------|---------|---------------------|
+| `segment` | `params.segment` 读取，用于查库加载分群 | ❌ 从不进入 |
+| `cohort` | `params.cohort` 读取，用于查库加载队列 | ❌ 从不进入 |
+| `match` | `params.match` 读取，控制 AND/OR 逻辑 | ❌ 从不进入 |
+| `excludeBounce` | 特殊处理：`params.excludeBounce` 为真时，通过 `Object.assign(filters, { excludeBounce: true })` 加入 | ⚠️ 条件性加入（作为布尔标志） |
+| `startAt`, `endAt`, `timezone`, `unit` | `getRequestDateRange()` 单独处理 | ❌ 作为 dateRange 单独返回 |
+| `page`, `pageSize`, `orderBy`, `sortDescending`, `search`, `compare` | 直接从 `params` 读取 | ❌ 作为独立字段返回 |
+
+#### 特殊参数处理
+
+| 参数 | 分类 | 特殊处理 |
+|-----|------|---------|
+| `eventType` | ✅ 过滤参数 | 在 `FILTER_COLUMNS` 中，但是在 `getFilterQuery()` 中强制 AND 连接 |
+| `excludeBounce` | ⚠️ 混合 | 不在 `FILTER_COLUMNS`，但通过 `Object.assign(filters, { excludeBounce: true })` 加入 `filters`，用于触发 `getExcludeBounceQuery()` 生成 JOIN 子查询 |
+| `cohort_*` 前缀字段 | ⚠️ 混合 | 队列筛选条件加 `cohort_` 前缀后加入 `filters`，在 `parseFilters()` 中分离处理 |
+
+**核心判定代码（`src/lib/request.ts:79-90`）：**
+```typescript
+export function getRequestFilters(query: Record<string, any>) {
+  const result: Record<string, any> = {};
+  for (const key of Object.keys(query)) {
+    const baseName = key.replace(/\d+$/, '');
+    if (baseName in FILTER_COLUMNS) {  // ⭐ 只有 FILTER_COLUMNS 中的字段才会被提取
+      result[key] = query[key];
+    }
+  }
+  return result;
+}
+```
+
+**⚠️ 重要结论 1：** `segment` 参数**从不**进入 `filters` 条件集合。它是一个控制参数，仅用于从数据库加载对应的分群定义，然后分群的 `filters` 数组才会被转换并合并到查询条件中。
+
+**⚠️ 重要结论 2（命名混淆点）：** 代码中存在三个不同层次的 `filters` 对象，容易混淆：
+
+| 层次 | 来源 | 包含内容 | `segment` / `cohort` |
+|------|------|---------|---------------------|
+| **1. 原始 params** | URL query / POST body | 所有参数（过滤 + 控制） | ✅ 包含 |
+| **2. 狭义 filters** | `getRequestFilters(params)` | 仅 `FILTER_COLUMNS` 中的过滤参数 | ❌ 不包含（通过 `if (baseName in FILTER_COLUMNS)` 过滤） |
+| **3. 广义 filters** | `getQueryFilters()` 返回值 | `{ ...dateRange, ...狭义filters, match, excludeBounce, page, pageSize, ... }` | ❌ 不包含（`segment` / `cohort` 仅用于查库，未加入返回值） |
+
+**`match` 参数的特殊访问路径：**
+```
+getQueryFilters() 返回 { ..., match }  →  广义filters.match
+  ↓
+parseFilters(广义filters) → getFilterQuery(广义filters)
+  ↓
+getFilterQuery(filters) 中访问 filters.match （虽然 match 不在 FILTER_COLUMNS）
+```
+
+**`excludeBounce` 参数的特殊访问路径：**
+```
+params.excludeBounce （控制参数）
+  ↓
+getQueryFilters() 中条件性加入 filters:
+  if (params.excludeBounce) Object.assign(filters, { excludeBounce: true })
+  ↓
+parseFilters(广义filters) → getExcludeBounceQuery(filters)
+  ↓
+if (filters.excludeBounce !== true) 返回空，否则生成 JOIN 子查询
+```
+
+### 1.6 分群（Segment）存储模型
 
 **文件：** `prisma/schema.prisma`（Segment 表）
 
@@ -461,20 +545,29 @@ SQL: AND session.country = ANY({country}) AND session.country != ALL({country1})
 
 ### 3.5.1 合并顺序与覆盖优先级
 
-**核心代码：** `src/lib/request.ts:116,127,151`
+**核心代码：** `src/lib/request.ts:116,123-127,134-151`
 
 ```typescript
 const filters = getRequestFilters(params);                         // 1. 先提取页面临时筛选（ad-hoc）
+                                                                    //    ⭐ params 包含 segment/cohort 等控制参数
+                                                                    //    ⭐ filters 只包含 FILTER_COLUMNS 中的过滤参数
 
-if (params.segment) {
-  Object.assign(filters, filtersArrayToObject(segmentParams.filters));  // 2. 分群筛选 MERGE INTO 临时筛选
-  if (segmentParams.match) match = segmentParams.match;               // 3. 分群 match 覆盖临时 match
+if (params.segment) {                                               // 2. 从 params.segment（控制参数）读取分群 ID
+  const segmentParams = (await getWebsiteSegment(websiteId, params.segment))?.parameters;
+  Object.assign(filters, filtersArrayToObject(segmentParams.filters));  // 3. 分群筛选 MERGE INTO 临时筛选
+  if (segmentParams.match) match = segmentParams.match;               // 4. 分群 match 覆盖临时 match
 }
 
-if (params.cohort) {
-  Object.assign(filters, { ...filtersArrayToObject(cohortFilters) }); // 4. 队列筛选最后合并（加前缀，无冲突）
+if (params.cohort) {                                                // 5. 从 params.cohort（控制参数）读取队列 ID
+  // ... 队列处理 ...
+  Object.assign(filters, { ...filtersArrayToObject(cohortFilters) }); // 6. 队列筛选最后合并（加前缀，无冲突）
 }
 ```
+
+**⚠️ 重要澄清：**
+- `params.segment` 是**控制参数**，用于从数据库加载分群定义
+- `segmentParams.filters` 才是分群的**实际筛选条件数组**，经 `filtersArrayToObject()` 转换后合并入 `filters`
+- `segment` 字符串本身**从不**进入 `filters` 条件集合
 
 **关键机制：** `Object.assign(target, source)` —— **source 的同 key 属性会覆盖 target**
 
@@ -686,6 +779,7 @@ if (schema) {
 ### 3.6.3 GET 请求完整链路（数字后缀保留）
 
 **URL：** `?country=eq.CN&country1=neq.US&segment=xxx`
+**分群「Chrome 用户」：** `[{ name: 'browser', op: 'eq', value: 'Chrome' }]`
 
 ```
 步骤 1: parseRequest(schema)
@@ -704,12 +798,17 @@ if (schema) {
   → query = { country: 'eq.CN', country1: 'neq.US', segment: 'xxx' }  ✅ 完整保留
 
 步骤 3: getQueryFilters(query, websiteId)
-  filters = getRequestFilters(query)
-    → { country: 'eq.CN', country1: 'neq.US', segment: 'xxx' }
+  params = query = { country: 'eq.CN', country1: 'neq.US', segment: 'xxx' }
+  filters = getRequestFilters(params)
+    → { country: 'eq.CN', country1: 'neq.US' }  ✅ segment 不在 FILTER_COLUMNS，不进入 filters
 
-步骤 4: 合并分群筛选
-  Object.assign(filters, filtersArrayToObject(segment.filters))
-  → { country: 'eq.CN', country1: 'neq.US', segment: 'xxx', browser: 'eq.Chrome' }
+步骤 4: 加载并合并分群筛选（request.ts:123-127）
+  if (params.segment) {  // ⭐ 从 params.segment 读取分群 ID（不是从 filters）
+    segmentParams = getWebsiteSegment(websiteId, params.segment).parameters
+    → { filters: [{ name: 'browser', op: 'eq', value: 'Chrome' }], match: 'all' }
+  }
+  Object.assign(filters, filtersArrayToObject(segmentParams.filters))
+  → { country: 'eq.CN', country1: 'neq.US', browser: 'eq.Chrome' }  ✅ segment 从未进入 filters
 
 步骤 5: 最终 Filter[]（3 个条件）
   [
@@ -729,7 +828,7 @@ if (schema) {
    post('/reports/funnel', {
      websiteId,
      type: 'funnel',
-     filters,  // 包含 country1
+     filters,  // 包含 country1 和 segment
      parameters: { ... }
    })
    ```
@@ -750,14 +849,18 @@ if (schema) {
   body = result.data  ❌ POST 分支没有后缀回填逻辑
 
 步骤 2: getQueryFilters(body.filters, websiteId)
-  filters = getRequestFilters(body.filters)
-    → { country: 'eq.CN', segment: 'xxx' }  （country1 已经丢失）
+  params = body.filters = { country: 'eq.CN', segment: 'xxx' }
+  filters = getRequestFilters(params)
+    → { country: 'eq.CN' }  ✅ segment 不在 FILTER_COLUMNS，不进入 filters（country1 已丢失）
 
-步骤 3: 合并分群筛选
-  Object.assign(filters, filtersArrayToObject(segment.filters))
-  → { country: 'eq.CN', segment: 'xxx', browser: 'eq.Chrome' }
+步骤 3: 加载并合并分群筛选
+  if (params.segment) {
+    segmentParams = getWebsiteSegment(websiteId, params.segment).parameters
+  }
+  Object.assign(filters, filtersArrayToObject(segmentParams.filters))
+  → { country: 'eq.CN', browser: 'eq.Chrome' }
 
-步骤 4: 最终 Filter[]（只有 2 个条件！）
+步骤 4: 最终 Filter[]（只有 2 个条件！country1 丢失）
   [
     { name: 'country', op: 'eq', value: ['CN'] },
     { name: 'browser', op: 'eq', value: ['Chrome'] }
@@ -768,9 +871,10 @@ if (schema) {
 
 | 处理环节 | GET 请求 | POST 请求 | 差异影响 |
 |----------|---------|----------|---------|
-| Zod 校验对象 | `query` | `body.filters` | 校验层级不同 |
+| Zod 校验对象 | `query`（单层） | `body.filters`（嵌套） | 校验层级不同 |
 | 后缀参数剥离 | ✅ 是 | ✅ 是 | 相同 |
-| 后缀参数回填 | ✅ 有（`rawQuery` → `query`） | ❌ 无 | **核心差异** |
+| 原始数据备份 | ✅ `rawQuery = query` | ❌ 无 `rawBody` 备份 | 无法回填的根源 |
+| 后缀参数回填 | ✅ 有（遍历 `rawQuery` → `query`） | ❌ 无 | **核心差异** |
 | 最终 `country1` 保留 | ✅ 保留 | ❌ 丢失 | 条件数量不同 |
 | `getRequestFilters()` 输入 | 含后缀 | 不含后缀 | 结果不同 |
 | 分群合并基底 | 完整临时筛选 | 残缺临时筛选 | **查询结果不一致** |
@@ -829,21 +933,28 @@ export const reportResultSchema = z.intersection(
 );
 ```
 
-**回填逻辑不完整：** `src/lib/request.ts:33-38`
+**回填逻辑不完整：** `src/lib/request.ts:30-41`
 
 ```typescript
-else if (isGet) {
+if (isGet) {
   query = result.data;
-  // ⚠️ 只处理了 GET 的 query，没有处理 POST 的 body.filters
+  // ✅ GET: rawQuery 保存了原始 query，回填被剥离的后缀参数
   for (const key of Object.keys(rawQuery)) {
     if (/\d+$/.test(key) && !(key in query)) {
       query[key] = rawQuery[key];
     }
   }
 } else {
-  body = result.data;  // ❌ POST 没有类似的后缀回填逻辑
+  body = result.data;  // ❌ POST：没有保存原始 body，也没有 body.filters 的后缀回填逻辑
+  // ⚠️ POST 分支甚至没有原始 body 的副本，无法进行后缀回填
 }
 ```
+
+**POST 无法回填的更深层原因：**
+1. POST 请求的原始数据在 `body` 变量中，经过 `schema.safeParse(body)` 后直接被覆盖为 `body = result.data`
+2. 没有像 GET 那样保存 `rawBody = body` 的原始副本
+3. 即使有原始副本，也需要递归遍历 `body.filters` 对象进行后缀回填，而不是简单遍历 `rawQuery`
+4. 回填逻辑只实现了单层 `query` 对象的遍历，没有考虑嵌套的 `body.filters` 结构
 
 ---
 
@@ -1203,11 +1314,14 @@ WHERE website_event.website_id = {websiteId}
 
 #### 后端处理流程
 ```
-步骤 1：getRequestFilters(params)
-  → filters = { country: 'neq.US', os: 'eq.Windows' }
-  → match = 'all'
+params = { country: 'neq.US', os: 'eq.Windows', match: 'all', segment: '{segmentId}' }
+  ⭐ segment 在 params 中（控制参数），不在 filters 中（过滤参数）
 
-步骤 2：读取 segment 表
+步骤 1：getRequestFilters(params)
+  → filters = { country: 'neq.US', os: 'eq.Windows' }  ✅ segment 未进入 filters
+  → match = params.match = 'all'
+
+步骤 2：读取 segment 表（通过 params.segment）
   → segmentParams.filters = [{name:'country', op:'eq', value:'CN'}]
   → segmentParams.match = 'any'
 
