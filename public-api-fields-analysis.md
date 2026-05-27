@@ -319,7 +319,85 @@ export function getRequestFilters(query: Record<string, any>) {
 
 返回分页结构：`{ data, count, page, pageSize }`
 
-### 4.6 `/api/websites/[websiteId]/event-data/fields` — 事件数据字段
+### 4.6 `/api/websites/[websiteId]/sessions/[sessionId]` — 单个会话详情
+
+**数据结构**（`getWebsiteSession`）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | string | 会话 ID |
+| `websiteId` | string | 网站 ID |
+| `distinctId` | string | 唯一访客标识 |
+| `browser` | string | 浏览器 |
+| `os` | string | 操作系统 |
+| `device` | string | 设备类型 |
+| `screen` | string | 屏幕分辨率 |
+| `language` | string | 语言 |
+| `country` | string | 国家 |
+| `region` | string | 地区 |
+| `city` | string | 城市 |
+| `firstAt` | string | 首次活动时间 |
+| `lastAt` | string | 最后活动时间 |
+| `visits` | number | 访问次数 |
+| `views` | number | 页面浏览数 |
+| `events` | number | 事件数 |
+| `totaltime` | number | 总停留时间（毫秒） |
+
+### 4.7 `/api/websites/[websiteId]/sessions/[sessionId]/activity` — 会话活动轨迹
+
+**数据结构**（`getSessionActivity`）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `eventId` | string | 事件 ID |
+| `eventType` | number | 事件类型 |
+| `eventName` | string | 事件名称 |
+| `urlPath` | string | URL 路径 |
+| `urlQuery` | string | URL 查询参数 |
+| `referrerDomain` | string | 来源域名 |
+| `visitId` | string | 访问 ID |
+| `hostname` | string | 主机名 |
+| `createdAt` | string | 创建时间 |
+| `hasData` | boolean | 是否有关联的 event_data 记录 |
+
+### 4.8 `/api/websites/[websiteId]/sessions/[sessionId]/properties` — 单会话数据属性
+
+**数据结构**（`getSessionData`）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `websiteId` | string | 网站 ID |
+| `sessionId` | string | 会话 ID |
+| `dataKey` | string | 数据键名 |
+| `dataType` | number | 数据类型（1=string, 2=number, 3=boolean, 4=date, 5=array） |
+| `stringValue` | string | 字符串值 |
+| `numberValue` | number | 数值 |
+| `dateValue` | string | 日期值 |
+| `createdAt` | string | 创建时间 |
+
+### 4.9 `/api/websites/[websiteId]/session-data/properties` — 会话数据属性汇总
+
+**数据结构**（`getSessionDataProperties`）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `propertyName` | string | 数据键名 (data_key) |
+| `total` | number | 具有该属性的独立会话数（count distinct session_id） |
+
+> 限制 `LIMIT 500`
+
+### 4.10 `/api/websites/[websiteId]/session-data/values` — 会话数据值
+
+**数据结构**（`getSessionDataValues`）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `value` | string | 处理后的值（数值去尾零、日期截断到小时） |
+| `total` | number | 具有该值的独立会话数（count distinct session_id） |
+
+> 限制 `LIMIT 100`
+
+### 4.11 `/api/websites/[websiteId]/event-data/fields` — 事件数据字段
 
 **数据结构**（`getEventDataFields`）：
 
@@ -332,70 +410,43 @@ export function getRequestFilters(query: Record<string, any>) {
 
 > 限制 `LIMIT 100`
 
-### 4.7 `/api/websites/[websiteId]/event-data` — 事件数据列表
+### 4.12 `/api/websites/[websiteId]/event-data` — 事件数据列表
 
-**数据结构**（`getEventData`）：
+**数据结构**（`getEventData` 经 eventMap 转换后）：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `websiteId` | string | 网站 ID |
 | `eventId` | string | 事件 ID |
 | `eventName` | string | 事件名称 |
-| `dataKey` | string | 数据键名 |
-| `stringValue` | string | 字符串值 |
-| `numberValue` | number | 数值 |
-| `dateValue` | string | 日期值 |
-| `dataType` | number | 数据类型 |
-| `createdAt` | string | 创建时间 |
+| `eventProperties` | array | 事件属性数组，每个属性包含：dataKey, stringValue, numberValue, dateValue, dataType, createdAt |
 
 返回分页结构：`{ data, count, page, pageSize }`
 
-### 4.8 `/api/websites/[websiteId]/sessions/[sessionId]` — 单个会话详情
+### 4.13 `/api/websites/[websiteId]/event-data/properties` — 事件数据属性汇总
 
-**数据结构**（`getWebsiteSession`）：
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `session_id` | string | 会话 ID |
-| `website_id` | string | 网站 ID |
-| `hostname` | string | 主机名 |
-| `browser` | string | 浏览器 |
-| `os` | string | 操作系统 |
-| `device` | string | 设备类型 |
-| `screen` | string | 屏幕 |
-| `language` | string | 语言 |
-| `country` | string | 国家 |
-| `region` | string | 地区 |
-| `city` | string | 城市 |
-| `created_at` | string | 创建时间 |
-
-### 4.9 `/api/websites/[websiteId]/sessions/[sessionId]/activity` — 会话活动轨迹
-
-**数据结构**（`getSessionActivity`）：
+**数据结构**（`getEventDataProperties`）：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `eventId` | string | 事件 ID |
-| `eventType` | number | 事件类型 |
 | `eventName` | string | 事件名称 |
-| `urlPath` | string | URL 路径 |
-| `urlQuery` | string | URL 查询参数 |
-| `referrerPath` | string | 来源路径 |
-| `referrerQuery` | string | 来源查询 |
-| `referrerDomain` | string | 来源域名 |
-| `pageTitle` | string | 页面标题 |
-| `createdAt` | string | 创建时间 |
+| `propertyName` | string | 数据键名 (data_key) |
+| `total` | number | 出现次数 |
 
-### 4.10 `/api/websites/[websiteId]/sessions/[sessionId]/properties` — 会话数据属性
+> 限制 `LIMIT 500`
 
-**数据结构**（`getSessionDataProperties`）：
+### 4.14 `/api/websites/[websiteId]/event-data/values` — 事件数据值
+
+**数据结构**（`getEventDataValues`）：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `dataKey` | string | 数据键名 |
-| `dataType` | number | 数据类型 |
+| `value` | string | 处理后的值（数值去尾零、日期截断到小时） |
+| `total` | number | 出现次数 |
 
-### 4.11 `/api/websites/[websiteId]/sessions/stats` — 会话统计
+> 限制 `LIMIT 100`
+
+### 4.15 `/api/websites/[websiteId]/sessions/stats` — 会话统计
 
 **数据结构**（`getWebsiteSessionStats`）：
 
@@ -407,7 +458,7 @@ export function getRequestFilters(query: Record<string, any>) {
 | `bounces` | number | 跳出数 |
 | `totaltime` | number | 总停留时间 |
 
-### 4.12 `/api/websites/[websiteId]/events/stats` — 事件统计
+### 4.16 `/api/websites/[websiteId]/events/stats` — 事件统计
 
 **数据结构**（`getWebsiteEventStats`）：
 
@@ -416,7 +467,7 @@ export function getRequestFilters(query: Record<string, any>) {
 | `events` | number | 事件总数 |
 | `visitors` | number | 触发事件的访客数 |
 
-### 4.13 `/api/websites/[websiteId]/events/series` — 事件时序
+### 4.17 `/api/websites/[websiteId]/events/series` — 事件时序
 
 **数据结构**（`getEventStats`）：
 
@@ -425,11 +476,11 @@ export function getRequestFilters(query: Record<string, any>) {
 | `x` | string | 时间点 |
 | `y` | number | 事件数 |
 
-### 4.14 `/api/websites/[websiteId]/metrics/expanded` — 扩展指标
+### 4.18 `/api/websites/[websiteId]/metrics/expanded` — 扩展指标
 
 返回合并的页面浏览+会话+事件扩展指标。
 
-### 4.15 `/api/realtime/[websiteId]` — 实时数据
+### 4.19 `/api/realtime/[websiteId]` — 实时数据
 
 **数据结构**（`getRealtimeData`）：
 
@@ -447,7 +498,7 @@ export function getRequestFilters(query: Record<string, any>) {
 | `totals.countries` | number | 覆盖国家数 |
 | `timestamp` | number | 时间戳 |
 
-### 4.16 `/api/reports/breakdown` — 细分分析报告
+### 4.20 `/api/reports/breakdown` — 细分分析报告
 
 **数据结构**（`getBreakdown`）：
 
@@ -460,18 +511,28 @@ export function getRequestFilters(query: Record<string, any>) {
 | `totaltime` | number | 总停留时间 |
 | 动态维度字段 | string | 由 `fields` 参数决定，如 `browser`、`os`、`country` 等 |
 
-### 4.17 `/api/websites/[websiteId]/values` — 字段值查询
+### 4.21 `/api/websites/[websiteId]/sessions/[sessionId]/replays` — 会话回放列表
 
-**数据结构**（`getValues`）：返回指定字段的去重值列表，用于自动补全。
-
-### 4.18 `/api/websites/[websiteId]/active` — 活跃访客数
-
-**数据结构**（`getActiveVisitors`）：
+**数据结构**（`getSessionReplays`）：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `x` | string | 时间点 |
-| `y` | number | 活跃访客数 |
+| `id` | string | 回放 ID (visit_id) |
+| `sessionId` | string | 会话 ID |
+| `websiteId` | string | 网站 ID |
+| `browser` | string | 浏览器 |
+| `os` | string | 操作系统 |
+| `device` | string | 设备类型 |
+| `country` | string | 国家 |
+| `city` | string | 城市 |
+| `eventCount` | number | 事件总数 |
+| `chunkCount` | number | 分块数 |
+| `startedAt` | string | 开始时间 |
+| `endedAt` | string | 结束时间 |
+| `duration` | number | 持续时间（毫秒） |
+| `createdAt` | string | 创建时间 |
+
+返回分页结构：`{ data, count, page, pageSize }`
 
 ---
 
@@ -511,11 +572,26 @@ export function getRequestFilters(query: Record<string, any>) {
 
 2. **Section 白名单仅控制前端**：`parameters` 中的 section 开关（如 `overview: true`, `events: false`）仅在 `ShareProvider` 中用于隐藏/展示前端 UI 组件，后端 API 不会因为 section 被禁用而拒绝请求。
 
-3. **distinct_id 暴露**：`SESSION_COLUMNS` 中包含 `distinctId`（映射到 `distinct_id`），该字段在 metrics 端点中可被查询，存在指纹追踪风险。
+3. **distinct_id 暴露**：
+   - `SESSION_COLUMNS` 中包含 `distinctId`（映射到 `distinct_id`），该字段在 metrics 端点中可被查询
+   - 单个会话详情接口 (`/sessions/[sessionId]`) 直接返回 `distinctId` 字段
+   - 存在指纹追踪风险
 
-4. **event_data 完整暴露**：通过 Share Token 可访问 `/event-data`、`/event-data/fields`、`/event-data/values`、`/event-data/properties`、`/event-data/events` 等端点，返回事件的自定义数据键值对。
+4. **event_data 完整暴露**：通过 Share Token 可访问以下端点，返回事件的自定义数据键值对：
+   - `/event-data` - 事件数据列表（聚合后）
+   - `/event-data/fields` - 事件数据字段（键名+类型+值）
+   - `/event-data/values` - 事件数据值（值+计数）
+   - `/event-data/properties` - 事件数据属性（事件名+键名+计数）
 
-5. **session_data 完整暴露**：通过 Share Token 可访问 `/sessions/[sessionId]/properties` 和 `/sessions/[sessionId]/replays`，返回会话的自定义属性和会话回放数据。
+5. **session_data 完整暴露**：通过 Share Token 可访问以下端点：
+   - `/sessions/[sessionId]/properties` - 单个会话的自定义属性键值对
+   - `/session-data/properties` - 会话数据属性汇总（键名+独立会话数）
+   - `/session-data/values` - 会话数据值（值+独立会话数）
+   - `/sessions/[sessionId]/replays` - 会话回放元数据
+
+6. **endpoint 命名容易混淆**：
+   - `/sessions/[sessionId]/properties` 返回单个会话的属性键值（`getSessionData`）
+   - `/session-data/properties` 返回所有会话的属性汇总统计（`getSessionDataProperties`）
 
 ---
 
@@ -547,6 +623,15 @@ export function getRequestFilters(query: Record<string, any>) {
 | 渠道指标 | `src/queries/sql/getChannelMetrics.ts` | 14-149 |
 | 事件列表 | `src/queries/sql/events/getWebsiteEvents.ts` | 6-119 |
 | 会话列表 | `src/queries/sql/sessions/getWebsiteSessions.ts` | 7-159 |
+| 会话详情 | `src/queries/sql/sessions/getWebsiteSession.ts` | 7-113 |
+| 会话活动轨迹 | `src/queries/sql/sessions/getSessionActivity.ts` | 8-80 |
+| 会话数据 | `src/queries/sql/sessions/getSessionData.ts` | 7-60 |
+| 会话数据属性汇总 | `src/queries/sql/sessions/getSessionDataProperties.ts` | 6-75 |
+| 会话数据值 | `src/queries/sql/sessions/getSessionDataValues.ts` | 6-85 |
+| 事件数据列表 | `src/queries/sql/events/getEventData.ts` | 7-152 |
+| 事件数据属性汇总 | `src/queries/sql/events/getEventDataProperties.ts` | 6-92 |
+| 事件数据值 | `src/queries/sql/events/getEventDataValues.ts` | 6-96 |
+| 会话回放列表 | `src/queries/sql/replays/getSessionReplays.ts` | 6-148 |
 | 实时数据 | `src/queries/sql/getRealtimeData.ts` | 16-78 |
 | 细分报告 | `src/queries/sql/reports/getBreakdown.ts` | 7-135 |
 | 事件数据字段 | `src/queries/sql/events/getEventDataFields.ts` | 6-88 |
