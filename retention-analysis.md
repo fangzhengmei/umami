@@ -118,20 +118,27 @@ await tx.session.deleteMany({ where: { websiteId } });             // 7. 会话
 - `T_agg_end`：聚合表最新数据日期
 - `T_raw_start`：明细表最早数据日期
 - `T_raw_end`：明细表最新数据日期
+- `T_eventdata_start`：事件参数表最早数据日期
+- `T_sessiondata_start`：会话参数表最早数据日期
+- `T_replay_start`：会话回放表最早数据日期
 - `T_query_start`：查询起始日期
 - `T_query_end`：查询结束日期
 
 **典型分层保留配置示例**：
 ```
-聚合表保留 3 年  (T_agg_start = 3年前)
-明细表保留 90 天 (T_raw_start = 90天前)
+聚合表保留 3 年    (T_agg_start = 3年前)
+明细表保留 90 天   (T_raw_start = 90天前)
+事件参数保留 90 天 (T_eventdata_start = 90天前)
+会话参数保留 90 天 (T_sessiondata_start = 90天前)
+回放数据保留 14 天 (T_replay_start = 14天前)
 
 时间轴：
-  ──┼──────────────────────────────────────────┼──────────────────┼──
-    T_agg_start (3年前)                        T_raw_start (90天前)  Today
-    │                                            │                    │
-    └──────────── 聚合数据完整范围 ──────────────┘                    │
-                                                 └── 明细数据范围 ───┘
+  ──┼──────────────────────────────────────────┼──────────────────┼──────┼──
+    T_agg_start (3年前)                        T_raw_start (90天前)       T_replay_start  Today
+    │                                            │                        │              │
+    └──────────── 聚合数据完整范围 ──────────────┘                        │              │
+                                                 └── 明细/事件/会话数据范围 ─┘              │
+                                                                          └── 回放数据范围 ──┘
 ```
 
 ### 3.2 查询结果的有效性分段
@@ -204,12 +211,18 @@ if (EVENT_COLUMNS.some(item => Object.keys(filters).includes(item)) || unit === 
 
 #### B. 会话类查询
 
-| 查询函数 | 文件路径 | 回退条件 | 数据边界影响 |
-|---------|---------|---------|------------|
-| `getWebsiteSessions` | `src/queries/sql/sessions/getWebsiteSessions.ts:53-147` | 使用 EVENT_COLUMNS 过滤或分页查询 | 列表查询在 `T_raw_start` 前无数据 |
+| 查询函数 | 文件路径 | 回退条件（修正版） | 数据边界影响 |
+|---------|---------|------------------|------------|
+| `getWebsiteSessions` | `src/queries/sql/sessions/getWebsiteSessions.ts:98-156` | **使用 EVENT_COLUMNS 过滤时回退**，否则使用聚合表 | 带 EVENT_COLUMNS 过滤的查询在 `T_raw_start` 前无数据；无过滤时数据完整 |
 | `getSessionStats` | `src/queries/sql/sessions/getSessionStats.ts:30-88` | 使用 EVENT_COLUMNS 过滤 | 带过滤查询在 `T_raw_start` 前无数据 |
 | `getSessionMetrics` | `src/queries/sql/sessions/getSessionMetrics.ts:54-120` | 使用 EVENT_COLUMNS 过滤 | 带过滤查询在 `T_raw_start` 前无数据 |
 | `getWebsiteSessionStats` | `src/queries/sql/sessions/getWebsiteSessionStats.ts:44-88` | 使用 EVENT_COLUMNS 过滤 | 带过滤查询在 `T_raw_start` 前无数据 |
+
+**会话列表查询回退条件修正说明**：
+- 原描述"使用 EVENT_COLUMNS 过滤或分页查询"不准确
+- 实际代码中：`getWebsiteSessions.ts:98` 只判断 `EVENT_COLUMNS.some(...)`
+- 分页查询本身不触发回退，只有使用 EVENT_COLUMNS 字段过滤时才回退
+- 无过滤的会话列表使用 `website_event_stats_hourly` 聚合表，数据完整
 
 #### C. 高级报表类查询（**始终使用明细表**）
 
@@ -230,12 +243,12 @@ if (EVENT_COLUMNS.some(item => Object.keys(filters).includes(item)) || unit === 
 | 查询函数 | 文件路径 | 数据边界影响 |
 |---------|---------|------------|
 | `getSessionActivity` | `src/queries/sql/sessions/getSessionActivity.ts` | `T_raw_start` 前的会话活动无数据 |
-| `getSessionDataProperties` / `getSessionDataValues` | `src/queries/sql/sessions/getSessionData*.ts` | `T_raw_start` 前的会话属性无数据 |
-| `getEventDataEvents` / `getEventDataStats` / `getEventDataUsage` 等 | `src/queries/sql/events/getEventData*.ts` | `T_raw_start` 前的事件数据无数据 |
+| `getSessionDataProperties` / `getSessionDataValues` | `src/queries/sql/sessions/getSessionData*.ts` | `T_sessiondata_start` 前的会话属性无数据 |
+| `getEventDataEvents` / `getEventDataStats` / `getEventDataUsage` 等 | `src/queries/sql/events/getEventData*.ts` | `T_eventdata_start` 前的事件数据无数据 |
 | `getPageviewMetrics` / `getPageviewExpandedMetrics` | `src/queries/sql/pageviews/getPageviewMetrics*.ts` | `T_raw_start` 前的页面指标无数据 |
 | `getActiveVisitors` | `src/queries/sql/getActiveVisitors.ts` | 通常查询实时窗口，不受影响 |
 | `getValues` | `src/queries/sql/getValues.ts` | `T_raw_start` 前的字段值无数据 |
-| `getSessionReplays` | `src/queries/sql/replays/getSessionReplays.ts` | `T_raw_start` 前的回放数据无数据 |
+| `getSessionReplays` | `src/queries/sql/replays/getSessionReplays.ts` | `T_replay_start` 前的回放数据无数据 |
 
 ### 4.3 EVENT_COLUMNS 过滤字段详解
 
@@ -264,9 +277,168 @@ export const EVENT_COLUMNS = [
 
 **设计原因**：聚合表中这些字段使用 `SimpleAggregateFunction(groupArrayArray, ...)` 存储为数组，无法直接过滤。
 
-## 5. 统计空窗校准：聚合与明细的范围不匹配处理
+## 5. 实时数据链路与缓存分析
 
-### 5.1 空窗产生的场景
+### 5.1 实时数据链路架构
+
+```
+前端实时页面 → getRealtimeData API
+                  │
+                  ├─→ getRealtimeActivity (最近 100 条事件，明细表)
+                  ├─→ getPageviewStats (可回退到聚合表)
+                  └─→ getSessionStats (可回退到聚合表)
+```
+
+### 5.2 Redis 缓存的作用边界
+
+**关键结论**：Redis **不缓存统计数据**，仅缓存配置信息和认证数据。
+
+| 缓存类型 | 缓存键 | TTL | 说明 |
+|---------|--------|-----|------|
+| 网站配置 | `website:${websiteId}` | 86400秒 | 网站基本信息、域名、所有者 |
+| 会话配置 | `session:${sessionId}` | 动态 | 会话元数据 |
+| 认证令牌 | `auth:${token}` | 动态 | 登录状态 |
+| 白标签配置 | `white-label:${accountId}` | 动态 | 品牌定制配置 |
+| 团队信息 | `team:${teamId}` | 动态 | 团队成员和权限 |
+
+**代码证据**：
+```typescript
+// src/lib/load.ts:9-10 - 仅缓存网站配置，不缓存统计数据
+if (redis.enabled) {
+  website = await redis.client.fetch(`website:${websiteId}`, () => getWebsite(websiteId), 86400);
+}
+
+// src/queries/sql/getRealtimeActivity.ts:51-81 - 实时活动直接查询 ClickHouse，无缓存
+async function clickhouseQuery(websiteId: string, filters: QueryFilters): Promise<{ x: number }> {
+  return rawQuery(
+    `select ... from website_event ... order by createdAt desc limit 100`,
+    queryParams,
+    FUNCTION_NAME,
+  );
+}
+```
+
+### 5.3 实时数据的保留窗口影响
+
+| 实时功能 | 数据来源 | 受保留窗口影响 | 说明 |
+|---------|---------|--------------|------|
+| 实时访客数 | getPageviewStats / getSessionStats | ⚠️ 部分 | 无过滤时用聚合表（完整），有过滤时用明细表（受限） |
+| 实时活动日志 | getRealtimeActivity → website_event | ✅ 受限 | 仅显示保留窗口内的数据，默认取最近100条 |
+| 国家/URL/来源统计 | getRealtimeActivity 内存聚合 | ✅ 受限 | 基于活动日志聚合，同样受窗口限制 |
+
+**实时数据行为**：
+- 实时页面查询的时间窗口通常很短（如 30 分钟）
+- 只要保留窗口 > 实时查询窗口，功能不受影响
+- 如果保留窗口设置过短（如 < 1小时），实时面板可能显示空白
+
+## 6. 明细附属数据的保留边界与风险
+
+### 6.1 附属数据表一览
+
+| 表名 | 存储内容 | 关联主表 | 独立 TTL 配置 | 保留窗口建议 |
+|------|---------|---------|--------------|------------|
+| `event_data` | 自定义事件参数（键值对） | website_event.event_id | ✅ 可独立设置 | 90 天 |
+| `session_data` | 自定义会话属性（键值对） | website_event.session_id | ✅ 可独立设置 | 90 天 |
+| `session_replay` | 会话回放视频/操作记录 | website_event.session_id | ✅ 可独立设置 | 14 天（数据量大） |
+| `website_revenue` | 收入/转化数据 | website_event.session_id | ✅ 可独立设置 | 365 天 |
+
+### 6.2 Schema 定义与分区策略
+
+```sql
+-- db/clickhouse/schema.sql:57-75
+CREATE TABLE umami.event_data (
+    event_id UUID,
+    website_id UUID,
+    session_id UUID,
+    data_key String,
+    data_type Int8,
+    string_value Nullable(String),
+    number_value Nullable(Decimal64(4)),
+    date_value Nullable(DateTime64(3)),
+    created_at DateTime64(3) DEFAULT now64(3),
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(created_at)  -- 按月分区，可独立设置 TTL
+ORDER BY (website_id, session_id, event_id)
+TTL created_at + INTERVAL 90 DAY;  -- 建议配置
+
+CREATE TABLE umami.session_replay (
+    session_id UUID,
+    website_id UUID,
+    data String,  -- 回放数据，通常较大
+    created_at DateTime64(3) DEFAULT now64(3),
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(created_at)
+TTL created_at + INTERVAL 14 DAY;  -- 建议更短的保留期
+```
+
+### 6.3 附属数据的查询依赖链
+
+**场景1：事件详情查询**
+```
+getEventData (事件参数)
+    ↓ JOIN
+website_event (明细)
+    ↓
+T_eventdata_start 与 T_raw_start 取较早值
+    ↓
+早于该日期的事件参数查询返回空
+```
+
+**场景2：会话详情查询**
+```
+getSessionActivity (会话活动)
+    ↓
+getSessionData (会话属性)
+    ↓
+T_sessiondata_start 需 ≥ T_raw_start 才一致
+    ↓
+否则可能出现"会话存在但属性缺失"的异常
+```
+
+### 6.4 保留策略不一致的风险
+
+| 风险场景 | 现象 | 原因 | 影响程度 |
+|---------|------|------|---------|
+| **事件参数早于明细删除** | 事件列表存在，但点击详情后参数空白 | TTL_eventdata < TTL_raw | ⚠️ 中等 |
+| **会话属性早于明细删除** | 会话列表存在，但自定义属性丢失 | TTL_sessiondata < TTL_raw | ⚠️ 中等 |
+| **回放数据早于明细删除** | 会话显示"有回放"但点击后无法播放 | TTL_replay < TTL_raw | ⚠️ 中等 |
+| **收入数据早于明细删除** | 转化报表与收入报表数据不一致 | TTL_revenue < TTL_raw | ⚠️ 高 |
+| **聚合数据早于明细删除** | 聚合统计数据早于明细消失（极罕见） | TTL_agg < TTL_raw | ❌ 严重 |
+
+**风险规避建议**：
+```sql
+-- 确保附属数据 TTL ≥ 明细表 TTL
+ALTER TABLE umami.event_data MODIFY TTL created_at + INTERVAL 90 DAY;
+ALTER TABLE umami.session_data MODIFY TTL created_at + INTERVAL 90 DAY;
+ALTER TABLE umami.website_event MODIFY TTL created_at + INTERVAL 90 DAY;
+
+-- 回放数据可独立设置更短
+ALTER TABLE umami.session_replay MODIFY TTL created_at + INTERVAL 14 DAY;
+```
+
+### 6.5 JOIN 查询的边界行为
+
+```sql
+-- getEventData.ts:89-107 - 左连接明细表
+select event_data.event_id
+from event_data
+any left join (
+  select event_id, session_id, website_id, event_name, created_at
+  from website_event
+  where website_id = {websiteId:UUID}
+    and created_at between {startDate:DateTime64} and {endDate:DateTime64}
+) website_event
+on website_event.event_id = event_data.event_id
+```
+
+**边界行为**：
+- 如果 `website_event` 中该 `event_id` 已因 TTL 删除，左连接后字段为 NULL
+- `event_data` 本身的数据仍可查询到（只要未过期）
+- 但事件名、会话信息等关联字段会显示为空
+
+## 7. 统计空窗校准：聚合与明细的范围不匹配处理
+
+### 7.1 空窗产生的场景
 
 **场景1：查询时间跨明细保留边界**
 
@@ -298,7 +470,16 @@ T_raw_start = 3月1日（90天前）
   报表显示：留存率曲线在 3月1日前为空白
 ```
 
-### 5.2 日期范围校准的代码实现
+**场景3：附属数据与明细保留不一致**
+
+事件参数保留 30 天，明细保留 90 天：
+```
+查询 60 天前的事件详情：
+  - 事件在列表中存在（明细未删）
+  - 但点击查看参数时显示空白（event_data 已删）
+```
+
+### 7.2 日期范围校准的代码实现
 
 `getWebsiteDateRange` 函数在 ClickHouse 模式下**从聚合表读取日期范围**，而不是明细表：
 
@@ -326,7 +507,7 @@ async function clickhouseQuery(websiteId: string) {
 - 但实际执行明细查询时，早期数据实际不存在
 - 这是造成"统计空窗"的根本原因之一
 
-### 5.3 空窗校准建议
+### 7.3 空窗校准建议
 
 当前代码**未实现**跨边界查询的自动校准。以下是建议的处理策略：
 
@@ -354,21 +535,24 @@ function getHybridStats(queryStart, queryEnd, filters) {
 **策略 C：UI 提示**
 - 在报表顶部显示："注：90天前的历史数据仅支持基础指标统计，高级分析功能可能不完整"
 - 日期选择器中标注："完整数据从 XXXX-XX-XX 开始"
+- 数据图表中用虚线或灰色标记数据不完整的区域
 
-### 5.4 数据缺口的用户感知
+### 7.4 数据缺口的用户感知
 
 **用户可能看到的异常**：
 1. 报表页面"前半部分空白，后半部分有数据"（非完全空白）
 2. 筛选特定 URL/事件后，历史数据突然减少
 3. 时间范围选择器显示的最早日期（从聚合表）与实际可用数据（从明细表）不一致
 4. 导出的数据在某一日期后突然有数据
+5. 事件/会话详情页"参数缺失"或"回放不可用"但列表仍显示
 
 **建议的 UI 提示**（当前代码未实现）：
 - 在报表页面提示："历史数据仅保留 N 天，更早数据不可用"
 - 在日期范围选择器中标注可用数据范围
 - 数据图表中用虚线或灰色标记数据不完整的区域
+- 详情页中对已过期的参数/回放显示"数据已归档"提示
 
-## 6. 功能影响矩阵（修正版）
+## 8. 功能影响矩阵（修正版）
 
 | 功能模块 | 子功能 | 数据完整性状态 | 详细说明 |
 |---------|--------|--------------|---------|
@@ -386,21 +570,23 @@ function getHybridStats(queryStart, queryEnd, filters) {
 | | Attribution 归因 | ⚠️ 时间窗口内有效 | `T_raw_start` 前归因数据缺失 |
 | | UTM 分析 | ⚠️ 时间窗口内有效 | `T_raw_start` 前 UTM 数据缺失 |
 | | Performance 性能 | ⚠️ 时间窗口内有效 | `T_raw_start` 前性能指标缺失 |
-| | Revenue 收入 | ⚠️ 时间窗口内有效 | `T_raw_start` 前收入数据缺失 |
-| **实时** | 实时访客数 | ✅ 正常 | 短时间窗口查询，通常在保留范围内 |
-| | 实时活动日志 | ⚠️ 局部缺失 | `T_raw_start` 前日志无数据 |
+| | Revenue 收入 | ⚠️ 时间窗口内有效 | `T_revenue_start` 前收入数据缺失 |
+| **实时** | 实时访客数（无过滤） | ✅ 完整 | 使用聚合表 |
+| | 实时访客数（有过滤） | ⚠️ 局部缺失 | `T_raw_start` 前数据缺失 |
+| | 实时活动日志 | ⚠️ 时间窗口内有效 | `T_raw_start` 前日志无数据 |
 | **事件** | 事件统计（无过滤） | ✅ 完整 | 聚合表回退成功 |
 | | 事件统计（有过滤） | ⚠️ 局部缺失 | `T_raw_start` 前数据缺失 |
-| | 事件数据详情 | ⚠️ 局部缺失 | `T_raw_start` 前数据缺失 |
-| **会话** | 会话列表（无过滤） | ✅ 完整 | 聚合表回退成功 |
+| | 事件参数详情 | ⚠️ 时间窗口内有效 | `T_eventdata_start` 前参数无数据 |
+| **会话** | 会话列表（无过滤） | ✅ 完整 | 使用聚合表（已修正） |
 | | 会话列表（有 URL 过滤） | ⚠️ 局部缺失 | `T_raw_start` 前数据缺失 |
-| | 会话详情/活动时间线 | ⚠️ 局部缺失 | `T_raw_start` 前数据缺失 |
-| **回放** | 会话回放 | ⚠️ 时间窗口内有效 | 回放表独立 TTL，通常更短 |
+| | 会话详情/活动时间线 | ⚠️ 时间窗口内有效 | `T_raw_start` 前数据缺失 |
+| | 会话自定义属性 | ⚠️ 时间窗口内有效 | `T_sessiondata_start` 前属性无数据 |
+| **回放** | 会话回放 | ⚠️ 时间窗口内有效 | `T_replay_start` 前回放无数据 |
 | **导出** | 数据导出 | ⚠️ 局部缺失 | `T_raw_start` 前数据无法导出 |
 
-## 7. 代码中不显眼的取舍点
+## 9. 代码中不显眼的取舍点
 
-### 7.1 隐式的分层保留设计
+### 9.1 隐式的分层保留设计
 
 代码中没有显式的 `retentionDays` 配置，而是通过**查询路由**间接实现：
 
@@ -409,7 +595,7 @@ function getHybridStats(queryStart, queryEnd, filters) {
 - 两者在代码中相邻但职责分离
 - 运维可以独立配置两张表的 TTL，实现分层保留
 
-### 7.2 聚合表的取舍边界
+### 9.2 聚合表的取舍边界
 
 **聚合表不存储以下信息**（导致报表功能依赖明细表）：
 
@@ -421,7 +607,7 @@ function getHybridStats(queryStart, queryEnd, filters) {
 | 分钟级粒度 | 最细为小时级 | 实时趋势图、精细报表 |
 | 事件间顺序 | 无法重建用户行为路径 | Journey、Funnel |
 
-### 7.3 Prisma vs ClickHouse 的双写架构
+### 9.3 Prisma vs ClickHouse 的双写架构
 
 在 `src/lib/db.ts:22-36` 中定义了查询路由：
 
@@ -439,9 +625,17 @@ export async function runQuery(queries: any) {
 - PostgreSQL 中的明细数据可以更早清理
 - 但 Prisma 模式下的重置/删除不影响 ClickHouse
 
-## 8. 数据保留的实践建议
+### 9.4 Redis 不缓存统计数据的设计选择
 
-### 8.1 ClickHouse 部署的保留配置
+**设计取舍**：
+- Redis 仅用于配置和认证缓存，不用于统计数据
+- 统计数据直接查询 ClickHouse（其本身就是列存数据库，查询速度快）
+- 避免缓存与数据库的数据一致性问题
+- 代价：实时查询每次都访问数据库，但 ClickHouse 足够快
+
+## 10. 数据保留的实践建议
+
+### 10.1 ClickHouse 部署的保留配置
 
 对于生产环境部署，建议配置：
 
@@ -454,16 +648,24 @@ MODIFY TTL created_at + INTERVAL 90 DAY;
 ALTER TABLE umami.website_event_stats_hourly 
 MODIFY TTL created_at + INTERVAL 3 YEAR;
 
+-- 事件参数保留 90 天（与明细同步）
+ALTER TABLE umami.event_data 
+MODIFY TTL created_at + INTERVAL 90 DAY;
+
+-- 会话属性保留 90 天（与明细同步）
+ALTER TABLE umami.session_data 
+MODIFY TTL created_at + INTERVAL 90 DAY;
+
 -- 回放数据保留 14 天（数据量大）
 ALTER TABLE umami.session_replay 
 MODIFY TTL created_at + INTERVAL 14 DAY;
 
--- 事件数据保留 90 天
-ALTER TABLE umami.event_data 
-MODIFY TTL created_at + INTERVAL 90 DAY;
+-- 收入数据保留 1 年
+ALTER TABLE umami.website_revenue 
+MODIFY TTL created_at + INTERVAL 365 DAY;
 ```
 
-### 8.2 保留窗口与功能的权衡
+### 10.2 保留窗口与功能的权衡
 
 | 业务场景 | 建议明细保留 | 建议聚合保留 | 功能影响 |
 |---------|------------|------------|---------|
@@ -472,7 +674,7 @@ MODIFY TTL created_at + INTERVAL 90 DAY;
 | 电商/营销站点 | 180 天 | 5 年 | 高级报表仅近 180 天数据可用 |
 | 数据合规要求严格 | 按法规 | 按法规 | 完全合规优先 |
 
-### 8.3 删除后的统计一致性
+### 10.3 删除后的统计一致性
 
 删除明细数据后需要注意：
 
@@ -484,22 +686,30 @@ MODIFY TTL created_at + INTERVAL 90 DAY;
    - 事件导出只能导出保留窗口内的数据
 
 3. **实时数据**：
-   - 实时查询（30 分钟内）通常仍在内存/缓存中，不受影响
+   - 实时查询（30 分钟内）通常仍在保留范围内
+   - Redis 不缓存统计数据，查询直接访问数据库
 
-4. **日期范围展示校准**：
+4. **附属数据一致性**：
+   - 确保 event_data、session_data 的 TTL ≥ website_event 的 TTL
+   - 避免出现"列表有数据但详情空白"的不一致现象
+
+5. **日期范围展示校准**：
    - 前端应从明细表单独获取 `T_raw_start` 用于限制用户选择
    - 避免用户选择早于保留窗口的日期导致困惑
 
-## 9. 关键代码位置速查
+## 11. 关键代码位置速查
 
 | 功能模块 | 文件路径 | 关键行 |
 |---------|---------|-------|
 | 聚合表 Schema | `db/clickhouse/schema.sql` | 94-143 |
 | 物化视图定义 | `db/clickhouse/schema.sql` | 145-239 |
+| event_data 表定义 | `db/clickhouse/schema.sql` | 57-75 |
+| session_replay 表定义 | `db/clickhouse/schema.sql` | 291-322 |
 | 页面浏览统计路由 | `src/queries/sql/pageviews/getPageviewStats.ts` | 59-99 |
-| 网站统计路由 | `src/queries/sql/getWebsiteStats.ts` | 86-135 |
-| 周流量统计路由 | `src/queries/sql/getWeeklyTraffic.ts` | 56-86 |
-| 事件统计路由 | `src/queries/sql/events/getEventStats.ts` | 103-137 |
+| 会话列表查询路由（修正） | `src/queries/sql/sessions/getWebsiteSessions.ts` | 98-156 |
+| 实时活动查询（无缓存） | `src/queries/sql/getRealtimeActivity.ts` | 51-81 |
+| 事件参数查询 | `src/queries/sql/events/getEventData.ts` | 80-152 |
+| Redis 配置缓存 | `src/lib/load.ts` | 9-26 |
 | 留存率报表（用明细） | `src/queries/sql/reports/getRetention.ts` | 121-172 |
 | 漏斗报表（用明细） | `src/queries/sql/reports/getFunnel.ts` | 325-348 |
 | 日期范围查询（聚合表） | `src/queries/sql/getWebsiteDateRange.ts` | 42-54 |
