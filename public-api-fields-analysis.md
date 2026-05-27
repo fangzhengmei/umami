@@ -36,7 +36,7 @@ x-umami-share-context: 1
 
 **签发入口**：`GET /api/share/[slug]`（`src/app/api/share/[slug]/route.ts:47-106`）
 
-**完整签发流程**：
+**完整签发流程（带边界冲突点）**：
 
 ```
 GET /api/share/[slug]
@@ -71,16 +71,20 @@ GET /api/share/[slug]
   │       ├─ linkId = share.entityId
   │       └─ entity = link
   │
-  ├─ 4. 签发 JWT
+  ├─ 4. 签发 JWT（⚠️ 边界点 1：此时 data 仅包含上述字段）
   │   └─ token = createToken(data, secret())  ⚠️ 纯 JWT，无 AES 加密
   │
-  └─ 5. 附加 whiteLabel（仅 Redis 模式）
+  ├─ 5. 追加 token 到响应对象
+  │   └─ data.token = token
+  │
+  └─ 6. 附加 whiteLabel（⚠️ 边界点 2：在 token 生成后追加）
       ├─ 从 entity 获取 userId/teamId
       ├─ 若 teamId → 查询 teamOwner 获取 accountId
       └─ 若 accountId 存在 → 从 Redis 取 white-label:${accountId}
+         └─ data.whiteLabel = whiteLabel
 ```
 
-**Share Token payload 字段清单**：
+**JWT payload 字段清单（token 生成时已包含）：
 
 | 字段 | 类型 | 说明 | 适用 shareType |
 |------|------|------|---------------|
@@ -94,8 +98,19 @@ GET /api/share/[slug]
 | `websiteIds` | string[] | 关联网站 ID 列表 | board |
 | `pixelIds` | string[] | 关联像素 ID 列表 | board |
 | `linkIds` | string[] | 关联链接 ID 列表 | board |
-| `token` | string | 签发的 JWT Token 字符串 | 全部 |
-| `whiteLabel` | object | 白标配置（仅 Redis 开启且有配置时） | 全部（可选） |
+
+**HTTP 响应附加字段（token 生成后追加）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `token` | string | 签发的 JWT Token 字符串（JWT 本身，不在 payload 中） |
+| `whiteLabel` | object | 白标配置（仅 Redis 开启且有配置时，不在 payload 中） |
+
+**边界冲突总结**：
+- `token` 是 JWT 字符串本身，不可能包含在 JWT payload 中（自引用悖论）
+- `whiteLabel` 在 token 生成后才追加到响应对象，因此不在 JWT payload 中
+- 服务端 `parseShareToken()` 只能解析到 JWT payload 中已包含的 10 个字段（shareId, shareType, parameters, websiteId/pixelId/linkId/boardId, websiteIds/pixelIds/linkIds）
+- 客户端 `ShareData` 类型定义中的 `token` 和 `whiteLabel` 是前端状态字段，不是 JWT payload 字段
 
 ### 1.3 whiteLabel 字段边界
 
