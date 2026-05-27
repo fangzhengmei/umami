@@ -538,7 +538,7 @@ export function getRequestFilters(query: Record<string, any>) {
 
 ## 五、字段裁剪总结
 
-### 5.1 三层过滤机制
+### 5.1 三层过滤机制（无字段级裁剪）
 
 ```
 请求层（Request Layer）
@@ -546,14 +546,17 @@ export function getRequestFilters(query: Record<string, any>) {
   ├─ [第一层] getRequestFilters()
   │   仅保留 FILTER_COLUMNS 中定义的字段作为过滤条件
   │   任何未知 filter 字段被静默丢弃
+  │   ⚠️ 仅作用于入参过滤，不影响返回字段
   │
   ├─ [第二层] checkAuth() → canViewWebsite()
   │   Share Token 只能访问其绑定的 websiteId(s)/pixelId(s)/linkId(s)
   │   访问其他实体返回 401
+  │   ⚠️ 仅做实体级权限校验，不校验字段或 section
   │
   └─ [第三层] SQL 查询层
       各查询函数硬编码 SELECT 字段，不做动态列选择
       数据库层没有额外的字段裁剪
+      ⚠️ 所有通过权限校验的请求返回相同的完整字段
 ```
 
 ### 5.2 Share Token 字段裁剪现状
@@ -568,7 +571,10 @@ export function getRequestFilters(query: Record<string, any>) {
 
 ### 5.3 关键发现
 
-1. **Share Token 无字段级裁剪**：通过 Share Token 获取 `/api/websites/[id]/events` 端点时，返回的事件数据包含 `country`、`city`、`region`、`os`、`browser`、`device`、`language`、`hostname` 等完整字段，与登录用户看到的字段完全一致。
+1. **Share Token 无字段级裁剪**：
+   - **事件列表** (`/api/websites/[id]/events`) 返回 19 个完整字段：`id`, `websiteId`, `sessionId`, `createdAt`, `hostname`, `urlPath`, `urlQuery`, `referrerPath`, `referrerQuery`, `referrerDomain`, `country`, `city`, `device`, `os`, `browser`, `pageTitle`, `eventType`, `eventName`, `hasData`
+   - **会话详情** (`/api/websites/[id]/sessions/[sessionId]`) 返回 17 个完整字段：`id`, `websiteId`, `distinctId`, `browser`, `os`, `device`, `screen`, `language`, `country`, `region`, `city`, `firstAt`, `lastAt`, `visits`, `views`, `events`, `totaltime`
+   - 所有字段对 Share Token 完全开放，与登录用户看到的字段完全一致
 
 2. **Section 白名单仅控制前端**：`parameters` 中的 section 开关（如 `overview: true`, `events: false`）仅在 `ShareProvider` 中用于隐藏/展示前端 UI 组件，后端 API 不会因为 section 被禁用而拒绝请求。
 
