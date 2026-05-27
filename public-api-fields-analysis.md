@@ -32,24 +32,127 @@ x-umami-share-token: <share_jwt>
 x-umami-share-context: 1
 ```
 
-### 1.2 Share Token 的签发
+### 1.2 Share Token 的签发流程
 
-Share Token 由 `GET /api/share/[slug]` 端点签发（`src/app/api/share/[slug]/route.ts`），以 JWT 明文签名（`createToken`，非 `createSecureToken`），payload 包含以下字段：
+**签发入口**：`GET /api/share/[slug]`（`src/app/api/share/[slug]/route.ts:47-106`）
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `shareId` | string | 分享记录 UUID |
-| `shareType` | number | 实体类型（1=website, 2=link, 3=pixel, 4=board） |
-| `parameters` | object | 分享参数，包含可见 section 白名单 |
-| `websiteId` | string | 关联网站 ID（website/pixel/link 类型） |
-| `websiteIds` | string[] | 关联网站 ID 列表（board 类型） |
-| `pixelId` / `pixelIds` | string / string[] | 关联像素 ID |
-| `linkId` / `linkIds` | string / string[] | 关联链接 ID |
-| `boardId` | string | 关联看板 ID（board 类型） |
-| `token` | string | 签发的 JWT Token 字符串 |
-| `whiteLabel` | object | 白标配置（仅 Redis 模式下） |
+**完整签发流程**：
 
-### 1.3 鉴权上下文传递
+```
+GET /api/share/[slug]
+  │
+  ├─ 1. 根据 slug 查询 Share 记录 (getShareByCode)
+  │   ├─ Share 表字段：id, entityId, name, shareType, slug, parameters, createdAt
+  │   └─ 若无记录 → 404
+  │
+  ├─ 2. 初始化基础 payload
+  │   ├─ shareId = share.id
+  │   ├─ shareType = share.shareType
+  │   └─ parameters = share.parameters (section 白名单等)
+  │
+  ├─ 3. 根据 shareType 查询对应实体并扩展 payload
+  │   ├─ shareType = board (4):
+  │   │   ├─ 查询 Board (entityId)
+  │   │   ├─ boardId = share.entityId
+  │   │   ├─ 解析 boardEntityIds → websiteIds[], pixelIds[], linkIds[]
+  │   │   └─ entity = board
+  │   ├─ shareType = website (1):
+  │   │   ├─ 查询 Website (entityId)
+  │   │   ├─ websiteId = share.entityId
+  │   │   └─ entity = website
+  │   ├─ shareType = pixel (3):
+  │   │   ├─ 查询 Pixel (entityId)
+  │   │   ├─ websiteId = share.entityId  ⚠️ pixelId 同时赋值给 websiteId
+  │   │   ├─ pixelId = share.entityId
+  │   │   └─ entity = pixel
+  │   └─ shareType = link (2):
+  │       ├─ 查询 Link (entityId)
+  │       ├─ websiteId = share.entityId   ⚠️ linkId 同时赋值给 websiteId
+  │       ├─ linkId = share.entityId
+  │       └─ entity = link
+  │
+  ├─ 4. 签发 JWT
+  │   └─ token = createToken(data, secret())  ⚠️ 纯 JWT，无 AES 加密
+  │
+  └─ 5. 附加 whiteLabel（仅 Redis 模式）
+      ├─ 从 entity 获取 userId/teamId
+      ├─ 若 teamId → 查询 teamOwner 获取 accountId
+      └─ 若 accountId 存在 → 从 Redis 取 white-label:${accountId}
+```
+
+**Share Token payload 字段清单**：
+
+| 字段 | 类型 | 说明 | 适用 shareType |
+|------|------|------|---------------|
+| `shareId` | string | 分享记录 UUID | 全部 |
+| `shareType` | number | 实体类型：1=website, 2=link, 3=pixel, 4=board | 全部 |
+| `parameters` | object | 分享参数，包含可见 section 白名单 | 全部 |
+| `websiteId` | string | 关联 ID（⚠️ pixel/link 场景下实际是 pixelId/linkId） | website, pixel, link |
+| `pixelId` | string | 像素 ID | pixel |
+| `linkId` | string | 链接 ID | link |
+| `boardId` | string | 看板 ID | board |
+| `websiteIds` | string[] | 关联网站 ID 列表 | board |
+| `pixelIds` | string[] | 关联像素 ID 列表 | board |
+| `linkIds` | string[] | 关联链接 ID 列表 | board |
+| `token` | string | 签发的 JWT Token 字符串 | 全部 |
+| `whiteLabel` | object | 白标配置（仅 Redis 开启且有配置时） | 全部（可选） |
+
+### 1.3 whiteLabel 字段边界
+
+**类型定义**（`src/lib/types.ts:190-194`）：
+
+```typescript
+export interface WhiteLabel {
+  displayName: string;
+  domainName: string;
+  logoUrl: string;
+}
+```
+
+**边界说明**：
+- **仅在 Redis 模式下可用**：`getWhiteLabel()` 函数在 `redis.enabled === false` 时直接返回 `null`
+- **基于账号维度**：通过 `userId` 或 `teamOwner.userId` 从 Redis 键 `white-label:${accountId}` 读取
+- **仅附加在签发响应中**：whiteLabel 是 `/api/share/[slug]` 接口的响应字段，**不是 JWT payload 的一部分**，不会在后续数据请求中传递
+- **前端展示用**：用于自定义分享页面的品牌展示，不影响 API 数据权限
+
+### 1.4 pixel/link 场景下 websiteId 的语义
+
+**关键发现**：在 pixel 和 link 分享场景中，`websiteId` 字段被**重载**，实际存储的是 pixelId 或 linkId：
+
+```typescript
+// 代码位置：src/app/api/share/[slug]/route.ts:80-89
+} else if (share.shareType === ENTITY_TYPE.pixel) {
+  entity = await getPixel(share.entityId);
+  data.websiteId = share.entityId;  // ⚠️ 实际是 pixelId
+  data.pixelId = share.entityId;
+} else if (share.shareType === ENTITY_TYPE.link) {
+  entity = await getLink(share.entityId);
+  data.websiteId = share.entityId;  // ⚠️ 实际是 linkId
+  data.linkId = share.entityId;
+}
+```
+
+**权限匹配逻辑**（`src/permissions/website.ts:12-19`）：
+
+```typescript
+if (
+  shareToken?.websiteId === websiteId ||      // 匹配 website 或重载的 pixelId/linkId
+  shareToken?.pixelId === websiteId ||        // 精确匹配 pixelId
+  shareToken?.linkId === websiteId ||         // 精确匹配 linkId
+  shareToken?.websiteIds?.includes(websiteId) ||  // board 场景批量匹配
+  shareToken?.pixelIds?.includes(websiteId) ||
+  shareToken?.linkIds?.includes(websiteId)
+) {
+  return true;
+}
+```
+
+**语义澄清**：
+- API 路径中的 `[websiteId]` 参数实际上是 **entityId**，可以是 websiteId、pixelId 或 linkId
+- `canViewWebsite()` 函数名有误导性，实际是 **`canViewEntity()`**，支持所有实体类型的权限校验
+- pixel/link 分享时，同时设置 `websiteId`（重载）和 `pixelId`/`linkId`（精确）是为了兼容路径参数命名
+
+### 1.5 鉴权上下文传递
 
 客户端通过 `useApi()` hook 自动注入 share headers（`src/components/hooks/useApi.ts:22-28`）：
 
@@ -76,9 +179,9 @@ const shareHeaders =
 canViewWebsite(auth, websiteId):
   ├─ user.isAdmin → true（管理员直通）
   ├─ shareToken 匹配任一：
-  │   ├─ shareToken.websiteId === websiteId
-  │   ├─ shareToken.pixelId === websiteId
-  │   ├─ shareToken.linkId === websiteId
+  │   ├─ shareToken.websiteId === websiteId    (website 或 重载的 pixelId/linkId)
+  │   ├─ shareToken.pixelId === websiteId      (pixel 精确匹配)
+  │   ├─ shareToken.linkId === websiteId       (link 精确匹配)
   │   ├─ shareToken.websiteIds.includes(websiteId)
   │   ├─ shareToken.pixelIds.includes(websiteId)
   │   └─ shareToken.linkIds.includes(websiteId)
@@ -267,7 +370,7 @@ export function getRequestFilters(query: Record<string, any>) {
 
 ### 4.4 `/api/websites/[websiteId]/events` — 事件列表
 
-**数据结构**（`getWebsiteEvents`）：
+**数据结构**（`getWebsiteEvents`，SQL 硬编码 19 个字段）：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -290,6 +393,8 @@ export function getRequestFilters(query: Record<string, any>) {
 | `eventType` | number | 事件类型（1=pageview, 2=custom, 3=link, 4=pixel, 5=performance） |
 | `eventName` | string | 事件名称 |
 | `hasData` | boolean | 是否有关联的 event_data 记录 |
+
+> ⚠️ **注意**：事件列表不返回 `region` 和 `language` 字段，这两个字段仅在**会话详情**中返回。
 
 返回分页结构：`{ data, count, page, pageSize }`
 
@@ -321,13 +426,13 @@ export function getRequestFilters(query: Record<string, any>) {
 
 ### 4.6 `/api/websites/[websiteId]/sessions/[sessionId]` — 单个会话详情
 
-**数据结构**（`getWebsiteSession`）：
+**数据结构**（`getWebsiteSession`，SQL 硬编码 17 个字段）：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `id` | string | 会话 ID |
 | `websiteId` | string | 网站 ID |
-| `distinctId` | string | 唯一访客标识 |
+| `distinctId` | string | 唯一访客标识（distinct_id） |
 | `browser` | string | 浏览器 |
 | `os` | string | 操作系统 |
 | `device` | string | 设备类型 |
@@ -397,20 +502,7 @@ export function getRequestFilters(query: Record<string, any>) {
 
 > 限制 `LIMIT 100`
 
-### 4.11 `/api/websites/[websiteId]/event-data/fields` — 事件数据字段
-
-**数据结构**（`getEventDataFields`）：
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `propertyName` | string | 数据键名 (data_key) |
-| `dataType` | number | 数据类型（1=string, 2=number, 3=boolean, 4=date, 5=array） |
-| `value` | string | 处理后的值（数值去尾零、日期截断到小时） |
-| `total` | number | 该值出现次数 |
-
-> 限制 `LIMIT 100`
-
-### 4.12 `/api/websites/[websiteId]/event-data` — 事件数据列表
+### 4.11 `/api/websites/[websiteId]/event-data` — 事件数据列表（聚合）
 
 **数据结构**（`getEventData` 经 eventMap 转换后）：
 
@@ -423,7 +515,60 @@ export function getRequestFilters(query: Record<string, any>) {
 
 返回分页结构：`{ data, count, page, pageSize }`
 
-### 4.13 `/api/websites/[websiteId]/event-data/properties` — 事件数据属性汇总
+### 4.12 `/api/websites/[websiteId]/event-data/[eventId]` — 单个事件数据详情
+
+**数据结构**（`getEventDataById`）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `websiteId` | string | 网站 ID |
+| `eventId` | string | 事件 ID |
+| `eventName` | string | 事件名称 |
+| `dataKey` | string | 数据键名 |
+| `stringValue` | string | 字符串值 |
+| `numberValue` | number | 数值 |
+| `dateValue` | string | 日期值 |
+| `dataType` | number | 数据类型 |
+| `createdAt` | string | 创建时间 |
+
+### 4.13 `/api/websites/[websiteId]/event-data/events` — 事件数据分组统计
+
+**数据结构**（`getEventDataEvents`）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `eventName` | string | 事件名称 |
+| `propertyName` | string | 属性名 (data_key) |
+| `dataType` | number | 数据类型 |
+| `propertyValue` | string | 属性值（仅当指定 `event` 查询参数时返回） |
+| `total` | number | 记录数 |
+
+> 限制 `LIMIT 500`；指定 `event` 参数时按 eventName+propertyName+propertyValue 分组，否则按 eventName+propertyName 分组
+
+### 4.14 `/api/websites/[websiteId]/event-data/stats` — 事件数据统计概览
+
+**数据结构**（`getEventDataStats`）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `events` | number | 有数据的事件数（count distinct event_id） |
+| `properties` | number | 不同属性键数（count distinct data_key） |
+| `records` | number | 总记录数（sum of counts） |
+
+### 4.15 `/api/websites/[websiteId]/event-data/fields` — 事件数据字段
+
+**数据结构**（`getEventDataFields`）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `propertyName` | string | 数据键名 (data_key) |
+| `dataType` | number | 数据类型（1=string, 2=number, 3=boolean, 4=date, 5=array） |
+| `value` | string | 处理后的值（数值去尾零、日期截断到小时） |
+| `total` | number | 该值出现次数 |
+
+> 限制 `LIMIT 100`
+
+### 4.16 `/api/websites/[websiteId]/event-data/properties` — 事件数据属性汇总
 
 **数据结构**（`getEventDataProperties`）：
 
@@ -435,7 +580,7 @@ export function getRequestFilters(query: Record<string, any>) {
 
 > 限制 `LIMIT 500`
 
-### 4.14 `/api/websites/[websiteId]/event-data/values` — 事件数据值
+### 4.17 `/api/websites/[websiteId]/event-data/values` — 事件数据值
 
 **数据结构**（`getEventDataValues`）：
 
@@ -446,7 +591,7 @@ export function getRequestFilters(query: Record<string, any>) {
 
 > 限制 `LIMIT 100`
 
-### 4.15 `/api/websites/[websiteId]/sessions/stats` — 会话统计
+### 4.18 `/api/websites/[websiteId]/sessions/stats` — 会话统计
 
 **数据结构**（`getWebsiteSessionStats`）：
 
@@ -458,7 +603,7 @@ export function getRequestFilters(query: Record<string, any>) {
 | `bounces` | number | 跳出数 |
 | `totaltime` | number | 总停留时间 |
 
-### 4.16 `/api/websites/[websiteId]/events/stats` — 事件统计
+### 4.19 `/api/websites/[websiteId]/events/stats` — 事件统计
 
 **数据结构**（`getWebsiteEventStats`）：
 
@@ -467,7 +612,7 @@ export function getRequestFilters(query: Record<string, any>) {
 | `events` | number | 事件总数 |
 | `visitors` | number | 触发事件的访客数 |
 
-### 4.17 `/api/websites/[websiteId]/events/series` — 事件时序
+### 4.20 `/api/websites/[websiteId]/events/series` — 事件时序
 
 **数据结构**（`getEventStats`）：
 
@@ -476,11 +621,11 @@ export function getRequestFilters(query: Record<string, any>) {
 | `x` | string | 时间点 |
 | `y` | number | 事件数 |
 
-### 4.18 `/api/websites/[websiteId]/metrics/expanded` — 扩展指标
+### 4.21 `/api/websites/[websiteId]/metrics/expanded` — 扩展指标
 
 返回合并的页面浏览+会话+事件扩展指标。
 
-### 4.19 `/api/realtime/[websiteId]` — 实时数据
+### 4.22 `/api/realtime/[websiteId]` — 实时数据
 
 **数据结构**（`getRealtimeData`）：
 
@@ -498,7 +643,7 @@ export function getRequestFilters(query: Record<string, any>) {
 | `totals.countries` | number | 覆盖国家数 |
 | `timestamp` | number | 时间戳 |
 
-### 4.20 `/api/reports/breakdown` — 细分分析报告
+### 4.23 `/api/reports/breakdown` — 细分分析报告
 
 **数据结构**（`getBreakdown`）：
 
@@ -511,7 +656,7 @@ export function getRequestFilters(query: Record<string, any>) {
 | `totaltime` | number | 总停留时间 |
 | 动态维度字段 | string | 由 `fields` 参数决定，如 `browser`、`os`、`country` 等 |
 
-### 4.21 `/api/websites/[websiteId]/sessions/[sessionId]/replays` — 会话回放列表
+### 4.24 `/api/websites/[websiteId]/sessions/[sessionId]/replays` — 会话回放列表
 
 **数据结构**（`getSessionReplays`）：
 
@@ -534,6 +679,27 @@ export function getRequestFilters(query: Record<string, any>) {
 
 返回分页结构：`{ data, count, page, pageSize }`
 
+### 4.25 event-data 家族端点暴露链路
+
+```
+event-data 端点家族（共 7 个，全部通过 canViewWebsite 校验）
+  │
+  ├─ /event-data                → getEventData()         → 事件数据列表（按 eventId 聚合）
+  ├─ /event-data/[eventId]      → getEventDataById()     → 单个事件的所有属性
+  ├─ /event-data/events         → getEventDataEvents()   → 按事件+属性分组统计
+  ├─ /event-data/stats          → getEventDataStats()    → 事件数据总体统计（events/properties/records）
+  ├─ /event-data/fields         → getEventDataFields()   → 字段名+类型+值
+  ├─ /event-data/properties     → getEventDataProperties() → 事件名+属性名+计数
+  └─ /event-data/values         → getEventDataValues()   → 按属性值统计
+```
+
+**共享权限模式**：所有 7 个端点都遵循相同的鉴权链路：
+```
+parseRequest → checkAuth → canViewWebsite → getQueryFilters → SQL 查询
+     ↓           ↓            ↓                  ↓              ↓
+  解析token  双轨鉴权    仅实体级校验      仅过滤入参字段   硬编码SELECT字段
+```
+
 ---
 
 ## 五、字段裁剪总结
@@ -552,6 +718,7 @@ export function getRequestFilters(query: Record<string, any>) {
   │   Share Token 只能访问其绑定的 websiteId(s)/pixelId(s)/linkId(s)
   │   访问其他实体返回 401
   │   ⚠️ 仅做实体级权限校验，不校验字段或 section
+  │   ⚠️ websiteId 参数名重载，实际可匹配 websiteId/pixelId/linkId
   │
   └─ [第三层] SQL 查询层
       各查询函数硬编码 SELECT 字段，不做动态列选择
@@ -583,8 +750,11 @@ export function getRequestFilters(query: Record<string, any>) {
    - 单个会话详情接口 (`/sessions/[sessionId]`) 直接返回 `distinctId` 字段
    - 存在指纹追踪风险
 
-4. **event_data 完整暴露**：通过 Share Token 可访问以下端点，返回事件的自定义数据键值对：
-   - `/event-data` - 事件数据列表（聚合后）
+4. **event_data 完整暴露（7 个端点）**：通过 Share Token 可访问以下端点，返回事件的自定义数据键值对：
+   - `/event-data` - 事件数据列表（按 eventId 聚合）
+   - `/event-data/[eventId]` - 单个事件的所有属性
+   - `/event-data/events` - 按事件+属性分组统计
+   - `/event-data/stats` - 事件数据总体统计
    - `/event-data/fields` - 事件数据字段（键名+类型+值）
    - `/event-data/values` - 事件数据值（值+计数）
    - `/event-data/properties` - 事件数据属性（事件名+键名+计数）
@@ -598,6 +768,16 @@ export function getRequestFilters(query: Record<string, any>) {
 6. **endpoint 命名容易混淆**：
    - `/sessions/[sessionId]/properties` 返回单个会话的属性键值（`getSessionData`）
    - `/session-data/properties` 返回所有会话的属性汇总统计（`getSessionDataProperties`）
+
+7. **websiteId 参数语义重载**：
+   - pixel 分享时：`websiteId = pixelId`（同时设置 `pixelId` 字段）
+   - link 分享时：`websiteId = linkId`（同时设置 `linkId` 字段）
+   - `canViewWebsite()` 实际是 `canViewEntity()`，支持所有实体类型
+
+8. **whiteLabel 字段边界**：
+   - 仅在 Redis 模式下可用，非 Redis 部署无此字段
+   - 是 `/api/share/[slug]` 响应字段，**不是 JWT payload 的一部分**
+   - 仅用于前端品牌展示，不影响 API 数据权限
 
 ---
 
@@ -618,10 +798,14 @@ export function getRequestFilters(query: Record<string, any>) {
 | Share 权限 | `src/permissions/website.ts` | 5-40 |
 | Board 权限 | `src/permissions/board.ts` | 5-35 |
 | Pixel 权限 | `src/permissions/pixel.ts` | 5-33 |
+| 实体解析 | `src/lib/entity.ts` | 4-15 |
+| WhiteLabel 类型 | `src/lib/types.ts` | 190-194 |
 | 前端 API Hook | `src/components/hooks/useApi.ts` | 21-34 |
 | Share Provider | `src/app/share/ShareProvider.tsx` | 61-64 |
 | Share Store | `src/store/app.ts` | 35-40 |
 | Prisma Share Model | `prisma/schema.prisma` | 348-360 |
+| Prisma Pixel Model | `prisma/schema.prisma` | 309-324 |
+| Prisma Link Model | `prisma/schema.prisma` | 288-303 |
 | 概览统计查询 | `src/queries/sql/getWebsiteStats.ts` | 9-138 |
 | 页面浏览指标 | `src/queries/sql/pageviews/getPageviewMetrics.ts` | 7-197 |
 | 会话指标 | `src/queries/sql/sessions/getSessionMetrics.ts` | 7-137 |
@@ -635,6 +819,9 @@ export function getRequestFilters(query: Record<string, any>) {
 | 会话数据属性汇总 | `src/queries/sql/sessions/getSessionDataProperties.ts` | 6-75 |
 | 会话数据值 | `src/queries/sql/sessions/getSessionDataValues.ts` | 6-85 |
 | 事件数据列表 | `src/queries/sql/events/getEventData.ts` | 7-152 |
+| 事件数据详情 | `src/queries/sql/events/getEventDataById.ts` | 8-63 |
+| 事件数据分组统计 | `src/queries/sql/events/getEventDataEvents.ts` | 8-151 |
+| 事件数据统计概览 | `src/queries/sql/events/getEventDataStats.ts` | 8-94 |
 | 事件数据属性汇总 | `src/queries/sql/events/getEventDataProperties.ts` | 6-92 |
 | 事件数据值 | `src/queries/sql/events/getEventDataValues.ts` | 6-96 |
 | 会话回放列表 | `src/queries/sql/replays/getSessionReplays.ts` | 6-148 |
