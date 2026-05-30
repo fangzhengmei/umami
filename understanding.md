@@ -672,20 +672,27 @@ A: 因为域名不在预定义的分类列表中，或者 UTM 参数没有匹配
 | 10 | Video | ✅ | ✅ | ✅ |
 | 11 | Referral (外链) | ✅ | ✅ | ✅ |
 
-#### 10.2.2 付费/自然前缀判断对比
+#### 10.2.2 付费/自然前缀判断对比（已修正）
 
-| 对比项 | getChannelMetrics | getChannelExpandedMetrics | getRevenueMetrics |
-|--------|:-----------------:|:-------------------------:|:-----------------:|
-| PostgreSQL `LIKE 'p%'` | ✅ | ✅ | ❌ 使用 `ilike '%cp%'` |
-| PostgreSQL `LIKE '%ppc%'` | ✅ | ✅ | ✅ |
-| PostgreSQL `LIKE '%retargeting%'` | ✅ | ✅ | ✅ |
-| PostgreSQL `LIKE '%paid%'` | ✅ | ✅ | ✅ |
-| ClickHouse `multiSearchAny` | ✅ | ✅ | ✅ |
+**原始代码逐字对照**：
 
-**⚠️ 差异发现**: PostgreSQL 版本中，getRevenueMetrics 使用 `ilike '%cp%'` 而其他两条路径使用 `LIKE 'p%'`。这可能导致：
-- `getChannelMetrics`: 'cpc' 会被匹配（因为 'p%' 匹配 'cpc' 的第二个字符开始）
-- `getRevenueMetrics`: 'cpc' 会被匹配（因为 '%cp%' 包含 'cp'）
-- 实际效果可能一致，但实现方式不同
+| 条件 | getChannelMetrics (PG) | getChannelExpandedMetrics (PG) | getRevenueMetrics (PG) | 全部 ClickHouse |
+|------|:----------------------:|:------------------------------:|:----------------------:|:---------------:|
+| 条件 1 | `LIKE 'p%'` | `LIKE 'p%'` | `ilike '%cp%'` | `multiSearchAny(lower(…), ['cp',…])` |
+| 条件 2 | `LIKE '%ppc%'` | `LIKE '%ppc%'` | `ilike '%ppc%'` | 同上（含 'ppc'） |
+| 条件 3 | `LIKE '%retargeting%'` | `LIKE '%retargeting%'` | `ilike '%retargeting%'` | 同上（含 'retargeting'） |
+| 条件 4 | `LIKE '%paid%'` | `LIKE '%paid%'` | `ilike '%paid%'` | 同上（含 'paid'） |
+| 大小写 | 区分大小写 (LIKE) | 区分大小写 (LIKE) | 不区分 (ilike) | 不区分 (lower) |
+
+**关键语义差异推演**：
+
+`LIKE 'p%'` = 匹配以小写 'p' **开头**的任意字符串。这是 PostgreSQL LIKE 的精确语义：`%` 只出现在末尾，表示"p 后跟任意字符"。
+
+`ilike '%cp%'` = 匹配**任意位置包含** 'cp' 子串的字符串，不区分大小写。
+
+`multiSearchAny(lower(utm_medium), ['cp',…])` = 将 utm_medium 转小写后，检查是否**包含** 'cp' 子串。
+
+**三种模式的语义完全不同**，详见下方反例推演。
 
 #### 10.2.3 未匹配处理对比
 
@@ -879,15 +886,16 @@ export function getSalt(saltRotation: string, createdAt: Date): string {
 
 ## 十二、校验结果与证据汇总
 
-### 12.1 一致性校验结论
+### 12.1 一致性校验结论（已修正）
 
 | 校验项 | 结论 | 证据位置 |
 |-------|------|---------|
 | 渠道分类优先级 | ✅ 完全一致 | getChannelMetrics:54-65<br>getChannelExpandedMetrics:85-96<br>getRevenueMetrics:207-218 |
-| 付费前缀判断 | ⚠️ PostgreSQL 实现有细微差异 | getChannelMetrics:34<br>getRevenueMetrics:185 |
+| 付费前缀判断 | ❌ 三种实现语义不同，存在跨路径+跨引擎双重不一致 | getChannelMetrics:34 `LIKE 'p%'`<br>getRevenueMetrics:185 `ilike '%cp%'`<br>ClickHouse 全部:96 `multiSearchAny(…,['cp',…])` |
+| 渠道 CASE 分支逻辑 | ✅ 完全一致（同一组常量、同一优先级） | 三文件使用相同的 SEARCH/SOCIAL/EMAIL/SHOPPING/VIDEO_DOMAINS |
 | 未匹配处理 | ❌ 不一致（空 vs Unknown） | getChannelMetrics:74<br>getRevenueMetrics:219 |
-| 事件类型过滤 | ❌ 不一致 | getChannelMetrics:49<br>getRevenueMetrics:46-56 |
-| Session 去重逻辑 | ⚠️ 统计维度不同 | getChannelMetrics:67<br>getChannelExpandedMetrics:108-109<br>getRevenueMetrics:107 |
+| 事件类型过滤 | ❌ 不一致（设计意图不同） | getChannelMetrics:49 `NOT IN (2,5)`<br>getRevenueMetrics:46-56 关联收入事件 |
+| Session 去重逻辑 | ⚠️ 统计维度不同（设计意图差异） | getChannelMetrics:67 `count(distinct session_id)`<br>getChannelExpandedMetrics:108-109 session+visit<br>getRevenueMetrics:107 按 session 聚合求和 |
 
 ### 12.2 关键发现清单
 
@@ -975,3 +983,219 @@ export function getSalt(saltRotation: string, createdAt: Date): string {
 | Prisma 过滤器 | `src/lib/prisma.ts` |
 | ClickHouse 过滤器 | `src/lib/clickhouse.ts` |
 | 参数解析 | `src/lib/params.ts` |
+
+---
+
+## 十五、已修正结论：付费前缀判断的精确分析
+
+> 本节修正了此前文档中的错误论断。原文声称 `LIKE 'p%'` 能匹配 'cpc'（"因为 'p%' 匹配 'cpc' 的第二个字符开始"），这是对 SQL LIKE 语法的根本误解。下面给出精确推演。
+
+### 15.1 三种实现的精确语义
+
+#### 15.1.1 PostgreSQL `LIKE 'p%'`（getChannelMetrics / getChannelExpandedMetrics）
+
+```sql
+-- 来源: getChannelMetrics.ts:34, getChannelExpandedMetrics.ts:53
+utm_medium LIKE 'p%'
+```
+
+**语义**：匹配以小写字母 'p' **开头**的字符串。PostgreSQL 的 LIKE 区分大小写。
+
+- `%` 在 SQL LIKE 中是通配符，代表"零个或多个任意字符"
+- `'p%'` = 字面量 'p' 后跟任意字符序列
+- **不是**"任意位置包含 p"
+
+#### 15.1.2 PostgreSQL `ilike '%cp%'`（getRevenueMetrics）
+
+```sql
+-- 来源: getRevenueMetrics.ts:185
+we.utm_medium ilike '%cp%'
+```
+
+**语义**：匹配**任意位置包含**子串 'cp' 的字符串，不区分大小写。
+
+- `%cp%` = 前面任意字符 + 'cp' + 后面任意字符
+- ilike = 大小写不敏感的 LIKE
+
+#### 15.1.3 ClickHouse `multiSearchAny(lower(…), ['cp',…])`（全部三条路径）
+
+```sql
+-- 来源: getChannelMetrics.ts:96, getChannelExpandedMetrics.ts:143, getRevenueMetrics.ts:396
+multiSearchAny(lower(utm_medium), ['cp', 'ppc', 'retargeting', 'paid']) != 0
+```
+
+**语义**：将 utm_medium 转小写后，检查是否**包含** 'cp'、'ppc'、'retargeting'、'paid' 中任意一个子串。
+
+- `multiSearchAny` 是子串搜索函数，等价于多个 `position(…) > 0` 的 OR
+- `lower()` 保证大小写不敏感
+
+---
+
+### 15.2 逐值推演：哪些 utm_medium 值会产生分歧
+
+#### 15.2.1 核心分歧表
+
+| utm_medium | PG ChannelMetrics `LIKE 'p%'` | PG RevenueMetrics `ilike '%cp%'` | CH 全部 `multiSearchAny(['cp',…])` | 是否存在分歧 |
+|-----------|:-----------------------------:|:--------------------------------:|:----------------------------------:|:----------:|
+| `'cpc'` | ❌ organic（以 'c' 开头） | ✅ paid（含 'cp'） | ✅ paid（含 'cp'） | **❌ 三方不一致** |
+| `'CPC'` | ❌ organic（LIKE 区分大小写） | ✅ paid（ilike 不区分） | ✅ paid（lower→'cpc'含 'cp'） | **❌ 三方不一致** |
+| `'CPA'` | ❌ organic | ✅ paid（含 'CP'→ilike 匹配） | ✅ paid（lower→'cpa'含 'cp'） | **❌ 三方不一致** |
+| `'paid'` | ✅ paid（以 'p' 开头） | ✅ paid（含 'paid'） | ✅ paid（含 'paid'） | ✅ 一致 |
+| `'Paid'` | ❌ organic（大写 P，LIKE 区分大小写） | ✅ paid（ilike 不区分） | ✅ paid（lower→'paid'） | **❌ PG ChannelMetrics 不一致** |
+| `'PPC'` | ❌ organic（大写 P） | ✅ paid（ilike '%ppc%'匹配） | ✅ paid（lower→'ppc'） | **❌ PG ChannelMetrics 不一致** |
+| `'ppc'` | ✅ paid（以 'p' 开头） | ✅ paid（含 'ppc'） | ✅ paid（含 'ppc'） | ✅ 一致 |
+| `'retargeting'` | ❌ organic（以 'r' 开头，但 LIKE '%retargeting%' 单独匹配） | ✅ paid | ✅ paid | ✅ 一致（靠其他条件） |
+| `'promo'` | ✅ paid（以 'p' 开头 ⚠️误判） | ❌ organic（不含 'cp'） | ❌ organic（不含 'cp'） | **❌ PG ChannelMetrics 误判为 paid** |
+| `'product'` | ✅ paid（以 'p' 开头 ⚠️误判） | ❌ organic | ❌ organic | **❌ PG ChannelMetrics 误判为 paid** |
+| `'partnership'` | ✅ paid（以 'p' 开头 ⚠️误判） | ❌ organic | ❌ organic | **❌ PG ChannelMetrics 误判为 paid** |
+| `'press'` | ✅ paid（以 'p' 开头 ⚠️误判） | ❌ organic | ❌ organic | **❌ PG ChannelMetrics 误判为 paid** |
+| `'print'` | ✅ paid（以 'p' 开头 ⚠️误判） | ❌ organic | ❌ organic | **❌ PG ChannelMetrics 误判为 paid** |
+| `'programmatic'` | ✅ paid（以 'p' 开头 ⚠️误判） | ❌ organic | ❌ organic | **❌ PG ChannelMetrics 误判为 paid** |
+
+#### 15.2.2 分歧分类总结
+
+**分歧类型 A — `LIKE 'p%'` 过度匹配（误判为 paid）**：
+
+仅 PostgreSQL ChannelMetrics/ExpandedMetrics 会将非付费的 'p' 开头 utm_medium 误判为 paid：
+- `'promo'` → 实际为推广，非付费广告
+- `'product'` → 产品相关
+- `'partnership'` → 合作伙伴
+- `'press'` → 媒体/新闻
+- `'print'` → 平面媒体
+- `'programmatic'` → 程序化投放（可能是付费，也可能不是）
+
+**分歧类型 B — `LIKE 'p%'` 漏匹配（漏判为 organic）**：
+
+PostgreSQL ChannelMetrics/ExpandedMetrics 无法识别以下付费媒介：
+- `'cpc'` → 标准 Google Ads 付费媒介（cost-per-click），被漏判为 organic
+- `'CPC'` → 同上大写形式
+- `'CPA'` → cost-per-action 付费模式
+- `'cpv'` → cost-per-view 付费模式
+
+**分歧类型 C — 大小写敏感导致漏匹配**：
+
+PostgreSQL ChannelMetrics/ExpandedMetrics 使用区分大小写的 LIKE：
+- `'Paid'` → 被漏判为 organic（大写 P 不匹配 `LIKE 'p%'`）
+- `'PPC'` → 被漏判为 organic（但被 `LIKE '%ppc%'` 漏掉后，`LIKE 'p%'` 也因大写而失败）
+
+---
+
+### 15.3 ClickHouse 三条路径的一致性确认
+
+ClickHouse 的三条查询路径使用**完全相同**的前缀判断逻辑：
+
+```sql
+-- getChannelMetrics.ts:96
+-- getChannelExpandedMetrics.ts:143
+-- getRevenueMetrics.ts:396
+-- 三者代码完全一致
+case when multiSearchAny(lower(utm_medium), ['cp', 'ppc', 'retargeting', 'paid']) != 0
+  then 'paid' else 'organic' end prefix
+```
+
+**结论：ClickHouse 引擎下，三条路径的付费前缀判断完全一致，不存在跨路径分歧。**
+
+---
+
+### 15.4 PostgreSQL 两条渠道路径的一致性确认
+
+getChannelMetrics 和 getChannelExpandedMetrics 使用**完全相同**的前缀判断逻辑：
+
+```sql
+-- getChannelMetrics.ts:34
+-- getChannelExpandedMetrics.ts:53
+-- 二者代码完全一致
+case when website_event.utm_medium LIKE 'p%' OR
+    website_event.utm_medium LIKE '%ppc%' OR
+    website_event.utm_medium LIKE '%retargeting%' OR
+    website_event.utm_medium LIKE '%paid%' then 'paid' else 'organic' end prefix
+```
+
+**结论：PostgreSQL 引擎下，getChannelMetrics 与 getChannelExpandedMetrics 的付费前缀判断完全一致。**
+
+---
+
+### 15.5 真正存在的不一致维度
+
+| 不一致维度 | 涉及路径 | 根因 |
+|-----------|---------|------|
+| **PG ChannelMetrics ↔ PG RevenueMetrics** | 跨路径 | `LIKE 'p%'` vs `ilike '%cp%'` 语义不同 |
+| **PG ChannelMetrics ↔ CH ChannelMetrics** | 跨引擎 | `LIKE 'p%'` vs `multiSearchAny(['cp',…])` 语义不同 |
+| **PG ChannelMetrics 大小写** | 单路径内 | `LIKE` 区分大小写，漏判 'Paid'/'PPC'/'CPC' |
+| **PG ChannelMetrics 过度匹配** | 单路径内 | `LIKE 'p%'` 误判 'promo'/'product'/'press' 为 paid |
+
+**不存在的不一致**：
+- ~~PG ChannelMetrics ↔ PG ExpandedMetrics~~：两者代码完全相同
+- ~~CH 三条路径之间~~：三者代码完全相同
+
+---
+
+### 15.6 修正前错误声明与修正后结论对照
+
+| 编号 | 修正前声明 | 修正后结论 |
+|------|----------|----------|
+| E1 | "`LIKE 'p%'` 能匹配 'cpc'，因为 'p%' 匹配 'cpc' 的第二个字符" | ❌ **错误**。`LIKE 'p%'` 只匹配以 'p' **开头**的字符串。'cpc' 以 'c' 开头，不匹配。`%` 在 LIKE 中不是"任意位置"通配符，只有 `%pattern%` 才是。 |
+| E2 | "三条路径的实际效果可能一致，只是实现方式不同" | ❌ **错误**。实际效果在 'cpc'、'CPC'、'promo' 等场景下**完全不同**。 |
+| E3 | "付费前缀判断是细微差异" | ❌ **错误**。这是**语义级差异**，影响面远超"细微"。`LIKE 'p%'` 存在过度匹配和漏匹配双重问题。 |
+| E4 | "ClickHouse 三条路径一致" | ✅ **确认正确**。三条路径使用完全相同的 `multiSearchAny` 表达式。 |
+| E5 | "PG ChannelMetrics 和 PG ExpandedMetrics 有细微差异" | ❌ **错误**。两者代码完全相同，无任何差异。 |
+
+---
+
+## 十六、核对清单（修订版）
+
+### 16.1 付费前缀判断核对
+
+- [ ] `LIKE 'p%'` 是否将 'promo'/'product'/'press' 误判为 paid（PG ChannelMetrics/ExpandedMetrics）
+- [ ] `LIKE 'p%'` 是否漏判 'cpc' 为 organic（PG ChannelMetrics/ExpandedMetrics）
+- [ ] `LIKE 'p%'` 是否因大小写敏感漏判 'Paid'/'PPC'（PG ChannelMetrics/ExpandedMetrics）
+- [ ] `ilike '%cp%'` 是否正确匹配 'cpc'/'CPC'/'CPA'（PG RevenueMetrics）
+- [ ] `multiSearchAny` 是否正确匹配所有付费媒介变体（CH 全部路径）
+- [ ] 同一 utm_medium='cpc' 在 PG 和 CH 下是否产生不同渠道分类
+- [ ] 同一 utm_medium='promo' 在 PG ChannelMetrics 和 PG RevenueMetrics 下是否产生不同渠道分类
+
+### 16.2 渠道 CASE 分支一致性核对
+
+- [ ] 11 级优先级顺序在三条路径中是否完全一致
+- [ ] SEARCH_DOMAINS / SOCIAL_DOMAINS / EMAIL_DOMAINS / SHOPPING_DOMAINS / VIDEO_DOMAINS 常量引用是否一致
+- [ ] PAID_AD_PARAMS 常量引用是否一致
+- [ ] `toPostgresLikeClause` 和 `toPostgresPositionClause` 生成的 SQL 是否等价（答案：是，均生成 `column ilike '%value%'`）
+
+### 16.3 跨引擎一致性核对
+
+- [ ] PG `LIKE 'p%'` 与 CH `multiSearchAny(['cp',…])` 对 'cpc' 的判断是否不同（答案：是）
+- [ ] PG `LIKE 'p%'` 与 CH `multiSearchAny(['cp',…])` 对 'promo' 的判断是否不同（答案：是）
+- [ ] PG `ilike '%cp%'` 与 CH `multiSearchAny(['cp',…])` 对 'cpc' 的判断是否一致（答案：是，均判定为 paid）
+
+### 16.4 未匹配处理核对
+
+- [ ] getChannelMetrics/getChannelExpandedMetrics 是否过滤空字符串（`where x != ''`/`where name != ''`）
+- [ ] getRevenueMetrics 是否将未匹配记录归为 'Unknown' 并保留统计
+- [ ] 同一用户在渠道概览表和收入渠道表中是否可能出现渠道名不一致
+
+### 16.5 事件类型核对
+
+- [ ] getChannelMetrics/ExpandedMetrics 排除 event_type IN (2, 5)
+- [ ] getRevenueMetrics 关联 revenue 表（基于 event_type=2 的自定义事件）
+- [ ] 收入报表渠道归属使用首事件属性（min(created_at) 关联）
+
+### 16.6 Session 归并核对
+
+- [ ] 无 distinctId 时，IP 变化产生新 session_id
+- [ ] 有 distinctId 时，跨设备归并为同一 session_id
+- [ ] 盐值轮换后，默认模式产生新 session_id
+- [ ] 盐值轮换后，distinctId 模式保持一致
+- [ ] visit_id 30 分钟超时逻辑
+
+### 16.7 采集端核对
+
+- [ ] `document.referrer` 同源检测
+- [ ] URL 标准化函数（excludeSearch/excludeHash）
+- [ ] referrer 在 payload 中正确传递
+
+### 16.8 过滤器核对
+
+- [ ] referrer 过滤自动排除站内域名
+- [ ] 时间窗口正确应用时区
+- [ ] 过滤操作符正确映射
+- [ ] AND/OR 逻辑组合正确
