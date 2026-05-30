@@ -640,16 +640,338 @@ A: 因为域名不在预定义的分类列表中，或者 UTM 参数没有匹配
 
 ---
 
-## 十、相关文件速查
+## 十、三条查询路径的对比分析
+
+### 10.1 查询路径概览
+
+| 查询路径 | 主要用途 | 统计单位 |
+|---------|---------|---------|
+| `getChannelMetrics` | 渠道概览图表 | session_id 去重 |
+| `getChannelExpandedMetrics` | 渠道详情表格 | session_id / visit_id 去重 |
+| `getRevenueMetrics` | 收入渠道分布 | 首个事件属性 |
+
+---
+
+### 10.2 来源分类规则一致性校验
+
+#### 10.2.1 优先级顺序对比
+
+**三条路径的优先级顺序完全一致**，均为：
+
+| 优先级 | 渠道 | getChannelMetrics | getChannelExpandedMetrics | getRevenueMetrics |
+|--------|------|:-----------------:|:-------------------------:|:-----------------:|
+| 1 | Direct | ✅ | ✅ | ✅ |
+| 2 | Paid Ads | ✅ | ✅ | ✅ |
+| 3 | Referral (utm_medium) | ✅ | ✅ | ✅ |
+| 4 | Affiliate | ✅ | ✅ | ✅ |
+| 5 | SMS | ✅ | ✅ | ✅ |
+| 6 | Search | ✅ | ✅ | ✅ |
+| 7 | Social | ✅ | ✅ | ✅ |
+| 8 | Email | ✅ | ✅ | ✅ |
+| 9 | Shopping | ✅ | ✅ | ✅ |
+| 10 | Video | ✅ | ✅ | ✅ |
+| 11 | Referral (外链) | ✅ | ✅ | ✅ |
+
+#### 10.2.2 付费/自然前缀判断对比
+
+| 对比项 | getChannelMetrics | getChannelExpandedMetrics | getRevenueMetrics |
+|--------|:-----------------:|:-------------------------:|:-----------------:|
+| PostgreSQL `LIKE 'p%'` | ✅ | ✅ | ❌ 使用 `ilike '%cp%'` |
+| PostgreSQL `LIKE '%ppc%'` | ✅ | ✅ | ✅ |
+| PostgreSQL `LIKE '%retargeting%'` | ✅ | ✅ | ✅ |
+| PostgreSQL `LIKE '%paid%'` | ✅ | ✅ | ✅ |
+| ClickHouse `multiSearchAny` | ✅ | ✅ | ✅ |
+
+**⚠️ 差异发现**: PostgreSQL 版本中，getRevenueMetrics 使用 `ilike '%cp%'` 而其他两条路径使用 `LIKE 'p%'`。这可能导致：
+- `getChannelMetrics`: 'cpc' 会被匹配（因为 'p%' 匹配 'cpc' 的第二个字符开始）
+- `getRevenueMetrics`: 'cpc' 会被匹配（因为 '%cp%' 包含 'cp'）
+- 实际效果可能一致，但实现方式不同
+
+#### 10.2.3 未匹配处理对比
+
+| 处理方式 | getChannelMetrics | getChannelExpandedMetrics | getRevenueMetrics |
+|---------|:-----------------:|:-------------------------:|:-----------------:|
+| 未匹配返回 | 空字符串 `''` | 空字符串 `''` | `'Unknown'` |
+| 过滤空值 | `where x != ''` | `where name != ''` | 无过滤（包含 Unknown） |
+
+**⚠️ 差异发现**: 
+- getChannelMetrics 和 getChannelExpandedMetrics 会过滤掉未匹配的记录
+- getRevenueMetrics 会将未匹配的记录归类为 `'Unknown'` 并统计
+
+---
+
+### 10.3 Session 去重规则一致性校验
+
+#### 10.3.1 事件类型过滤
+
+| 事件类型 | getChannelMetrics | getChannelExpandedMetrics | getRevenueMetrics |
+|---------|:-----------------:|:-------------------------:|:-----------------:|
+| 1 (pageView) | ✅ 包含 | ✅ 包含 | ✅ 包含 |
+| 2 (customEvent) | ❌ 排除 | ❌ 排除 | ✅ 关联（收入事件） |
+| 3 (linkEvent) | ✅ 包含 | ✅ 包含 | ✅ 包含 |
+| 4 (pixelEvent) | ✅ 包含 | ✅ 包含 | ✅ 包含 |
+| 5 (performance) | ❌ 排除 | ❌ 排除 | ✅ 包含 |
+
+**⚠️ 差异发现**: 
+- getChannelMetrics/Expanded: `event_type NOT IN (2, 5)` - 排除自定义事件和性能事件
+- getRevenueMetrics: 基于 revenue 表，通过 event_id 关联 event_type = 2 的自定义事件（收入事件）
+
+#### 10.3.2 去重统计方式
+
+| 统计维度 | getChannelMetrics | getChannelExpandedMetrics | getRevenueMetrics |
+|---------|:-----------------:|:-------------------------:|:-----------------:|
+| visitors (session) | `count(distinct session_id)` | `count(distinct session_id)` | 按 session_id 聚合后求和 |
+| visits | ❌ 不统计 | `count(distinct visit_id)` | ❌ 不统计 |
+| pageviews | ❌ 不统计 | `count(*)` | ❌ 不统计 |
+| 收入金额 | ❌ 不统计 | ❌ 不统计 | `sum(revenue)` |
+
+#### 10.3.3 首事件归因逻辑（getRevenueMetrics 特有）
+
+getRevenueMetrics 使用**首事件归因**，即：
+
+```sql
+WITH revenue_data AS (
+  select
+    e.session_id,
+    e.value,
+    we.min_date as created_at  -- 取该 session 的首个事件时间
+  from events e
+  join (
+    select session_id, min(created_at) as min_date
+    from website_event
+    group by session_id
+  ) we on we.session_id = e.session_id
+)
+-- 用首个事件的属性来判断渠道
+```
+
+**影响**: 收入的渠道归属是基于用户会话中**第一个事件**的来源属性，而不是产生收入的那个事件的属性。
+
+---
+
+## 十一、Session ID 生成路径与 DistinctId 影响
+
+### 11.1 Session ID 生成逻辑
+
+**文件位置**: `src/app/api/send/route.ts`, `src/lib/crypto.ts`
+
+#### 11.1.1 核心生成代码
+
+```typescript
+// src/app/api/send/route.ts:147
+const sessionId = id ? uuid(sourceId, id) : uuid(sourceId, ip, userAgent, sessionSalt);
+```
+
+```typescript
+// src/lib/crypto.ts:60-66
+export function uuid(...args: any) {
+  if (args.length) {
+    // 确定性 UUID v5: 基于输入参数的哈希值生成
+    return v5(hash(...args, secret()), v5.DNS);
+  }
+  // 随机 UUID v4 或 v7
+  return process.env.USE_UUIDV7 ? v7() : v4();
+}
+```
+
+#### 11.1.2 两种生成模式对比
+
+| 模式 | 触发条件 | 输入参数 | 稳定性 |
+|------|---------|---------|--------|
+| **DistinctId 模式** | 提供了 `id` 参数（来自 `umami.identify()`） | `sourceId` + `distinctId` | ✅ 跨设备/跨网络稳定 |
+| **默认模式** | 未提供 `id` 参数 | `sourceId` + `ip` + `userAgent` + `sessionSalt` | ⚠️ IP/UserAgent 变化时改变 |
+
+---
+
+### 11.2 DistinctId 存在时的影响
+
+#### 11.2.1 会话归并行为
+
+**当调用 `umami.identify('user123')` 后：**
+
+```javascript
+// 前端调用
+umami.identify('user123', { name: 'John' });
+```
+
+**效果**:
+1. `identity` 变量被设置为 `'user123'`
+2. 后续所有事件上报时，`payload.id = 'user123'`
+3. 服务端使用 `uuid(sourceId, 'user123')` 生成 session_id
+4. **同一 distinctId 的所有事件会归并到同一个 session_id**
+
+#### 11.2.2 盐值轮换的影响
+
+```typescript
+// src/lib/crypto.ts:72-78
+export function getSalt(saltRotation: string, createdAt: Date): string {
+  return hash(
+    (saltRotation === 'day' ? startOfDay : saltRotation === 'week' ? startOfWeek : startOfMonth)(
+      createdAt,
+    ).toUTCString(),
+  );
+}
+```
+
+| 配置 | 默认值 | 影响 |
+|------|--------|------|
+| `SALT_ROTATION` | `'month'` | 每月重置盐值 |
+| 重置周期 | 月/周/天 | 盐值变化后，相同 IP+UA 会生成不同 session_id |
+
+**注意**: DistinctId 模式**不受盐值轮换影响**，因为它不使用 sessionSalt！
+
+---
+
+### 11.3 Session 归并对比矩阵
+
+| 场景 | 默认模式 (无 distinctId) | DistinctId 模式 |
+|------|:-----------------------:|:---------------:|
+| 同一浏览器，同一 IP | ✅ 同一 session_id | ✅ 同一 session_id |
+| 同一浏览器，IP 变化 | ❌ 不同 session_id | ✅ 同一 session_id |
+| 不同浏览器，同一用户 | ❌ 不同 session_id | ✅ 同一 session_id |
+| 跨设备用户 | ❌ 不同 session_id | ✅ 同一 session_id |
+| 盐值轮换后 | ❌ 不同 session_id | ✅ 同一 session_id |
+| 隐私模式浏览 | ❌ 不同 session_id | ✅ 同一 session_id（需登录） |
+
+---
+
+### 11.4 对渠道统计的影响
+
+#### 11.4.1 默认模式的问题
+
+**问题场景**: 用户在上班时用公司网络访问，下班回家用家庭网络继续访问
+
+```
+上午 (公司网络):
+  IP: 203.0.113.1
+  UserAgent: Chrome/Windows
+  → session_id: ABC123
+  → 渠道: organicSearch
+
+晚上 (家庭网络):
+  IP: 198.51.100.2
+  UserAgent: Chrome/Windows
+  → session_id: DEF456  (不同！)
+  → 渠道: direct
+```
+
+**统计结果**: 被算作 2 个访客，渠道被拆分
+
+#### 11.4.2 DistinctId 模式的解决
+
+**使用 identify 后**:
+
+```
+上午:
+  distinctId: user123
+  → session_id: UUID-user123
+  → 渠道: organicSearch
+
+晚上:
+  distinctId: user123
+  → session_id: UUID-user123  (相同！)
+  → 渠道: organicSearch (沿用首事件属性)
+```
+
+**统计结果**: 被算作 1 个访客，渠道归属一致
+
+---
+
+## 十二、校验结果与证据汇总
+
+### 12.1 一致性校验结论
+
+| 校验项 | 结论 | 证据位置 |
+|-------|------|---------|
+| 渠道分类优先级 | ✅ 完全一致 | getChannelMetrics:54-65<br>getChannelExpandedMetrics:85-96<br>getRevenueMetrics:207-218 |
+| 付费前缀判断 | ⚠️ PostgreSQL 实现有细微差异 | getChannelMetrics:34<br>getRevenueMetrics:185 |
+| 未匹配处理 | ❌ 不一致（空 vs Unknown） | getChannelMetrics:74<br>getRevenueMetrics:219 |
+| 事件类型过滤 | ❌ 不一致 | getChannelMetrics:49<br>getRevenueMetrics:46-56 |
+| Session 去重逻辑 | ⚠️ 统计维度不同 | getChannelMetrics:67<br>getChannelExpandedMetrics:108-109<br>getRevenueMetrics:107 |
+
+### 12.2 关键发现清单
+
+1. **收入归因采用首事件模式**: getRevenueMetrics 使用 session 中第一个事件的来源属性来判断渠道，而不是收入事件本身的属性
+2. **DistinctId 可跨设备归并**: 使用 identify() 后，相同用户在不同设备/网络下会被归并为同一会话
+3. **盐值轮换不影响 DistinctId**: DistinctId 模式不使用 sessionSalt，因此盐值轮换不会拆分会话
+4. **Unknown 渠道仅在收入报表出现**: 普通渠道报表会过滤未匹配记录，收入报表会显示为 Unknown
+
+---
+
+## 十三、核对清单
+
+### 13.1 采集端核对
+
+- [ ] `document.referrer` 同源检测是否正确执行
+- [ ] URL 标准化函数是否处理了相对 URL
+- [ ] excludeSearch/excludeHash 配置是否生效
+- [ ] Tracker 上报的 payload 中是否包含 referrer 字段
+
+### 13.2 服务端处理核对
+
+- [ ] referrer 是否被正确解析为 domain/path/query
+- [ ] 域名是否正确移除 www. 前缀
+- [ ] UTM 参数是否从目标 URL（而非 referrer）提取
+- [ ] Click ID 参数（gclid/fbclid 等）是否正确提取
+- [ ] session_id 生成逻辑是否符合预期（带/不带 distinctId）
+- [ ] 盐值轮换配置是否正确应用
+
+### 13.3 渠道映射核对
+
+- [ ] 11 级优先级顺序是否正确执行
+- [ ] Direct 条件是否为（domain 空 AND query 空）
+- [ ] Paid Ads 参数列表是否完整
+- [ ] 域名分类数组是否包含所有需要的域名
+- [ ] 付费/自然前缀判断逻辑是否正确
+- [ ] 站内跳转是否被正确排除
+
+### 13.4 三条查询路径核对
+
+**getChannelMetrics**:
+- [ ] 事件过滤: `event_type NOT IN (2, 5)`
+- [ ] 去重方式: `count(distinct session_id)`
+- [ ] 空值处理: `where x != ''`
+
+**getChannelExpandedMetrics**:
+- [ ] 事件过滤: `event_type NOT IN (2, 5)`
+- [ ] visitors: `count(distinct session_id)`
+- [ ] visits: `count(distinct visit_id)`
+- [ ] 空值处理: `where name != ''`
+
+**getRevenueMetrics**:
+- [ ] 首事件归因: 使用 min(created_at) 关联
+- [ ] 未匹配处理: 返回 'Unknown'
+- [ ] 收入聚合: `sum(revenue)`
+
+### 13.5 Session 归并核对
+
+- [ ] 无 distinctId 时，IP 变化是否产生新 session
+- [ ] 有 distinctId 时，跨设备是否归并
+- [ ] 盐值轮换后，默认模式是否产生新 session
+- [ ] 盐值轮换后，distinctId 模式是否保持一致
+- [ ] visit_id 30 分钟超时逻辑是否正确
+
+### 13.6 过滤器核对
+
+- [ ] referrer 过滤是否自动排除站内域名
+- [ ] 时间窗口是否正确应用时区
+- [ ] 过滤操作符是否正确映射
+- [ ] AND/OR 逻辑组合是否正确
+
+---
+
+## 十四、相关文件速查（扩展版）
 
 | 功能 | 文件路径 |
 |------|---------|
 | Tracker 采集 | `src/tracker/index.js` |
 | 数据接收 | `src/app/api/send/route.ts` |
 | 常量配置 | `src/lib/constants.ts` |
+| 加密与 UUID | `src/lib/crypto.ts` |
 | 事件保存 | `src/queries/sql/events/saveEvent.ts` |
 | 渠道统计 | `src/queries/sql/getChannelMetrics.ts` |
 | 渠道详情 | `src/queries/sql/getChannelExpandedMetrics.ts` |
+| 收入渠道统计 | `src/queries/sql/reports/getRevenueMetrics.ts` |
 | Prisma 过滤器 | `src/lib/prisma.ts` |
 | ClickHouse 过滤器 | `src/lib/clickhouse.ts` |
 | 参数解析 | `src/lib/params.ts` |
