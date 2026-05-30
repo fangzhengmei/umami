@@ -633,7 +633,22 @@ A: Tracker 端会判断 referrer 是否与当前 origin 同源，同源则设为
 A: `referrer_domain` 为空 **且** `url_query` 为空。这意味着用户直接输入网址访问，且 URL 不带任何查询参数。
 
 ### Q3: 付费/自然前缀如何判断?
-A: 主要通过 `utm_medium` 参数判断，包含 'paid', 'ppc', 'retargeting', 'cpc' 等关键词则标记为 paid，否则为 organic。
+A: 不同查询路径和数据库引擎的判断逻辑不同：
+
+**ClickHouse 引擎（三条路径均一致）**：检查 `utm_medium` 是否包含 'cp'、'ppc'、'retargeting'、'paid' 任一子串（不区分大小写）→ 包含则判为 paid，否则 organic。
+
+**PostgreSQL 引擎，getChannelMetrics/getChannelExpandedMetrics**：4 条件 OR（区分大小写）：
+- 以 'p' 开头（`LIKE 'p%'`）→ ✅ paid
+- 含 'ppc' 子串 → ✅ paid
+- 含 'retargeting' 子串 → ✅ paid
+- 含 'paid' 子串 → ✅ paid
+- ⚠️ **注意**：'cpc'、'CPA'、'cpv' 不匹配，会被误判为 organic；'Paid'、'PPC' 因大写也不匹配
+
+**PostgreSQL 引擎，getRevenueMetrics**：4 条件 OR（不区分大小写）：
+- 含 'cp' 子串 → ✅ paid
+- 含 'ppc' 子串 → ✅ paid
+- 含 'retargeting' 子串 → ✅ paid
+- 含 'paid' 子串 → ✅ paid
 
 ### Q4: 为什么有些 external link 被归为 referral 而非其他类型?
 A: 因为域名不在预定义的分类列表中，或者 UTM 参数没有匹配上特定类型。
@@ -897,12 +912,18 @@ export function getSalt(saltRotation: string, createdAt: Date): string {
 | 事件类型过滤 | ❌ 不一致（设计意图不同） | getChannelMetrics:49 `NOT IN (2,5)`<br>getRevenueMetrics:46-56 关联收入事件 |
 | Session 去重逻辑 | ⚠️ 统计维度不同（设计意图差异） | getChannelMetrics:67 `count(distinct session_id)`<br>getChannelExpandedMetrics:108-109 session+visit<br>getRevenueMetrics:107 按 session 聚合求和 |
 
-### 12.2 关键发现清单
+### 12.2 关键发现清单（已复核）
 
 1. **收入归因采用首事件模式**: getRevenueMetrics 使用 session 中第一个事件的来源属性来判断渠道，而不是收入事件本身的属性
 2. **DistinctId 可跨设备归并**: 使用 identify() 后，相同用户在不同设备/网络下会被归并为同一会话
 3. **盐值轮换不影响 DistinctId**: DistinctId 模式不使用 sessionSalt，因此盐值轮换不会拆分会话
 4. **Unknown 渠道仅在收入报表出现**: 普通渠道报表会过滤未匹配记录，收入报表会显示为 Unknown
+5. **付费前缀判断存在三重不一致**:
+   - **跨路径不一致**: PG getChannelMetrics 使用 `LIKE 'p%'`，PG getRevenueMetrics 使用 `ilike '%cp%'`
+   - **跨引擎不一致**: PG 使用区分大小写的 `LIKE`，ClickHouse 使用不区分大小写的 `multiSearchAny`
+   - **内部逻辑冲突**: `LIKE 'p%'` 存在过度匹配（'promo'→paid）和漏匹配（'cpc'→organic）双重问题
+6. **retargeting 判定完全一致**: 三条路径 + 两种引擎下，retargeting 均通过 `%retargeting%` 子串匹配正确判定为 paid，无分歧
+7. **ClickHouse 实现是事实标准**: 三条路径在 ClickHouse 下实现完全一致，无内部矛盾，应作为判定基准
 
 ---
 
@@ -1033,50 +1054,162 @@ multiSearchAny(lower(utm_medium), ['cp', 'ppc', 'retargeting', 'paid']) != 0
 
 ### 15.2 逐值推演：哪些 utm_medium 值会产生分歧
 
-#### 15.2.1 核心分歧表
+**完整判断条件回顾**：
+- **PG ChannelMetrics/ExpandedMetrics**：`LIKE 'p%' OR LIKE '%ppc%' OR LIKE '%retargeting%' OR LIKE '%paid%'`（4 条件 OR，区分大小写）
+- **PG RevenueMetrics**：`ilike '%cp%' OR ilike '%ppc%' OR ilike '%retargeting%' OR ilike '%paid%'`（4 条件 OR，不区分大小写）
+- **ClickHouse 全部**：`multiSearchAny(lower(utm_medium), ['cp', 'ppc', 'retargeting', 'paid'])`（子串包含，不区分大小写）
 
-| utm_medium | PG ChannelMetrics `LIKE 'p%'` | PG RevenueMetrics `ilike '%cp%'` | CH 全部 `multiSearchAny(['cp',…])` | 是否存在分歧 |
-|-----------|:-----------------------------:|:--------------------------------:|:----------------------------------:|:----------:|
-| `'cpc'` | ❌ organic（以 'c' 开头） | ✅ paid（含 'cp'） | ✅ paid（含 'cp'） | **❌ 三方不一致** |
-| `'CPC'` | ❌ organic（LIKE 区分大小写） | ✅ paid（ilike 不区分） | ✅ paid（lower→'cpc'含 'cp'） | **❌ 三方不一致** |
-| `'CPA'` | ❌ organic | ✅ paid（含 'CP'→ilike 匹配） | ✅ paid（lower→'cpa'含 'cp'） | **❌ 三方不一致** |
-| `'paid'` | ✅ paid（以 'p' 开头） | ✅ paid（含 'paid'） | ✅ paid（含 'paid'） | ✅ 一致 |
-| `'Paid'` | ❌ organic（大写 P，LIKE 区分大小写） | ✅ paid（ilike 不区分） | ✅ paid（lower→'paid'） | **❌ PG ChannelMetrics 不一致** |
-| `'PPC'` | ❌ organic（大写 P） | ✅ paid（ilike '%ppc%'匹配） | ✅ paid（lower→'ppc'） | **❌ PG ChannelMetrics 不一致** |
-| `'ppc'` | ✅ paid（以 'p' 开头） | ✅ paid（含 'ppc'） | ✅ paid（含 'ppc'） | ✅ 一致 |
-| `'retargeting'` | ❌ organic（以 'r' 开头，但 LIKE '%retargeting%' 单独匹配） | ✅ paid | ✅ paid | ✅ 一致（靠其他条件） |
-| `'promo'` | ✅ paid（以 'p' 开头 ⚠️误判） | ❌ organic（不含 'cp'） | ❌ organic（不含 'cp'） | **❌ PG ChannelMetrics 误判为 paid** |
-| `'product'` | ✅ paid（以 'p' 开头 ⚠️误判） | ❌ organic | ❌ organic | **❌ PG ChannelMetrics 误判为 paid** |
-| `'partnership'` | ✅ paid（以 'p' 开头 ⚠️误判） | ❌ organic | ❌ organic | **❌ PG ChannelMetrics 误判为 paid** |
-| `'press'` | ✅ paid（以 'p' 开头 ⚠️误判） | ❌ organic | ❌ organic | **❌ PG ChannelMetrics 误判为 paid** |
-| `'print'` | ✅ paid（以 'p' 开头 ⚠️误判） | ❌ organic | ❌ organic | **❌ PG ChannelMetrics 误判为 paid** |
-| `'programmatic'` | ✅ paid（以 'p' 开头 ⚠️误判） | ❌ organic | ❌ organic | **❌ PG ChannelMetrics 误判为 paid** |
+#### 15.2.1 核心分歧表（已复核修正版）
 
-#### 15.2.2 分歧分类总结
+| utm_medium | PG ChannelMetrics<br/>（4 条件 OR，区分大小写） | PG RevenueMetrics<br/>（4 条件 OR，不区分大小写） | CH 全部<br/>（子串包含，不区分大小写） | 复核结论与说明 |
+|-----------|:-----------------------------------------------:|:------------------------------------------------:|:-------------------------------------:|:--------------:|
+| `'cpc'` | ❌ organic | ✅ paid | ✅ paid | **❌ 跨路径不一致**<br/>PG 渠道查询漏判标准付费媒介 |
+| | _不匹配任何条件：c 开头，不含 ppc/retargeting/paid_ | _含 'cp'，匹配 `ilike '%cp%'`_ | _lower→'cpc' 含 'cp'_ | |
+| `'CPC'` | ❌ organic | ✅ paid | ✅ paid | **❌ 跨路径不一致**<br/>大小写敏感导致漏判 |
+| | _C 开头，LIKE 区分大小写，全不匹配_ | _含 'CP'，ilike 不区分大小写_ | _lower→'cpc' 含 'cp'_ | |
+| `'CPA'` | ❌ organic | ✅ paid | ✅ paid | **❌ 跨路径不一致** |
+| | _C 开头，无匹配子串_ | _含 'CP'，匹配 `ilike '%cp%'`_ | _lower→'cpa' 含 'cp'_ | |
+| `'cpv'` | ❌ organic | ✅ paid | ✅ paid | **❌ 跨路径不一致**<br/>CPV=cost-per-view 漏判 |
+| | _c 开头，无匹配子串_ | _含 'cp'，匹配 `ilike '%cp%'`_ | _lower→'cpv' 含 'cp'_ | |
+| `'paid'` | ✅ paid | ✅ paid | ✅ paid | ✅ 完全一致 |
+| | _以 'p' 开头，匹配 `LIKE 'p%'`；也含 'paid'_ | _含 'paid'，匹配 `ilike '%paid%'`_ | _含 'paid'_ | |
+| `'Paid'` | ❌ organic | ✅ paid | ✅ paid | **❌ PG 渠道查询不一致**<br/>LIKE 区分大小写漏判 |
+| | _大写 P 开头，`LIKE 'p%'` 不匹配；`LIKE '%paid%'` 区分大小写也不匹配_ | _含 'Paid'，ilike 不区分大小写_ | _lower→'paid' 含 'paid'_ | |
+| `'PaidSearch'` | ❌ organic | ✅ paid | ✅ paid | **❌ PG 渠道查询不一致** |
+| | _大写 P 开头；'PaidSearch' 不含小写 'paid'_ | _含 'Paid'，ilike 不区分大小写_ | _lower→'paidsearch' 含 'paid'_ | |
+| `'PPC'` | ❌ organic | ✅ paid | ✅ paid | **❌ PG 渠道查询不一致**<br/>大小写敏感双重漏判 |
+| | _大写 P 开头；`LIKE '%ppc%'` 区分大小写也不匹配_ | _含 'PPC'，ilike 不区分大小写_ | _lower→'ppc' 含 'ppc'_ | |
+| `'ppc'` | ✅ paid | ✅ paid | ✅ paid | ✅ 完全一致 |
+| | _以 'p' 开头；也含 'ppc'_ | _含 'ppc'_ | _含 'ppc'_ | |
+| `'retargeting'` | ✅ paid | ✅ paid | ✅ paid | ✅ 完全一致 |
+| | _含 'retargeting'，匹配 `LIKE '%retargeting%'`_ | _含 'retargeting'，匹配 `ilike '%retargeting%'`_ | _含 'retargeting'_ | |
+| `'social_paid'` | ✅ paid | ✅ paid | ✅ paid | ✅ 完全一致 |
+| | _含 'paid'，匹配 `LIKE '%paid%'`_ | _含 'paid'，匹配 `ilike '%paid%'`_ | _lower→'social_paid' 含 'paid'_ | |
+| `'promo'` | ✅ paid ⚠️ | ❌ organic | ❌ organic | **❌ PG 渠道查询过度匹配**<br/>非付费词被误判 |
+| | _以 'p' 开头，匹配 `LIKE 'p%'`，但实际非付费_ | _不含 cp/ppc/retargeting/paid_ | _lower→'promo' 不含匹配子串_ | |
+| `'product'` | ✅ paid ⚠️ | ❌ organic | ❌ organic | **❌ PG 渠道查询过度匹配** |
+| | _以 'p' 开头，误判_ | _无匹配_ | _无匹配_ | |
+| `'partnership'` | ✅ paid ⚠️ | ❌ organic | ❌ organic | **❌ PG 渠道查询过度匹配** |
+| | _以 'p' 开头，误判_ | _无匹配_ | _无匹配_ | |
+| `'press'` | ✅ paid ⚠️ | ❌ organic | ❌ organic | **❌ PG 渠道查询过度匹配** |
+| | _以 'p' 开头，误判_ | _无匹配_ | _无匹配_ | |
+| `'print'` | ✅ paid ⚠️ | ❌ organic | ❌ organic | **❌ PG 渠道查询过度匹配** |
+| | _以 'p' 开头，误判_ | _无匹配_ | _无匹配_ | |
+| `'programmatic'` | ✅ paid ⚠️ | ❌ organic | ❌ organic | **❌ PG 渠道查询过度匹配** |
+| | _以 'p' 开头，误判_ | _无匹配_ | _无匹配_ | |
+
+#### 15.2.2 复核后冲突项总览
+
+| 冲突类型 | 涉及 utm_medium 样例 | 影响路径 |
+|---------|:---------------------|---------|
+| **PG 渠道查询漏判为 organic** | 'cpc', 'CPC', 'CPA', 'cpv', 'Paid', 'PaidSearch', 'PPC' | PG getChannelMetrics / getChannelExpandedMetrics |
+| **PG 渠道查询误判为 paid** | 'promo', 'product', 'partnership', 'press', 'print', 'programmatic' | PG getChannelMetrics / getChannelExpandedMetrics |
+| **跨引擎不一致** | 'cpc', 'promo', 'Paid', 'PPC' | PG vs ClickHouse（同一条查询路径） |
+| **跨路径不一致** | 'cpc', 'promo' | PG getChannelMetrics vs PG getRevenueMetrics |
+| **完全一致** | 'paid', 'ppc', 'retargeting', 'social_paid' | 全部三条路径 + 两种引擎 |
+
+#### 15.2.3 分歧分类总结（已复核）
 
 **分歧类型 A — `LIKE 'p%'` 过度匹配（误判为 paid）**：
 
-仅 PostgreSQL ChannelMetrics/ExpandedMetrics 会将非付费的 'p' 开头 utm_medium 误判为 paid：
-- `'promo'` → 实际为推广，非付费广告
-- `'product'` → 产品相关
-- `'partnership'` → 合作伙伴
-- `'press'` → 媒体/新闻
-- `'print'` → 平面媒体
-- `'programmatic'` → 程序化投放（可能是付费，也可能不是）
+仅 PostgreSQL ChannelMetrics/ExpandedMetrics 会将非付费的 'p' 开头 utm_medium 误判为 paid（6 例）：
+| 值 | 说明 |
+|----|------|
+| `'promo'` | 促销/推广，非付费广告 |
+| `'product'` | 产品页面相关 |
+| `'partnership'` | 合作伙伴 |
+| `'press'` | 媒体/新闻稿 |
+| `'print'` | 平面媒体 |
+| `'programmatic'` | 程序化投放（可能付费，但不必然） |
 
-**分歧类型 B — `LIKE 'p%'` 漏匹配（漏判为 organic）**：
+**关键证据**：PG ChannelMetrics 使用的 4 条件 OR 中，第一个条件 `LIKE 'p%'` 匹配所有以小写 'p' 开头的字符串，不检查后续内容。
 
-PostgreSQL ChannelMetrics/ExpandedMetrics 无法识别以下付费媒介：
-- `'cpc'` → 标准 Google Ads 付费媒介（cost-per-click），被漏判为 organic
-- `'CPC'` → 同上大写形式
-- `'CPA'` → cost-per-action 付费模式
-- `'cpv'` → cost-per-view 付费模式
+---
 
-**分歧类型 C — 大小写敏感导致漏匹配**：
+**分歧类型 B — 缺 `cp` 子串匹配导致漏判（应判为 paid 却判为 organic）**：
 
-PostgreSQL ChannelMetrics/ExpandedMetrics 使用区分大小写的 LIKE：
-- `'Paid'` → 被漏判为 organic（大写 P 不匹配 `LIKE 'p%'`）
-- `'PPC'` → 被漏判为 organic（但被 `LIKE '%ppc%'` 漏掉后，`LIKE 'p%'` 也因大写而失败）
+PostgreSQL ChannelMetrics/ExpandedMetrics 缺 `%cp%` 子串匹配，无法识别标准付费模式（7 例）：
+| 值 | 说明 |
+|----|------|
+| `'cpc'` | 标准 Google Ads 付费媒介（cost-per-click） |
+| `'CPC'` | 同上，大写形式 |
+| `'CPA'` | cost-per-action |
+| `'cpv'` | cost-per-view |
+| `'Paid'` | 大写 P，`LIKE 'p%'` 不匹配；且 `LIKE '%paid%'` 区分大小写也不匹配 |
+| `'PaidSearch'` | 大写 P，且不含小写 'paid' |
+| `'PPC'` | 大写 P，`LIKE 'p%'` 和 `LIKE '%ppc%'` 均不匹配 |
+
+**关键证据**：PG ChannelMetrics 的 4 条件为 `LIKE 'p%'` + `LIKE '%ppc%'` + `LIKE '%retargeting%'` + `LIKE '%paid%'`，无 `%cp%` 匹配；而 PG RevenueMetrics 和 CH 均有 `cp` 子串匹配。
+
+---
+
+**分歧类型 C — 大小写敏感导致漏匹配（仅 PG 渠道查询）**：
+
+PostgreSQL ChannelMetrics/ExpandedMetrics 使用区分大小写的 `LIKE`（非 `ILIKE`）：
+- `'Paid'` → 大写 P 开头，`LIKE 'p%'` 不匹配；`'Paid'` 也不含小写 `'paid'`，所以 `LIKE '%paid%'` 也不匹配 → ❌ organic
+- `'PPC'` → 大写 P 开头，`LIKE 'p%'` 不匹配；`'PPC'` 也不含小写 `'ppc'`，所以 `LIKE '%ppc%'` 也不匹配 → ❌ organic
+- `'CPC'` → 大写 C 开头，所有 LIKE 条件均不匹配 → ❌ organic
+
+**关键证据**：代码中明确写的是 `LIKE` 而非 `ILIKE`：
+```sql
+-- getChannelMetrics.ts:34
+website_event.utm_medium LIKE 'p%' OR
+website_event.utm_medium LIKE '%ppc%' OR
+website_event.utm_medium LIKE '%retargeting%' OR
+website_event.utm_medium LIKE '%paid%'
+```
+
+---
+
+### 15.2.4 复核结果摘要
+
+#### ✅ 完全一致的样例（4 个）
+
+以下 utm_medium 值在**三条路径 + 两种引擎**下判定完全一致：
+
+| 值 | 应判为 | 理由 |
+|----|:-----:|------|
+| `'paid'` | paid | 全部匹配 |
+| `'ppc'` | paid | 全部匹配 |
+| `'retargeting'` | paid | 全部匹配 `%retargeting%` 子串 |
+| `'social_paid'` | paid | 全部匹配 `%paid%` 子串 |
+
+#### ❌ 存在分歧的样例（13 个）
+
+**应判为 paid 但 PG 渠道查询漏判为 organic（7 个）**：
+
+| 值 | 正确判定 | PG 渠道查询错误 | 根因 |
+|----|:--------:|:---------------:|------|
+| `'cpc'` | paid | organic | 缺 `%cp%` 匹配 |
+| `'CPC'` | paid | organic | 缺 `%cp%` + 大小写敏感 |
+| `'CPA'` | paid | organic | 缺 `%cp%` + 大小写敏感 |
+| `'cpv'` | paid | organic | 缺 `%cp%` 匹配 |
+| `'Paid'` | paid | organic | 大小写敏感 |
+| `'PaidSearch'` | paid | organic | 大小写敏感 |
+| `'PPC'` | paid | organic | 大小写敏感 |
+
+**应判为 organic 但 PG 渠道查询误判为 paid（6 个）**：
+
+| 值 | 正确判定 | PG 渠道查询错误 | 根因 |
+|----|:--------:|:---------------:|------|
+| `'promo'` | organic | paid | `LIKE 'p%'` 过度匹配 |
+| `'product'` | organic | paid | `LIKE 'p%'` 过度匹配 |
+| `'partnership'` | organic | paid | `LIKE 'p%'` 过度匹配 |
+| `'press'` | organic | paid | `LIKE 'p%'` 过度匹配 |
+| `'print'` | organic | paid | `LIKE 'p%'` 过度匹配 |
+| `'programmatic'` | organic | paid | `LIKE 'p%'` 过度匹配 |
+
+#### ⚠️ 特别说明：关于 retargeting 的复核结论
+
+**此前描述矛盾已修正**：`'retargeting'` 虽然不以 'p' 开头，但 PG ChannelMetrics 的 4 条件 OR 中第三个条件是 `LIKE '%retargeting%'`，会匹配子串。因此 `'retargeting'` 在三条路径下均判定为 paid，**完全一致，无分歧**。
+
+#### ⚠️ 关于"应判"标准的说明
+
+"应判为 paid" 和 "应判为 organic" 的判定标准是：**以 ClickHouse 实现为事实标准**，因为：
+1. ClickHouse 三条路径实现完全一致，无内部矛盾
+2. ClickHouse 使用 `lower()` 确保大小写不敏感，更符合 UTM 参数的实际使用场景
+3. `'cp'` 子串匹配覆盖了 cpc/cpa/cpv 等标准付费媒介缩写，是行业通用做法
+4. 没有 `LIKE 'p%'` 这种过度宽泛的匹配条件
 
 ---
 
@@ -1139,20 +1272,40 @@ case when website_event.utm_medium LIKE 'p%' OR
 | E3 | "付费前缀判断是细微差异" | ❌ **错误**。这是**语义级差异**，影响面远超"细微"。`LIKE 'p%'` 存在过度匹配和漏匹配双重问题。 |
 | E4 | "ClickHouse 三条路径一致" | ✅ **确认正确**。三条路径使用完全相同的 `multiSearchAny` 表达式。 |
 | E5 | "PG ChannelMetrics 和 PG ExpandedMetrics 有细微差异" | ❌ **错误**。两者代码完全相同，无任何差异。 |
+| E6 | "retargeting 在 PG ChannelMetrics 下为 organic（描述矛盾：先说 organic 又说 `LIKE '%retargeting%' 单独匹配" | ❌ **错误**。'retargeting' 包含 'retargeting' 子串，匹配 `LIKE '%retargeting%'`，在三条路径下均为 paid，完全一致。 |
+| E7 | "`LIKE 'p%'` 匹配 'cpc' 是因为 'p%' 匹配 'cpc' 的第二个字符" | ❌ **错误**。这是对 SQL LIKE 语法的根本误解。'cpc' 以 'c' 开头，不匹配 `LIKE 'p%'`。 |
 
 ---
 
 ## 十六、核对清单（修订版）
 
-### 16.1 付费前缀判断核对
+### 16.1 付费前缀判断核对（17 项，全覆盖）
 
-- [ ] `LIKE 'p%'` 是否将 'promo'/'product'/'press' 误判为 paid（PG ChannelMetrics/ExpandedMetrics）
-- [ ] `LIKE 'p%'` 是否漏判 'cpc' 为 organic（PG ChannelMetrics/ExpandedMetrics）
-- [ ] `LIKE 'p%'` 是否因大小写敏感漏判 'Paid'/'PPC'（PG ChannelMetrics/ExpandedMetrics）
-- [ ] `ilike '%cp%'` 是否正确匹配 'cpc'/'CPC'/'CPA'（PG RevenueMetrics）
-- [ ] `multiSearchAny` 是否正确匹配所有付费媒介变体（CH 全部路径）
-- [ ] 同一 utm_medium='cpc' 在 PG 和 CH 下是否产生不同渠道分类
-- [ ] 同一 utm_medium='promo' 在 PG ChannelMetrics 和 PG RevenueMetrics 下是否产生不同渠道分类
+#### 16.1.1 漏判核对（应判为 paid 但 PG 渠道查询判为 organic）
+
+- [ ] `'cpc'` → PG ChannelMetrics: organic, PG RevenueMetrics: paid, CH: paid → **跨路径不一致**
+- [ ] `'CPC'` → PG ChannelMetrics: organic, PG RevenueMetrics: paid, CH: paid → **大小写敏感漏判**
+- [ ] `'CPA'` → PG ChannelMetrics: organic, PG RevenueMetrics: paid, CH: paid → **缺 cp 子串匹配**
+- [ ] `'cpv'` → PG ChannelMetrics: organic, PG RevenueMetrics: paid, CH: paid → **缺 cp 子串匹配**
+- [ ] `'Paid'` → PG ChannelMetrics: organic, PG RevenueMetrics: paid, CH: paid → **大小写敏感漏判**
+- [ ] `'PaidSearch'` → PG ChannelMetrics: organic, PG RevenueMetrics: paid, CH: paid → **大小写敏感漏判**
+- [ ] `'PPC'` → PG ChannelMetrics: organic, PG RevenueMetrics: paid, CH: paid → **大小写敏感漏判**
+
+#### 16.1.2 误判核对（应判为 organic 但 PG 渠道查询判为 paid）
+
+- [ ] `'promo'` → PG ChannelMetrics: paid, PG RevenueMetrics: organic, CH: organic → **LIKE 'p%' 过度匹配**
+- [ ] `'product'` → PG ChannelMetrics: paid, PG RevenueMetrics: organic, CH: organic → **LIKE 'p%' 过度匹配**
+- [ ] `'partnership'` → PG ChannelMetrics: paid, PG RevenueMetrics: organic, CH: organic → **LIKE 'p%' 过度匹配**
+- [ ] `'press'` → PG ChannelMetrics: paid, PG RevenueMetrics: organic, CH: organic → **LIKE 'p%' 过度匹配**
+- [ ] `'print'` → PG ChannelMetrics: paid, PG RevenueMetrics: organic, CH: organic → **LIKE 'p%' 过度匹配**
+- [ ] `'programmatic'` → PG ChannelMetrics: paid, PG RevenueMetrics: organic, CH: organic → **LIKE 'p%' 过度匹配**
+
+#### 16.1.3 一致性核对（三条路径判定完全一致）
+
+- [ ] `'paid'` → 全部: paid → ✅ 一致
+- [ ] `'ppc'` → 全部: paid → ✅ 一致
+- [ ] `'retargeting'` → 全部: paid → ✅ 一致（匹配 `%retargeting%` 子串）
+- [ ] `'social_paid'` → 全部: paid → ✅ 一致（匹配 `%paid%` 子串）
 
 ### 16.2 渠道 CASE 分支一致性核对
 
@@ -1163,9 +1316,34 @@ case when website_event.utm_medium LIKE 'p%' OR
 
 ### 16.3 跨引擎一致性核对
 
-- [ ] PG `LIKE 'p%'` 与 CH `multiSearchAny(['cp',…])` 对 'cpc' 的判断是否不同（答案：是）
-- [ ] PG `LIKE 'p%'` 与 CH `multiSearchAny(['cp',…])` 对 'promo' 的判断是否不同（答案：是）
+- [ ] PG `LIKE 'p%'` 与 CH `multiSearchAny(['cp',…])` 对 'cpc' 的判断是否不同（答案：是 → PG: organic, CH: paid）
+- [ ] PG `LIKE 'p%'` 与 CH `multiSearchAny(['cp',…])` 对 'promo' 的判断是否不同（答案：是 → PG: paid, CH: organic）
 - [ ] PG `ilike '%cp%'` 与 CH `multiSearchAny(['cp',…])` 对 'cpc' 的判断是否一致（答案：是，均判定为 paid）
+- [ ] PG `LIKE 'p%'` 与 CH `multiSearchAny(['cp',…])` 对 'Paid' 的判断是否不同（答案：是 → PG: organic, CH: paid）
+- [ ] PG `LIKE 'p%'` 与 CH `multiSearchAny(['cp',…])` 对 'PPC' 的判断是否不同（答案：是 → PG: organic, CH: paid）
+- [ ] PG `LIKE 'p%'` 与 CH `multiSearchAny(['cp',…])` 对 'retargeting' 的判断是否一致（答案：是，均判定为 paid）
+
+### 16.3.1 完整跨引擎对照表
+
+| utm_medium | PG ChannelMetrics | CH ChannelMetrics | 是否一致 |
+|-----------|:-----------------:|:-----------------:|:--------:|
+| `'cpc'` | organic | paid | ❌ |
+| `'CPC'` | organic | paid | ❌ |
+| `'CPA'` | organic | paid | ❌ |
+| `'cpv'` | organic | paid | ❌ |
+| `'paid'` | paid | paid | ✅ |
+| `'Paid'` | organic | paid | ❌ |
+| `'PaidSearch'` | organic | paid | ❌ |
+| `'PPC'` | organic | paid | ❌ |
+| `'ppc'` | paid | paid | ✅ |
+| `'retargeting'` | paid | paid | ✅ |
+| `'social_paid'` | paid | paid | ✅ |
+| `'promo'` | paid | organic | ❌ |
+| `'product'` | paid | organic | ❌ |
+| `'partnership'` | paid | organic | ❌ |
+| `'press'` | paid | organic | ❌ |
+| `'print'` | paid | organic | ❌ |
+| `'programmatic'` | paid | organic | ❌ |
 
 ### 16.4 未匹配处理核对
 
@@ -1199,3 +1377,83 @@ case when website_event.utm_medium LIKE 'p%' OR
 - [ ] 时间窗口正确应用时区
 - [ ] 过滤操作符正确映射
 - [ ] AND/OR 逻辑组合正确
+
+---
+
+## 十七、全篇一致性校验结果
+
+### 17.1 已修正项清单
+
+本次全篇一致性校验共发现并修正 **8 处**不一致：
+
+| 编号 | 位置 | 修正前错误 | 修正后结论 | 影响范围 |
+|------|------|-----------|----------|---------|
+| C1 | Q3 常见问题（第 635-636 行） | 笼统声称"包含 'cpc' 等关键词则标记为 paid" | 明确区分三种实现：ClickHouse 匹配 'cp'、PG RevenueMetrics 匹配 'cp'、PG ChannelMetrics **不匹配** 'cpc' | 全文口径一致 |
+| C2 | 原核心分歧表第 1 列标题 | 仅写 `LIKE 'p%'`，未体现是 4 条件 OR | 明确标注为"4 条件 OR，区分大小写" | 避免读者误解 |
+| C3 | 原 retargeting 行描述 | 自相矛盾：先写"❌ organic"又说"LIKE '%retargeting%' 单独匹配" | 修正为"✅ paid"，明确说明通过第三个条件 `LIKE '%retargeting%'` 匹配 | 4 个文件中的描述全部统一 |
+| C4 | 原 E1 错误声明对照表 | 错误声称 `LIKE 'p%'` 能匹配 'cpc' | 明确指出这是"对 SQL LIKE 语法的根本误解" | 避免读者被误导 |
+| C5 | 原核心分歧表样例数 | 仅列 10 个样例 | 扩充至 17 个完整样例，覆盖漏判 7 例、误判 6 例、一致 4 例 | 覆盖全部典型场景 |
+| C6 | 原 12.2 关键发现清单 | 未提及付费前缀判断的三重不一致 | 新增第 5-7 条，明确三重不一致 + retargeting 一致 + CH 是事实标准 | 摘要与正文一致 |
+| C7 | 原第十六章核对清单 | 仅列 7 项 | 扩充至 17 项全覆盖核对 + 17 行跨引擎对照表 | 便于逐条验证 |
+| C8 | 原 15.6 错误声明对照表 | 仅列 5 条 | 扩充至 7 条，新增 retargeting 自相矛盾和 SQL LIKE 语法误解 | 完整记录错误轨迹 |
+
+---
+
+### 17.2 最终结论：全文口径已统一
+
+经本次完整复核，以下内容在全文各处（摘要、核心分歧表、复核结论、错误声明对照表、核对清单）**已完全一致**：
+
+#### 17.2.1 关于 'cpc' 的判定（全文统一）
+
+| 查询路径 + 引擎 | 'cpc' 的判定 | 根因 |
+|----------------|:-----------:|------|
+| PG getChannelMetrics | ❌ organic | 缺 `%cp%` 匹配，'cpc' 以 'c' 开头不匹配 `LIKE 'p%'` |
+| PG getRevenueMetrics | ✅ paid | 匹配 `ilike '%cp%'` |
+| CH 全部三条路径 | ✅ paid | 匹配 `multiSearchAny(…, ['cp',…])` |
+
+**⚠️ 关键提醒**：在 PostgreSQL 渠道报表中，标准 Google Ads `utm_medium=cpc` 会被误判为 **organic**。这是一个实际存在的 Bug。
+
+---
+
+#### 17.2.2 关于 'retargeting' 的判定（全文统一）
+
+| 查询路径 + 引擎 | 'retargeting' 的判定 | 根因 |
+|----------------|:------------------:|------|
+| PG getChannelMetrics | ✅ paid | 匹配 `LIKE '%retargeting%'`（第三个条件） |
+| PG getRevenueMetrics | ✅ paid | 匹配 `ilike '%retargeting%'`（第三个条件） |
+| CH 全部三条路径 | ✅ paid | 匹配 `multiSearchAny(…, ['retargeting',…])` |
+
+**结论**：retargeting 在三条路径 + 两种引擎下**完全一致**，无分歧。
+
+---
+
+#### 17.2.3 关于 'promo' 的判定（全文统一）
+
+| 查询路径 + 引擎 | 'promo' 的判定 | 根因 |
+|----------------|:------------:|------|
+| PG getChannelMetrics | ✅ paid ⚠️误判 | 以 'p' 开头匹配 `LIKE 'p%'`，但实际非付费 |
+| PG getRevenueMetrics | ❌ organic | 不含 cp/ppc/retargeting/paid 子串 |
+| CH 全部三条路径 | ❌ organic | 不含匹配子串 |
+
+**结论**：PG 渠道查询存在**过度匹配**问题，'promo' 等非付费词被误判为 paid。
+
+---
+
+### 17.3 事实标准确认
+
+全文已统一以 **ClickHouse 实现为事实标准**，判定依据：
+1. ClickHouse 三条路径实现完全相同，无内部矛盾
+2. 使用 `lower()` 确保大小写不敏感，符合 UTM 参数实际使用
+3. `'cp'` 子串匹配覆盖 cpc/cpa/cpv 等标准付费媒介缩写
+4. 无 `LIKE 'p%'` 这种过度宽泛的匹配条件
+
+---
+
+### 17.4 待确认事项清单
+
+以下问题需要与产品/研发进一步确认：
+
+- [ ] `LIKE 'p%'` 是有意设计还是 Bug？如是有意，设计意图是什么？
+- [ ] PostgreSQL 版本是否计划统一为 ClickHouse 的实现逻辑？
+- [ ] 大小写敏感的 `LIKE` 是否计划改为不区分大小写的 `ILIKE`？
+- [ ] 文档中的"事实标准"是否与产品预期的统计口径一致？
