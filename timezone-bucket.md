@@ -122,11 +122,13 @@ export function useDateParameters() {
 }
 ```
 
-**核心转换**：
-1. `useDateRange()` 计算出用户所选时区下的 `startDate`/`endDate`（此时是"用户时区的本地时间"）。
-2. `localToUtc()` 将"用户时区本地时间"转为 UTC 时间戳（`zonedTimeToUtc(date, timezone)`）。
-3. `startAt`/`endAt` 是 UTC 毫秒时间戳，传给 API。
-4. **`timezone` 字符串也一并传给 API**——这是后续 SQL 桶对齐的依据。
+注意这里用的是 `localToUtc`（定义在 [`useTimezone.ts#L71-L73`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/components/hooks/useTimezone.ts#L71-L73)）：
+
+```ts
+const localToUtc = (date) => zonedTimeToUtc(date, localTimeZone); // localTimeZone = 浏览器系统时区
+```
+
+`localToUtc` 使用的是**浏览器系统时区**，而不是用户在 Umami 中选择的显示时区。这与 `parseDateRange` 中的 `utcToZonedTime(date, timezone)`（使用用户选时区）共同决定了日期计算的正确性（详见第五节）。
 
 ### 3.3 时区规范化：前端 `canonicalizeTimezone` 与服务端 `normalizeTimezone` 两条通道
 
@@ -142,13 +144,28 @@ const canonicalizeTimezone = (timezone: string): string => {
 };
 ```
 
-[`TIMEZONE_LEGACY`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/lib/constants.ts#L698-L717) 共 17 条映射，包括：
-- `Asia/Batavia` → `Asia/Jakarta`
-- `Asia/Calcutta` → `Asia/Kolkata`
-- `Asia/Chongqing` / `Asia/Harbin` → `Asia/Shanghai`
-- `Europe/Kiev` / `Europe/Zaporozhye` → `Europe/Kyiv`
-- `Etc/UTC` → `UTC`
-- `US/Arizona` / `US/Central` / `US/Eastern` / `US/Mountain` / `US/Pacific` / `US/Samoa` → 对应标准名
+[`TIMEZONE_LEGACY`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/lib/constants.ts#L698-L717) 共 **18 条**映射：
+
+| 旧别名 | 标准名 |
+|--------|-------|
+| Asia/Batavia | Asia/Jakarta |
+| Asia/Calcutta | Asia/Kolkata |
+| Asia/Chongqing | Asia/Shanghai |
+| Asia/Harbin | Asia/Shanghai |
+| Asia/Jayapura | Asia/Pontianak |
+| Asia/Katmandu | Asia/Kathmandu |
+| Asia/Macao | Asia/Macau |
+| Asia/Rangoon | Asia/Yangon |
+| Asia/Saigon | Asia/Ho_Chi_Minh |
+| Europe/Kiev | Europe/Kyiv |
+| Europe/Zaporozhye | Europe/Kyiv |
+| Etc/UTC | UTC |
+| US/Arizona | America/Phoenix |
+| US/Central | America/Chicago |
+| US/Eastern | America/New_York |
+| US/Mountain | America/Denver |
+| US/Pacific | America/Los_Angeles |
+| US/Samoa | Pacific/Pago_Pago |
 
 调用时机：`useDateParameters` 在组装请求参数时调用，确保发出的 timezone 是标准名。
 
@@ -179,12 +196,12 @@ export const timezoneParam = z
 
 | 维度 | 前端 canonicalizeTimezone | 服务端 normalizeTimezone |
 |------|-------------------------|-------------------------|
-| 映射表 | `TIMEZONE_LEGACY`（17 条） | `TIMEZONE_MAPPINGS`（1 条） |
+| 映射表 | `TIMEZONE_LEGACY`（18 条） | `TIMEZONE_MAPPINGS`（1 条） |
 | 所在文件 | `constants.ts` | `date.ts` |
 | 调用时机 | 请求参数组装时 | Zod schema 校验 transform 阶段 |
-| 覆盖范围 | 更广，含旧 US/时区别名 | 仅一条 Asia/Calcutta 兼容性 |
+| 覆盖范围 | 更广，含旧 US/*、Asia/*、Europe/* 历史别名 | 仅一条 Asia/Calcutta → Asia/Kolkata |
 
-服务端映射表更精简，是因为它依赖 `Intl.DateTimeFormat` 做合法性校验——大多数旧别名在现代 JS 运行时已被 `Intl` 自动识别，无需额外映射。
+二者映射表条数不同，属于前后端独立维护的状态。
 
 ### 3.4 服务端提取时区并注入 SQL
 
@@ -221,7 +238,7 @@ function getDateSQL(field: string, unit: string, timezone?: string): string {
 **PostgreSQL 桶对齐机制**：
 - `created_at at time zone 'Asia/Shanghai'`：将 UTC 时间戳转为指定时区的本地时间。
 - `date_trunc('day', ...)`：对本地时间截断到指定精度的整点。
-- `to_char(..., format)`：格式化为字符串作为桶标签。
+- `to_char(..., format)`：**直接在 SQL 中格式化为字符串**作为桶标签返回。
 
 **示例**：`timezone = 'Asia/Shanghai'`，`unit = 'day'`
 - UTC `2024-01-01 20:00:00` → 上海时间 `2024-01-02 04:00:00` → 截断为 `2024-01-02` → 该事件归入 1 月 2 日的桶。
@@ -236,7 +253,7 @@ function getDateSQL(field: string, unit: string, timezone?: string): string {
 
 UTC 模式在格式中嵌入了 `T` 和 `Z` 标记，便于前端区分。
 
-### 4.2 ClickHouse 的桶对齐
+### 4.2 ClickHouse 的桶对齐：`toDateTime` 第二参数的语义
 
 [`getDateSQL`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/lib/clickhouse.ts#L62-L67)：
 
@@ -249,31 +266,82 @@ function getDateSQL(field: string, unit: string, timezone?: string) {
 }
 ```
 
-**ClickHouse 桶对齐机制**：
+**ClickHouse `date_trunc` 行为**：
 - `date_trunc('day', created_at, 'Asia/Shanghai')`：ClickHouse 的 `date_trunc` 支持第三参数时区名，先将 UTC 时间转到目标时区再截断。
-- 外层 `toDateTime(..., 'Asia/Shanghai')`：将截断结果标记为目标时区，确保返回的时间值是正确的。
+- 返回值已经是一个 DateTime 类型，其**内部 UTC 时间戳**是正确的截断结果（例如上海 00:00:00 对应的 UTC 前一天 16:00:00）。
 
-**示例**：`timezone = 'Asia/Shanghai'`，`unit = 'hour'`
-- UTC `2024-01-01 20:30:00` → 上海 `2024-01-02 04:30:00` → 截断为 `2024-01-02 04:00:00`（上海时区）。
+**外层 `toDateTime(..., timezone)` 的语义**：
+- 当第一参数已经是 DateTime 类型时，`toDateTime(x, timezone)` **不改变 x 内部的 UTC 时间戳值**，也不做任何时间点的换算。
+- 它的作用是**给这个 DateTime 值附加一个 `timezone` 元数据标记**（相当于在结果类型上写死 `timezone='Asia/Shanghai'`）。
+- 这个标记的影响体现在 ClickHouse 序列化结果集为 JSON 时：`formatDateTime` 或隐式的 DateTime→String 转换会按该标记的时区来格式化输出字符串。
+- 例如：内部 UTC = `2024-06-15T18:30:00Z`（= Kolkata 2024-06-16 00:00:00 IST）：
+  - 若没有 `toDateTime(..., 'Asia/Kolkata')`，默认按列类型 `DateTime('UTC')` 序列化为 `"2024-06-15 18:30:00"`（前端会误解为用户时区 18:30）。
+  - 若加了 `toDateTime(..., 'Asia/Kolkata')`，序列化为 `"2024-06-16 00:00:00"`（前端按用户时区识别正确）。
 
-### 4.3 非整数偏移时区与 hourly 预聚合的桶错位
+**与 PostgreSQL 的对比**：PostgreSQL 用 `to_char` 直接在 SQL 中把桶格式化为字符串并附加时区格式，不需要额外的"时区标记"步骤；ClickHouse 通过 `toDateTime` 的第二参数达到同样的目的。
 
-**问题背景**：预聚合表 `website_event_stats_hourly` 的桶是 **UTC 整小时** 对齐的。对于 UTC 偏移为整数小时的时区（如 `Asia/Shanghai` +8），UTC 整点也是用户时区的整点，`date_trunc('hour', created_at, timezone)` 二次截断能正确映射。
+### 4.3 非整数偏移时区在 hourly 视图上的 day/hour 桶归属：具体用例
 
-但对于**非整数偏移时区**（如 `Asia/Kolkata` +5:30、`Asia/Kathmandu` +5:45、`Asia/Tehran` +3:30），情况不同：
+预聚合表 `website_event_stats_hourly` 的桶是 **UTC 整小时**对齐的。当用户时区为整数偏移（如 `Asia/Shanghai` +8）时，UTC 整点也是用户时区整点，`date_trunc` 二次截断能正确映射。下面用 **`Asia/Kolkata` (+5:30)** 作为半小时偏移的典型用例，逐事件推演桶归属。
 
-- UTC `18:00:00` → 印度标准时间 (IST) `23:30:00`，不是整点。
-- 预聚合表的 UTC 小时桶（18:00–18:59 UTC）对应 IST 的 23:30–00:29，**跨越了两个 IST 小时**（23 点和 00 点）。
+**场景设定**：
+- 用户显示时区：`Asia/Kolkata`（IST，UTC+5:30）
+- 统计范围：IST 2024-06-16 全天（= UTC 2024-06-15 18:30 ~ UTC 2024-06-16 18:29:59）
 
-**对不同粒度的影响**：
+**3 个具体事件**：
 
-| 统计粒度 | 影响 | 说明 |
-|---------|------|------|
-| `day` 及以上 | 无影响 | 天级截断只关心日期是否变化，小时级偏移不改变日期归属 |
-| `hour` | 有错位 | 从 hourly 预聚合表读 hour 桶时，UTC 小时桶的"边界"不在用户时区整点，单个 UTC 小时桶的事件会被 `date_trunc` 分到不同的用户时区小时桶，但总和仍然正确 |
-| `minute` | 不影响 | 分钟级强制回源原始表，不走预聚合 |
+| 事件 | 原始 UTC 时间 | 对应的 IST 本地时间 | 理论正确桶（原始表查） |
+|------|-------------|-------------------|---------------------|
+| E1 | 2024-06-16 18:10 UTC | 2024-06-16 23:40 IST | day=6/16, hour=23 |
+| E2 | 2024-06-16 18:40 UTC | 2024-06-17 00:10 IST | day=6/17, hour=00 |
+| E3 | 2024-06-16 20:15 UTC | 2024-06-17 01:45 IST | day=6/17, hour=01 |
 
-**结论**：非整数偏移时区下，若走 hourly 预聚合表且 `unit=hour`，桶边界在用户时区意义上是"错位"的，但**计数总和是准确的**——因为每个事件都通过 `date_trunc` 正确归桶，只是预聚合的 UTC 小时桶需要被拆分到不同的用户时区小时桶中（ClickHouse 的 `date_trunc` 会在查询时完成这件事）。
+**预聚合 hourly 视图中实际存储的行**：
+E1 和 E2 的 UTC 时间都落在 `18:00-18:59` 这个 UTC 小时桶里，被合并为一行：
+
+| created_at (UTC) | views |
+|-----------------|-------|
+| 2024-06-16 18:00 UTC | 2 （E1 + E2 合计） |
+| 2024-06-16 20:00 UTC | 1 （E3） |
+
+#### Day 桶归属推演
+
+走 **hourly 预聚合表**，对 created_at 做 `date_trunc('day', created_at, 'Asia/Kolkata')`：
+
+| hourly 行 | created_at | trunc 过程（Kolkata） | 归到 day 桶 | views |
+|-----------|-----------|----------------------|-----------|-------|
+| row-18:00 | 18:00 UTC → 23:30 IST | trunc day = 2024-06-16 00:00 IST | **6/16** | 2 |
+| row-20:00 | 20:00 UTC → 01:30 IST (6/17) | trunc day = 2024-06-17 00:00 IST | **6/17** | 1 |
+
+**hourly 视图给出的 day 桶结果**：6/16=2, 6/17=1
+**理论正确的 day 桶（原始表查）**：6/16=1（E1）, 6/17=2（E2+E3）
+
+→ **Day 桶错位！** 差了 1 条事件从 6/17 误归到 6/16，原因是 `18:00-18:59 UTC` 这个桶覆盖了 IST 的 23:30-00:29，**跨越了日界**，但预聚合行用 created_at=18:00 UTC（=IST 23:30）作为代表点 trunc，把整个桶的 views 都归到了 6/16。
+
+#### Hour 桶归属推演
+
+同样走 hourly 视图，做 `date_trunc('hour', created_at, 'Asia/Kolkata')`：
+
+| hourly 行 | created_at | trunc 过程（Kolkata） | 归到 hour 桶 | views |
+|-----------|-----------|----------------------|-----------|-------|
+| row-18:00 | 18:00 UTC → 23:30 IST | trunc hour = IST 23:00 | **23:00** | 2 |
+| row-20:00 | 20:00 UTC → 01:30 IST (6/17) | trunc hour = IST 01:00 | **01:00** | 1 |
+
+**hourly 视图给出的 hour 桶**：IST 23:00=2, IST 01:00=1
+**理论正确的 hour 桶**：IST 23:00=1（E1）, IST 00:00=1（E2）, IST 01:00=1（E3）
+
+→ **Hour 桶错位！** IST 00:00 的桶丢失了 1 条，IST 23:00 的桶多了 1 条。
+
+#### 各粒度影响总表
+
+| 统计粒度 | 是否受影响 | 受影响的 UTC 小时桶 | 说明 |
+|---------|-----------|------------------|------|
+| `year/month/week` | 极大概率不受 | — | 1 小时的日级偏差在更大粒度可忽略 |
+| `day` | **受影响** | 跨越用户时区日界的那 1 个 UTC 小时桶 | 对 +5:30 是 18:00 UTC；每天最多 1 个桶出问题 |
+| `hour` | **所有 UTC 小时桶都受影响** | 全部 24 个桶 | 非整数偏移下每个 UTC 小时桶都横跨 2 个用户时区小时 |
+| `minute` | 不影响 | — | 强制回源原始表，不走预聚合 |
+
+**结论**：非整数偏移时区下，`website_event_stats_hourly` 预聚合表不仅 hour 桶会错位，**day 桶也会错位**（当天跨越日界的那一个 UTC 小时桶会造成跨 1 天的归属偏移）。受影响的事件量占比取决于日界小时桶的流量，但桶归属无法通过 SQL 的 `date_trunc` 修复——因为这是预聚合粒度本身的信息损失。只有走 EVENT_COLUMNS 过滤或 `unit=minute` 触发回源原始表时，归属才完全正确。
 
 ### 4.4 DST 切换日的非整桶处理
 
@@ -366,9 +434,10 @@ function getDateStringSQL(data: any, unit: string = 'utc', timezone?: string) {
 
 ### 5.1 前端日期范围计算
 
-[`parseDateRange`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/lib/date.ts#L140-L220) 根据用户选的快捷范围（如 `1day`、`1month`）在"用户时区本地时间"上做截断：
+[`parseDateRange`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/lib/date.ts#L140-L220) 根据用户选的快捷范围（如 `1day`、`1month`）做截断：
 
 ```ts
+const date = new Date();
 const now = timezone ? utcToZonedTime(date, timezone) : date;
 // ...
 case 'day':
@@ -379,23 +448,91 @@ case 'day':
   };
 ```
 
-- `utcToZonedTime(date, timezone)` 将当前 UTC 时间转为用户时区的本地时间。
-- `startOfDay(now)` 在该本地时间上取当天 00:00:00。
-- 这确保了 **"今天"的边界由用户时区决定**，而非 UTC。
+- `utcToZonedTime(date, timezone)`：date-fns-tz 函数。它不改变"真实时刻"，而是把返回的 Date 对象内部的 UTC 毫秒值"偏转"了一个量——使得在**浏览器系统时区**下调用 `.getHours()`、`.getDate()` 等 getter 时，得到的数值等于目标时区的本地时间分量。
+- 后续的 `startOfDay(now)`、`addDays` 等都是 **date-fns 原生函数**，内部实现基于浏览器时区的 setter（如 `setHours(0,0,0,0)`）。
 
-### 5.2 日期边界转 UTC 传给 API
+### 5.2 日期边界转 UTC 传给 API：浏览器时区与用户选时区的对齐问题
 
 [`useDateParameters`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/components/hooks/useDateParameters.ts) 中：
 
 ```ts
-startAt: +localToUtc(startDate),   // 用户时区 00:00 → UTC 时间戳
-endAt:   +localToUtc(endDate),      // 用户时区 23:59:59 → UTC 时间戳
+startAt: +localToUtc(startDate),
+endAt:   +localToUtc(endDate),
 ```
 
-**示例**：用户时区 `Asia/Shanghai` (UTC+8)，选择"今天"
-- `startDate` = 上海 2024-01-02 00:00:00 → `localToUtc` → UTC 2024-01-01 16:00:00
-- `endDate` = 上海 2024-01-02 23:59:59 → `localToUtc` → UTC 2024-01-02 15:59:59
-- API 收到的 `startAt`/`endAt` 已是 UTC 范围，确保 SQL `BETWEEN` 能正确框住数据。
+其中 `localToUtc` 定义在 [`useTimezone.ts#L71-L73`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/components/hooks/useTimezone.ts#L71-L73)：
+
+```ts
+const localToUtc = (date) => {
+  return zonedTimeToUtc(date, localTimeZone); // localTimeZone = 浏览器系统时区
+};
+```
+
+`zonedTimeToUtc(date, timezone)` 的含义是：把 `date` 的本地时间组件（按浏览器时区读取的年月日时分秒）当作是指定 `timezone` 的本地时间，然后计算出对应的真实 UTC 时间戳 Date 返回。
+
+**正确性的前提：浏览器系统时区 == 用户选的显示时区**
+
+下面用两种情况代入推演：
+
+#### 情况 A：浏览器时区 = 用户选时区（America/Los_Angeles）
+
+设当前真实 UTC = 2024-06-16T12:00:00Z，用户选时区 = `America/Los_Angeles`（PDT，UTC-7），快捷范围 `1day`：
+
+```
+Step 1：utcToZonedTime(date, 'America/Los_Angeles')
+  真实 UTC 12:00Z → LA 本地 05:00 PDT
+  返回的 Date 内部值调整为：在浏览器（LA）上读 .getHours()=5 → 内部 UTC = 2024-06-16T12:00:00Z（和原值相同）
+
+Step 2：startOfDay(now)
+  浏览器（LA）的 setter → LA 本地 2024-06-16 00:00:00 PDT
+  对应 UTC = 2024-06-16T07:00:00Z
+  startDate 内部值 = 2024-06-16T07:00:00Z
+
+Step 3：localToUtc(startDate) = zonedTimeToUtc(startDate, 'America/Los_Angeles')
+  取 startDate 的本地组件（LA 读）：2024-06-16 00:00
+  把它当作 LA 本地时间 → UTC = 2024-06-16T07:00:00Z ✓
+  startAt = 2024-06-16T07:00:00Z（= LA 06/16 00:00 正确）
+```
+
+→ **此时完全正确**。
+
+#### 情况 B：浏览器时区 ≠ 用户选时区（LA 浏览器 + Kolkata 用户选）
+
+设当前真实 UTC = 2024-06-16T12:00:00Z，浏览器系统时区 = `America/Los_Angeles`（PDT，-7），用户在 Umami 中选显示时区 = `Asia/Kolkata`（IST，+5:30），快捷范围 `1day`：
+
+```
+Step 1：utcToZonedTime(date, 'Asia/Kolkata')
+  真实 UTC 12:00Z → Kolkata 本地 17:30 IST (6/16)
+  返回的 Date 需满足：在 LA 浏览器上 getHours()=17, getMinutes()=30
+  即 LA 本地 2024-06-16 17:30 → UTC = 2024-06-17T00:30:00Z
+  now 内部值 = 2024-06-17T00:30:00Z
+
+Step 2：startOfDay(now)
+  浏览器（LA）的 setter：取 LA 本地的年月日 = 2024-06-16，设 00:00:00
+  → LA 本地 2024-06-16 00:00:00 PDT → UTC = 2024-06-16T07:00:00Z
+  startDate 内部值 = 2024-06-16T07:00:00Z
+
+  但用户真正想要的是"Kolkata 今天 00:00 IST"对应的 UTC：
+  Kolkata 2024-06-16 00:00:00 IST → UTC = 2024-06-15T18:30:00Z
+  偏差 = 2024-06-16T07:00:00Z - 2024-06-15T18:30:00Z = 12h 30m
+  = 用户时区偏移（+5:30） - 浏览器时区偏移（-7:00） = +12:30 ✓
+
+Step 3：localToUtc(startDate) = zonedTimeToUtc(startDate, 'America/Los_Angeles')
+  取 startDate 的本地组件（LA 读）：2024-06-16 00:00
+  当作 LA 本地 → UTC = 2024-06-16T07:00:00Z（和 startDate 自身一样，没修正偏差）
+  startAt = 2024-06-16T07:00:00Z（错误，应为 2024-06-15T18:30:00Z）
+```
+
+→ **此时传给 API 的 startAt/endAt 偏移了 12.5 小时**。
+
+#### 总结：date-fns 链路的对齐规则
+
+`parseDateRange` → `startOfDay`/`addDays` → `localToUtc` → `startAt` 的这整条 date-fns 操作链路：
+
+1. **浏览器系统时区 = 用户选时区时**：startAt/endAt 的 UTC 值完全正确。
+2. **浏览器系统时区 ≠ 用户选时区时**：startAt/endAt 的 UTC 值系统性偏移了（用户时区偏移 − 浏览器时区偏移）的量。
+3. `generateTimeSeries` 的填充也用同样的 date-fns 原生函数（`startOfDay`、`addDays` 等），它生成的时间轴标签是"基于浏览器时区读取 startDate"再做格式化，因此**在字符串标签层面上和 SQL 返回的桶标签可能对不上**——除非前端也使用一致的时区格式化。
+4. 注：`useTimezone` 中也提供了一个 `toUtc` 函数（`zonedTimeToUtc(date, timezone)`，基于用户选时区），但 `useDateParameters` 实际使用的是 `localToUtc`（基于浏览器时区）。
 
 ### 5.3 SQL 时间范围过滤与桶截断的协同
 
@@ -424,22 +561,34 @@ export function generateTimeSeries(data, minDate, maxDate, unit, locale) {
 
   let current = start(minDate);
   const end = start(maxDate);
-  const timeseries = [];
+  const timeseries: string[] = [];
 
   while (isBefore(current, end) || isEqual(current, end)) {
     timeseries.push(formatDate(current, fmt, locale));
     current = add(current, 1);
   }
-  // ...
+
+  const lookup = new Map(data.map(({ x, y, d }) => [formatDate(x, fmt, locale), { x, y, d }]));
+
+  return timeseries.map(t => {
+    const { x, y, d } = lookup.get(t) || {};
+    return { x: t, d: d ?? x, y: y ?? null };
+  });
 }
 ```
 
-- `minDate`/`maxDate` 是前端 `useDateRange` 计算出的"用户时区本地时间"。
-- `start(minDate)` 对齐到桶起点（如 `startOfDay`）。
-- 逐个 +1 unit 生成完整时间轴。
-- 查询返回的桶标签（如 `2024-01-02 00:00:00`）通过 `formatDate` 格式化后与时间轴匹配。
+关键步骤：
+1. `start(minDate)` 对齐到桶起点（`startOfDay`/`startOfHour` 等，均为 date-fns 原生函数）。
+2. `add(current, 1)` 逐个 +1 unit 生成完整时间轴（`addDays`/`addHours` 等）。
+3. 每一步都用 `formatDate(current, fmt, locale)` 格式化为字符串，加入时间轴。
+4. SQL 返回的桶标签 `x`（如 `"2024-06-16 00:00:00"` 字符串）也通过 `formatDate(x, fmt, locale)` 再次格式化（`formatDate` 遇到字符串会 `new Date(string)`），然后用 lookup 匹配。
 
-**这意味着**：即使某个桶没有数据（SQL 不返回该行），前端也能补出 `y: null` 的空桶，保证时间轴连续不断。
+**匹配逻辑的细节**：
+- SQL 返回的桶标签是 ClickHouse/PostgreSQL 按用户时区格式化出的本地时间字符串（如 `"2024-06-16 00:00:00"` = IST 当天开始）。
+- `new Date("2024-06-16 00:00:00")`：这个字符串**没有时区标记**，浏览器按**本地时区（系统时区）**解析为 Date 对象。
+- `formatDate(date, fmt)` 再按浏览器本地时区格式化回字符串。
+- 因此**只有在浏览器时区 = 用户选时区时**，SQL 返回的 `"2024-06-16 00:00:00"` 在"浏览器解析 → 浏览器格式化"后才能和 generateTimeSeries 生成的轴标签完全一致。
+- 当浏览器时区 ≠ 用户选时区时，lookup 会匹配失败，出现大量 `y: null` 空桶（即使 SQL 返回了有效数据）。
 
 **DST 切换日的特别说明**：`generateTimeSeries` 使用 `date-fns` 的 `addDays`/`addHours` 在用户时区本地时间上递增。在 DST 切换日：
 - 春季向前拨：`addHours` 会跳过缺失的那一小时，生成的时间轴少一个桶。
@@ -460,14 +609,16 @@ const formatSeriesTimezone = (data: any, column: string, timezone: string) => {
       year: 'numeric', month: '2-digit', day: '2-digit',
       hour: '2-digit', minute: '2-digit', second: '2-digit',
     });
-    // ...
+    const parts = format.formatToParts(date);
+    // ... 提取 parts 并拼接
     return { ...item, [column]: `${year}-${month}-${day} ${hour}:${minute}:${second}` };
   });
 };
 ```
 
-- 实时图表不走 SQL 桶对齐，而是在前端用 `Intl.DateTimeFormat` 按时区格式化时间戳。
-- 这是因为实时数据本身就是分钟粒度的时间点，不需要 SQL 聚合。
+- 实时图表不走 SQL 桶对齐，而是在前端用 `Intl.DateTimeFormat`（**明确指定了 `timeZone` 参数**）按时区格式化时间戳。
+- 这种方式不依赖浏览器时区，无论浏览器时区是什么，都能**正确**将 UTC 时间戳转为用户选时区的本地时间字符串。
+- 这是因为实时数据本身就是分钟粒度的时间点，不需要 SQL 聚合，前端直接处理更方便也更正确。
 
 ---
 
@@ -506,19 +657,20 @@ toInt32((toDateTime(date_trunc('day', created_at, 'Asia/Shanghai'), 'Asia/Shangh
 | **查询-桶截断** | `date_trunc(unit, field, timezone)` 在指定时区上截断 | [`clickhouse.ts getDateSQL`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/lib/clickhouse.ts#L62-L67)，[`prisma.ts getDateSQL`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/lib/prisma.ts#L50-L56) |
 | **查询-范围过滤（主统计）** | 直接 UTC BETWEEN，时区转换仅在桶截断 | [`getPageviewStats.ts`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/queries/sql/pageviews/getPageviewStats.ts#L71-L73) |
 | **查询-范围过滤（列表/渠道）** | `getDateQuery`，ClickHouse 版带 `toTimezone` | [`clickhouse.ts getDateQuery`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/lib/clickhouse.ts#L182-L200) |
-| **时区规范化（前端）** | `canonicalizeTimezone` + `TIMEZONE_LEGACY`（17 条） | [`useTimezone.ts`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/components/hooks/useTimezone.ts#L79-L81) |
+| **时区规范化（前端）** | `canonicalizeTimezone` + `TIMEZONE_LEGACY`（18 条） | [`useTimezone.ts`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/components/hooks/useTimezone.ts#L79-L81) |
 | **时区规范化（服务端）** | `normalizeTimezone` + `TIMEZONE_MAPPINGS`（1 条） | [`date.ts`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/lib/date.ts#L112-L114) |
-| **前端填充** | `generateTimeSeries` 在用户时区本地时间上递增填充空桶 | [`date.ts`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/lib/date.ts#L349-L377) |
-| **实时** | 前端 `Intl.DateTimeFormat` 做时区格式化，不走 SQL 桶 | [`useTimezone.ts formatSeriesTimezone`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/components/hooks/useTimezone.ts#L31-L61) |
+| **前端填充** | `generateTimeSeries` + date-fns 原生函数（依赖浏览器时区） | [`date.ts`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/lib/date.ts#L349-L377) |
+| **实时** | 前端 `Intl.DateTimeFormat(timeZone)` 明确指定时区，不依赖浏览器时区 | [`useTimezone.ts formatSeriesTimezone`](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/components/hooks/useTimezone.ts#L31-L61) |
 
 ### 核心设计要点
 
 1. **写入无时区**：原始事件只存 UTC 时间戳，不做任何桶对齐或时区转换，保留最大灵活性。
 2. **查询时对齐**：桶对齐完全在查询时通过 SQL `date_trunc(field, unit, timezone)` 完成，属于"读时计算"模式。
-3. **预聚合与桶解耦**：`website_event_stats_hourly` 按 UTC 小时桶预聚合，查询时再按用户时区 `date_trunc` 做二次截断。非整数偏移时区的小时级统计会有桶边界错位，但计数总和准确。
-4. **前端负责边界**：用户选择的"日期范围"在前端转换为 UTC 时间戳，确保 SQL 的 `BETWEEN` 与时区桶截断协同一致。
-5. **两条时间过滤路径**：主统计查询直接写死 UTC BETWEEN；事件列表/渠道/目标等查询通过 `getDateQuery` 生成时间条件，ClickHouse 版带 `toTimezone`。
-6. **两条规范化通道**：前端 `canonicalizeTimezone` 用 `TIMEZONE_LEGACY`（17 条），服务端 `normalizeTimezone` 用 `TIMEZONE_MAPPINGS`（仅 1 条），覆盖范围不同。
-7. **EVENT_COLUMNS 触发回源**：涉及事件级字段过滤或分钟粒度时，必须回源原始表，无法走预聚合。
-8. **DST 透明处理**：`date_trunc` 天然处理 DST，桶的定义按"日历日/小时"而非固定时长，DST 切换日小时数不对等但语义正确。
-9. **空桶前端补齐**：SQL 只返回有数据的桶，空桶由 `generateTimeSeries` 在前端填充，保证时间轴连续。
+3. **预聚合与桶解耦**：`website_event_stats_hourly` 按 UTC 小时桶预聚合。整数偏移时区下二次截断正确；**非整数偏移时区（如 +5:30）下，hour 桶全部错位，day 桶也会因跨日界的那一个 UTC 小时桶出现归属偏差**（可用 EVENT_COLUMNS 触发回源原始表来消除误差）。
+4. **ClickHouse toDateTime 第二参数**：仅给 DateTime 值加时区元数据标记，用于结果序列化时按目标时区输出字符串，不改变内部 UTC 时间戳。PostgreSQL 用 `to_char` 直接格式化达到同样目的。
+5. **前端日期边界的正确性前提**：`parseDateRange` + `localToUtc` 整条 date-fns 链路只有在**浏览器系统时区 = 用户选的显示时区**时才计算出正确的 startAt/endAt UTC 时间戳，否则系统性偏移（偏移量 = 用户时区偏移 − 浏览器时区偏移）。
+6. **两条时间过滤路径**：主统计查询直接写死 UTC BETWEEN；事件列表/渠道/目标等查询通过 `getDateQuery` 生成时间条件，ClickHouse 版带 `toTimezone`。
+7. **两条规范化通道**：前端 `canonicalizeTimezone` 用 `TIMEZONE_LEGACY`（18 条），服务端 `normalizeTimezone` 用 `TIMEZONE_MAPPINGS`（仅 1 条），前后端独立维护。
+8. **EVENT_COLUMNS 触发回源**：涉及 15 个事件级字段过滤或分钟粒度时，必须回源原始表，无法走预聚合。这也是非整数偏移时区获得准确桶归属的唯一可靠路径。
+9. **DST 透明处理**：`date_trunc` 天然处理 DST，桶的定义按"日历日/小时"而非固定时长，DST 切换日小时数不对等但语义正确。
+10. **空桶前端补齐**：SQL 只返回有数据的桶，空桶由 `generateTimeSeries` 在前端填充，但 lookup 匹配的正确性同样依赖"浏览器时区 = 用户选时区"这一前提。
