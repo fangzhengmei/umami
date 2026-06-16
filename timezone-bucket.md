@@ -128,7 +128,7 @@ export function useDateParameters() {
 const localToUtc = (date) => zonedTimeToUtc(date, localTimeZone); // localTimeZone = 浏览器系统时区
 ```
 
-`localToUtc` 使用的是**浏览器系统时区**，而不是用户在 Umami 中选择的显示时区。这与 `parseDateRange` 中的 `utcToZonedTime(date, timezone)`（使用用户选时区）共同决定了日期计算的正确性（详见第五节）。
+`localToUtc` 使用的是**浏览器系统时区**，而不是用户在 Umami 中选择的显示时区。它与 `parseDateRange` 中的 `utcToZonedTime(date, timezone)`（使用用户选时区）的组合使用，**在浏览器系统时区 == 用户选的显示时区这一前提成立时**，才能得到正确的 startAt/endAt UTC 时间戳（详见第五节详细推演与行为定性）。
 
 ### 3.3 时区规范化：前端 `canonicalizeTimezone` 与服务端 `normalizeTimezone` 两条通道
 
@@ -534,6 +534,62 @@ Step 3：localToUtc(startDate) = zonedTimeToUtc(startDate, 'America/Los_Angeles'
 3. `generateTimeSeries` 的填充也用同样的 date-fns 原生函数（`startOfDay`、`addDays` 等），它生成的时间轴标签是"基于浏览器时区读取 startDate"再做格式化，因此**在字符串标签层面上和 SQL 返回的桶标签可能对不上**——除非前端也使用一致的时区格式化。
 4. 注：`useTimezone` 中也提供了一个 `toUtc` 函数（`zonedTimeToUtc(date, timezone)`，基于用户选时区），但 `useDateParameters` 实际使用的是 `localToUtc`（基于浏览器时区）。
 
+### 5.2.1 行为定性：已知 Bug 与历史溯源
+
+**上游仓库 issue 与修复**：
+
+上述系统性偏移是一个**已知 Bug**，在 umami 上游仓库中有完整的报告与修复记录：
+
+- **Issue #4107**（2026 年 3 月报告，v3.0.3 版本）：*"Revenue chart, 'Last 24 hours' shows data according to PC Timezone (not Settings Timezone)"*。用户报告浏览器时区（UTC+5）与 Umami 设置时区（UTC+1）不同时，收入图表按 PC 本地时区显示数据，与头部统计（按设置时区）不一致。
+
+- **PR #4112**（2026 年 3 月 30 日合并入 v3.1.0）：*"fix: use settings timezone in revenue chart date range"*。修复内容是在 `RevenuePage` 中调用 `useDateRange({ timezone })` 时**显式传入用户设置的 timezone 参数**（此前 `RevenuePage` 调用 `useDateRange()` 不带参数，导致 `parseDateRange` 回退到浏览器本地时区，根本没有进入带用户时区的代码路径）。
+
+**当前代码库状态**：
+
+本仓库（fork 自 umami，commit `c0ea3ae` "Migrate tests to Vitest"，作者 Mike Cao 2026-05-14）**已包含 PR #4112 的修复**：
+- [RevenuePage.tsx L8-L11](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/app/(main)/websites/[websiteId]/(reports)/revenue/RevenuePage.tsx#L8-L11)：`const { timezone } = useTimezone(); ... useDateRange({ timezone });`
+- [WebsiteChart.tsx L14-L15](file:///d:/fz/0601-2/solo-dogfeeding/code/4-umami/src/app/(main)/websites/[websiteId]/WebsiteChart.tsx#L14-L15)：同样正确传入 timezone。
+
+**更深层的设计限制（PR #4112 未解决）**：
+
+PR #4112 只修复了"调用 `useDateRange` 时忘记传 timezone"这一层问题。但即使正确传入 timezone，只要**浏览器系统时区 ≠ 用户选的显示时区**，`useDateParameters` 中 `localToUtc` 仍然会造成系统性偏移（如情况 B 的 12.5 小时偏差）。这个更根本的问题在当前代码中仍然存在。
+
+### 5.2.2 `useDateParameters` 选 `localToUtc` 而非 `toUtc` 的设计意图
+
+`useTimezone` 同时提供了两个 UTC 转换函数，但 `useDateParameters` 选择了 `localToUtc` 而非 `toUtc`。这一选择需要结合 `parseDateRange` 的实现来理解：
+
+```ts
+// useTimezone.ts 中两个函数的区别
+const toUtc = (date) => zonedTimeToUtc(date, timezone);        // 基于用户选时区
+const localToUtc = (date) => zonedTimeToUtc(date, localTimeZone); // 基于浏览器系统时区
+```
+
+**设计思路："偏转-操作-反向偏转"的闭环**
+
+整条链路本质上是一个"偏转-操作-反向偏转"的三步闭环，目的是让**只能基于浏览器时区操作的 date-fns 原生函数**能够操作用户选时区的日期：
+
+| 步骤 | 操作 | 所用时区 | 目的 |
+|------|------|---------|------|
+| 1. 正向偏转 | `utcToZonedTime(date, timezone)` | 用户选时区 | 把真实 UTC 时间"偏转"为：在浏览器时区下读取分量时，得到用户时区的本地时间 |
+| 2. 日期操作 | `startOfDay` / `addDays` 等 date-fns 原生函数 | 浏览器时区 | 基于浏览器时区的 setter/getter，在"偏转后的表示空间"内做日期计算 |
+| 3. 反向偏转 | `localToUtc(date, localTimeZone)` | 浏览器时区 | 把操作结果从"偏转后的表示空间"转回真实 UTC 时间戳 |
+
+**为什么必须用 `localToUtc` 形成闭环？**
+
+如果步骤 3 改用 `toUtc(date, timezone)`（基于用户选时区反向偏转），那么：
+
+- 步骤 1 用用户时区偏转，步骤 2 用浏览器时区操作，步骤 3 用用户时区反向——**偏转方向不匹配**，闭环断裂。
+- 只有步骤 1（用户时区偏转）+ 步骤 3（浏览器时区反向偏转）的组合，才能在**浏览器时区 == 用户选时区**这一前提下，让偏转量与反向偏转量恰好抵消，得到正确结果。
+
+**两种选择在不同场景下的对比**：
+
+| 场景 | 用 `localToUtc`（当前实现） | 用 `toUtc`（假设修改） |
+|------|---------------------------|----------------------|
+| 浏览器时区 == 用户选时区 | ✓ 正确（偏转抵消） | ✓ 同样正确（两种方式等价） |
+| 浏览器时区 ≠ 用户选时区 | ✗ 系统性偏移（偏移量 = 用户时区偏移 − 浏览器时区偏移） | ✗ 同样偏移，但偏移模式不同 |
+
+**结论**：在 date-fns 原生函数只能基于浏览器时区操作这一技术约束下，`localToUtc` 是形成闭环的**唯一正确选择**——尽管这个闭环只有在"浏览器时区 == 用户选时区"时才正确。这不是一个理想的设计，而是技术约束下的折衷。
+
 ### 5.3 SQL 时间范围过滤与桶截断的协同
 
 以 ClickHouse 为例，统计查询的 SQL 模板为：
@@ -593,7 +649,60 @@ export function generateTimeSeries(data, minDate, maxDate, unit, locale) {
 **DST 切换日的特别说明**：`generateTimeSeries` 使用 `date-fns` 的 `addDays`/`addHours` 在用户时区本地时间上递增。在 DST 切换日：
 - 春季向前拨：`addHours` 会跳过缺失的那一小时，生成的时间轴少一个桶。
 - 秋季向后拨：`addHours` 会按日历小时递增，重复的小时只出现一次。
-- 这与 SQL `date_trunc` 的行为可能存在细微差异，但日级及以上粒度不受影响。
+- 这与 SQL `date_trunc` 的行为一致，日级及以上粒度不受影响。
+
+#### DST 具体用例推演：America/New_York 春令 2024-03-10
+
+**场景设定**：
+- 浏览器系统时区 = `America/New_York`
+- 用户选时区 = `America/New_York`（正确性前提满足）
+- 真实 UTC = 2024-03-10T12:00:00Z（此时 NYC 已进入夏令时 EDT，UTC-4）
+- 快捷范围 = `1day`，`unit = 'hour'`
+- DST 切换：2024-03-10 凌晨 2:00 EST（UTC-5）→ 直接跳到 3:00 EDT（UTC-4），跳过 1 小时
+
+**`parseDateRange` 中 `startOfDay` 推演**：
+
+```
+Step 1：utcToZonedTime(date, 'America/New_York')
+  真实 UTC 12:00Z → NYC 本地 08:00 EDT (3/10，已夏令时)
+  返回的 Date 内部值 = 2024-03-10T12:00:00Z（和原值相同，因为浏览器时区=用户选时区）
+
+Step 2：startOfDay(now)
+  date-fns startOfDay 内部调用 setHours(0,0,0,0)，基于浏览器时区（NYC）
+  → NYC 本地 2024-03-10 00:00:00
+  注意：3/10 00:00 还是 EST（UTC-5），因为 DST 切换在凌晨 2 点
+  → 对应 UTC = 2024-03-10T05:00:00Z
+  startDate 内部值 = 2024-03-10T05:00:00Z
+
+Step 3：localToUtc(startDate) = zonedTimeToUtc(startDate, 'America/New_York')
+  取 startDate 的本地组件（NYC 读）：2024-03-10 00:00
+  把它当作 NYC 本地时间 → 00:00 EST = UTC 05:00Z
+  startAt = 2024-03-10T05:00:00Z ✓（= NYC 03/10 00:00 正确）
+```
+
+**`generateTimeSeries` 中 `addHours` 推演**（unit=hour）：
+
+```
+start(minDate) = startOfHour(startDate) = startDate = 2024-03-10T05:00:00Z
+
+addHours(current, 1) 迭代 24 次（其中 1 次跨越 DST 切换点）：
+
+| 迭代 | current 内部 UTC | NYC 本地时间（读） | format 输出 | 说明 |
+|------|----------------|-------------------|-----------|------|
+| 0 | 05:00Z | 00:00 EST | "2024-03-10 00" | 正常 |
+| 1 | 06:00Z | 01:00 EST | "2024-03-10 01" | 正常 |
+| 2 | 07:00Z | 03:00 EDT | "2024-03-10 03" | **跳过了 02:00！** 2 点直接变 3 点 |
+| 3 | 08:00Z | 04:00 EDT | "2024-03-10 04" | 恢复正常 |
+| 4 | 09:00Z | 05:00 EDT | "2024-03-10 05" | 正常 |
+| ... | ... | ... | ... | ... |
+| 22 | 03:00Z (3/11) | 23:00 EDT (3/10) | "2024-03-10 23" | 当天最后一小时 |
+```
+
+**DST 切换日的关键现象**：
+1. `startOfDay` 仍然正确，因为 00:00 在 DST 切换之前（02:00），仍为 EST。
+2. `addHours` 第 2 次迭代时自动跳过缺失的 02:00 小时，直接从 01:00 跳到 03:00。
+3. 最终生成 **23 个小时桶**（缺少 "2024-03-10 02"），与 SQL `date_trunc` 的行为完全一致，前后端不会出现不匹配。
+4. DST 切换是由 date-fns 原生函数内部自动处理的，业务代码无需特殊判断。
 
 ### 5.5 实时图表的特殊处理
 
@@ -668,9 +777,11 @@ toInt32((toDateTime(date_trunc('day', created_at, 'Asia/Shanghai'), 'Asia/Shangh
 2. **查询时对齐**：桶对齐完全在查询时通过 SQL `date_trunc(field, unit, timezone)` 完成，属于"读时计算"模式。
 3. **预聚合与桶解耦**：`website_event_stats_hourly` 按 UTC 小时桶预聚合。整数偏移时区下二次截断正确；**非整数偏移时区（如 +5:30）下，hour 桶全部错位，day 桶也会因跨日界的那一个 UTC 小时桶出现归属偏差**（可用 EVENT_COLUMNS 触发回源原始表来消除误差）。
 4. **ClickHouse toDateTime 第二参数**：仅给 DateTime 值加时区元数据标记，用于结果序列化时按目标时区输出字符串，不改变内部 UTC 时间戳。PostgreSQL 用 `to_char` 直接格式化达到同样目的。
-5. **前端日期边界的正确性前提**：`parseDateRange` + `localToUtc` 整条 date-fns 链路只有在**浏览器系统时区 = 用户选的显示时区**时才计算出正确的 startAt/endAt UTC 时间戳，否则系统性偏移（偏移量 = 用户时区偏移 − 浏览器时区偏移）。
-6. **两条时间过滤路径**：主统计查询直接写死 UTC BETWEEN；事件列表/渠道/目标等查询通过 `getDateQuery` 生成时间条件，ClickHouse 版带 `toTimezone`。
-7. **两条规范化通道**：前端 `canonicalizeTimezone` 用 `TIMEZONE_LEGACY`（18 条），服务端 `normalizeTimezone` 用 `TIMEZONE_MAPPINGS`（仅 1 条），前后端独立维护。
-8. **EVENT_COLUMNS 触发回源**：涉及 15 个事件级字段过滤或分钟粒度时，必须回源原始表，无法走预聚合。这也是非整数偏移时区获得准确桶归属的唯一可靠路径。
-9. **DST 透明处理**：`date_trunc` 天然处理 DST，桶的定义按"日历日/小时"而非固定时长，DST 切换日小时数不对等但语义正确。
-10. **空桶前端补齐**：SQL 只返回有数据的桶，空桶由 `generateTimeSeries` 在前端填充，但 lookup 匹配的正确性同样依赖"浏览器时区 = 用户选时区"这一前提。
+5. **前端日期边界的正确性前提**：`parseDateRange` + `localToUtc` 整条 date-fns 链路只有在**浏览器系统时区 = 用户选的显示时区**时才计算出正确的 startAt/endAt UTC 时间戳，否则系统性偏移（偏移量 = 用户时区偏移 − 浏览器时区偏移）。这是 date-fns 只能基于浏览器时区操作这一技术约束下的折衷设计。
+6. **已知 Bug 与修复状态**："浏览器时区 ≠ 设置时区导致日期范围错误"是上游 umami 仓库的已知 Bug（issue #4107，v3.0.3）。PR #4112（v3.1.0）修复了"调用 `useDateRange` 时忘记传 timezone"的表层问题，但**浏览器时区 ≠ 用户选时区时的系统性偏移这一更根本的设计限制仍然存在**。本仓库（commit `c0ea3ae`）已包含 PR #4112 修复。
+7. **`localToUtc` vs `toUtc` 的设计选择**：`useDateParameters` 选择 `localToUtc`（基于浏览器时区）而非 `toUtc`（基于用户选时区），是为了与 `parseDateRange` 中 `utcToZonedTime`（用户时区偏转）+ date-fns 原生函数（浏览器时区操作）形成"偏转-操作-反向偏转"的闭环。只有在浏览器时区 == 用户选时区时，偏转量才能抵消。
+8. **两条时间过滤路径**：主统计查询直接写死 UTC BETWEEN；事件列表/渠道/目标等查询通过 `getDateQuery` 生成时间条件，ClickHouse 版带 `toTimezone`。
+9. **两条规范化通道**：前端 `canonicalizeTimezone` 用 `TIMEZONE_LEGACY`（18 条），服务端 `normalizeTimezone` 用 `TIMEZONE_MAPPINGS`（仅 1 条），前后端独立维护。
+10. **EVENT_COLUMNS 触发回源**：涉及 15 个事件级字段过滤或分钟粒度时，必须回源原始表，无法走预聚合。这也是非整数偏移时区获得准确桶归属的唯一可靠路径。
+11. **DST 透明处理**：`date_trunc` 和 date-fns `addHours`/`startOfDay` 都天然处理 DST，桶的定义按"日历日/小时"而非固定时长。以 America/New_York 2024-03-10 春令为例，凌晨 2 点跳 3 点时，`startOfDay` 仍然正确（00:00 在切换前），`addHours` 自动跳过 02:00，最终生成 23 个小时桶，与 SQL 行为一致。
+12. **空桶前端补齐**：SQL 只返回有数据的桶，空桶由 `generateTimeSeries` 在前端填充，但 lookup 匹配的正确性同样依赖"浏览器时区 = 用户选时区"这一前提。
