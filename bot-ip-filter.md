@@ -136,7 +136,49 @@ Umami 有四个数据采集入口，均会经过前置过滤逻辑：
 - **IPv6 方括号处理**：`[2001:db8::1]:8080` → `[2001:db8::1]`
 - **解析失败回退**：返回原始字符串
 
-### 3.2 机器人识别 ([send/route.ts:131-133](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L131-L133))
+### 3.2 UA 覆盖链详解 ([detect.ts:126-138](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/detect.ts#L126-L138))
+
+#### 覆盖优先级
+
+`getClientInfo()` 中存在一条完整的「payload → 自动检测」覆盖链，调用方可通过 payload 字段完全覆盖服务端的自动检测结果：
+
+```typescript
+export async function getClientInfo(request: Request, payload: Record<string, any>) {
+  const userAgent = payload?.userAgent || request.headers.get('user-agent');   // UA 覆盖
+  const ip        = payload?.ip        || getIpAddress(request.headers);      // IP 覆盖
+  const browser   = payload?.browser   ?? browserName(userAgent);              // 浏览器覆盖
+  const os        = payload?.os        ?? (detectOS(userAgent) as string);     // OS 覆盖
+  const device    = payload?.device    ?? getDevice(userAgent, payload?.screen); // 设备覆盖
+  // ...
+}
+```
+
+| 字段 | 优先级（高 → 低） | Schema 定义 | 默认行为（tracker.js） |
+|------|-------------------|-------------|------------------------|
+| `userAgent` | `payload.userAgent` → `headers['user-agent']` | `z.string().optional()` | **不传**，走 header |
+| `ip` | `payload.ip` → `getIpAddress(headers)` | `z.string().optional()` | **不传**，走 header 解析 |
+| `browser` | `payload.browser` → `browserName(userAgent)` | `z.string().optional()` | **不传**，自动检测 |
+| `os` | `payload.os` → `detectOS(userAgent)` | `z.string().optional()` | **不传**，自动检测 |
+| `device` | `payload.device` → `getDevice(userAgent, screen)` | `z.string().optional()` | **不传**，自动检测 |
+
+#### 关键设计细节
+
+1. **tracker.js 默认不发送**：[tracker/index.js:64-74](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/tracker/index.js#L64-L74) 中 `getPayload()` 只包含 `website/screen/language/title/hostname/url/referrer/tag/id`，**不包含** userAgent/ip/browser/os/device。因此在正常浏览器采集场景下，所有字段均通过服务端自动检测。
+
+2. **payload.ip 触发地理定位旁路**：当 payload 显式传入 `ip` 时，[detect.ts:129](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/detect.ts#L129) 会将 `skipHeaders=true` 传给 `getLocation()`，导致**跳过所有 CDN 地理 header**，直接走 MaxMind 本地数据库查询。
+
+3. **UA 为空的传递链**：如果 payload 不传 userAgent 且 header 中也无 `user-agent`，则 `userAgent = undefined`。该 undefined 会继续传递给：
+   - `isbot(undefined)` → 机器人检测（通常返回 false）
+   - `browserName(undefined)` → 浏览器检测（返回 null/undefined）
+   - `detectOS(undefined)` → OS 检测（返回 null/undefined）
+   - `getDevice(undefined, screen)` → 设备检测（fallback 为 'desktop'）
+   - `uuid(sourceId, ip, undefined, sessionSalt)` → sessionId 生成（undefined 参与 hash）
+
+4. **`??` vs `\|\|` 的差异**：`browser/os/device` 使用 `??`（空值合并），意味着 payload 传**空字符串 `''` 时会覆盖自动检测结果**；而 `userAgent/ip` 使用 `\|\|`，传空字符串会 fallback 到自动检测。
+
+---
+
+### 3.3 机器人识别 ([send/route.ts:131-133](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L131-L133))
 
 #### 判断逻辑
 
