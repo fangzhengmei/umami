@@ -77,8 +77,8 @@ ClickHouse MergeTree 的稀疏索引（mark）只能按**排序键的连续前�
 |---|---|---|
 | `website_id = ?` | 第 1 列（完全命中） | 整站范围 mark 跳跃，最粗粒度 |
 | `website_id = ? AND event_id = ?` | 第 1+2 列（完全命中） | 单事件范围，mark 定位极精准，**最佳场景** |
+| `website_id = ? AND created_at BETWEEN ? AND ?` | 仅第 1 列（created_at 被 2、3 列隔开） | ❌ created_at 在第 4 位，跳 2、3 列后无法直接用于 mark 跳跃。**hasData 子查询正是此模式**——只能按 website_id 粗定位后扫全站数据再过滤时间 |
 | `website_id = ? AND data_key = ?` | 仅第 1 列（data_key 被跳过） | ❌ **常见误解**：data_key 是第 3 列，被 event_id 隔开，不能直接走前缀；需扫完 website_id 下全部 event_id 再过滤 |
-| `website_id = ? AND created_at BETWEEN ? AND ?` | 仅第 1 列（created_at 被 2、3 列隔开） | ❌ created_at 在第 4 位，跳 2、3 列后无法直接用于 mark 跳跃 |
 | `website_id = ? AND event_id = ? AND data_key = ?` | 第 1+2+3 列（完全命中） | 单事件 + 单属性，mark 极度精准 |
 | `website_id = ? AND event_id = ? AND data_key = ? AND created_at BETWEEN ?` | 第 1+2+3 列完全命中，第 4 列在 mark 内下推 | 理论最优，但同 event 的 created_at 基本相同，收益有限 |
 
@@ -243,18 +243,34 @@ GROUP BY x ORDER BY y DESC LIMIT 500
 | 前端组件 | `<EventsDataTable>` → `<EventsTable>` | [src/app/(main)/websites/[websiteId]/events/EventsDataTable.tsx](src/app/(main)/websites/%5BwebsiteId%5D/events/EventsDataTable.tsx) | - | - |
 | 前端 Hook | `useWebsiteEventsQuery` (view=events → eventType=2) | [src/components/hooks/queries/useWebsiteEventsQuery.ts](src/components/hooks/queries/useWebsiteEventsQuery.ts) | - | - |
 | API 路由 | GET `/websites/:id/events` | [src/app/api/websites/[websiteId]/events/route.ts](src/app/api/websites/%5BwebsiteId%5D/events/route.ts) | - | - |
-| 查询函数 | `getWebsiteEvents` | [src/queries/sql/events/getWebsiteEvents.ts](src/queries/sql/events/getWebsiteEvents.ts) | **website_event**（主查）<br>+ **event_data**（hasData 子查询） | we：第 1+2 列命中<br>ed：仅第 1 列 `website_id` 命中（跳列，data_key 和 created_at 不参与前缀） |
+| 查询函数 | `getWebsiteEvents` | [src/queries/sql/events/getWebsiteEvents.ts](src/queries/sql/events/getWebsiteEvents.ts) | **website_event**（主查）<br>+ **event_data**（hasData 子查询） | we：第 1+2 列命中<br>ed：**仅第 1 列** `website_id`（见下方详细分析） |
 
-hasData 子查询结构（CH 方言）：
+hasData 子查询结构（CH 方言，[getWebsiteEvents.ts:103-106](src/queries/sql/events/getWebsiteEvents.ts)）：
 ```sql
-exists (
-  select * from event_data
-  where website_id = ?
-    and created_at between ? and ?   -- 注意：在第 4 位，跳列后前缀不生效
-    and event_id = website_event.event_id
+event_id IN (
+  select event_id
+  from event_data
+  where website_id = {websiteId:UUID}
+    and created_at between {startDate} and {endDate}   -- 第 4 位排序键，非连续前缀
 ) as hasData
 ```
-→ 主表 website_event 每行都会关联触发 event_data 子查询；但由于 event_id 是第 2 位排序键，`website_id + event_id` 前缀**在子查询中完全命中**。
+
+#### ❗ 关键分析：这不是单事件属性查询
+
+此子查询的语义是"找出该站点在时间范围内**有哪些 event_id 拥有属性行**"——`event_id` 是子查询的 **SELECT 输出列**，不是 WHERE 过滤条件。子查询的 WHERE 中实际只有两个条件：
+
+| WHERE 条件 | 在排序键中的位置 | 是否构成连续前缀 |
+|---|---|---|
+| `website_id = ?` | 第 1 列 | ✅ 命中，mark 可跳跃 |
+| `created_at BETWEEN ? AND ?` | 第 4 列（被 event_id、data_key 隔开） | ❌ 不构成连续前缀，mark 无法利用 |
+
+**实际执行路径**：
+1. 按 `website_id = ?` 粗定位 → 命中排序键第 1 列，mark 跳跃到该站数据起始位置
+2. 扫描该站**全部** event_data 行 → `created_at` 过滤只能在数据读取时做，无法通过 mark 提前裁剪
+3. 返回满足时间范围的所有 `event_id` 构成集合
+4. 外层 `event_id IN (...)` 做匹配
+
+**为什么 `event_id` 不是过滤条件**：子查询需要找出所有有属性行的事件 ID，它是结果集而非过滤输入。只有当子查询写成 `WHERE website_id = ? AND event_id = ?`（查特定事件的属性）时，第 1+2 列才能连续命中——但这不是 hasData 的语义。
 
 ### 3.5 Properties Tab：事件×属性组合列表
 
@@ -460,13 +476,18 @@ EventsPage
 1. **website_event 表**的排序键前两列 `(toStartOfHour(created_at), website_id)` 被绝大多数事件级查询充分利用，mark 跳跃高效。
 
 2. **event_data 表**的排序键 `(website_id, event_id, data_key, created_at)` 只有两种查询形态能高效命中：
-   - `website_id = ? AND event_id = ?`（单事件查属性）——前两列完全命中，**最佳性能**。
+   - `website_id = ? AND event_id = ?`（单事件查属性，如 `getEventDataById`）——前两列完全命中，**最佳性能**。
    - `website_id = ?`（全站属性聚合）——仅第 1 列命中，其余需扫数据。
 
-3. ❗ **常见性能误区修正**：`WHERE website_id = ? AND data_key = ?` **不构成连续前缀**，因为 event_id 夹在中间。data_key 过滤只能在扫数据时做，无法通过 mark 跳跃提前裁剪。若某站点属性键极多且频繁按 data_key 查询，可考虑新增 `(website_id, data_key, created_at)` 排序的 PROJECTION 或物化表。
+3. ❗ **常见性能误区修正**：
+   - `WHERE website_id = ? AND data_key = ?` **不构成连续前缀**，因为 event_id 夹在中间。data_key 过滤只能在扫数据时做，无法通过 mark 跳跃提前裁剪。
+   - `WHERE website_id = ? AND created_at BETWEEN ?` 同样**不构成连续前缀**，created_at 在第 4 位被 event_id 和 data_key 隔开。hasData 子查询（Activity Tab）正是这种模式——只能按 website_id 粗定位后全量扫描再过滤时间。
+   - 若某站点属性键极多且频繁按 data_key 查询，可考虑新增 `(website_id, data_key, created_at)` 排序的 PROJECTION 或物化表。
 
-4. **无过滤事件图表**走 `website_event_stats_hourly` 物化表，比扫明细快约 1~2 个数量级；但一旦带 filter / cohort，回源 `website_event` 明细。
+4. **hasData 子查询（Activity Tab）不是单事件属性查询**：子查询 `SELECT event_id FROM event_data WHERE website_id=? AND created_at BETWEEN ?` 的 `event_id` 是**输出列**而非过滤条件，它的语义是"找出该站有哪些事件拥有属性行"。因此排序键只有第 1 列 `website_id` 命中，需扫全站属性行后按 created_at 过滤。
 
-5. **FILTER_COLUMNS 中没有 data_key / data_value 级的内建列** → 属性值级的自定义过滤只能通过 parseFilters 的 `columns` 选项手动映射（见 getEventDataProperties 的做法）。
+5. **无过滤事件图表**走 `website_event_stats_hourly` 物化表，比扫明细快约 1~2 个数量级；但一旦带 filter / cohort，回源 `website_event` 明细。
 
-6. event_data 表**不分区**，所有查询都必须带 `created_at BETWEEN` 时间范围来减少扫描量；但由于 created_at 在排序键末位，时间过滤对 mark 跳跃帮助有限，主要靠**每 mark 内的二级裁剪**。
+6. **FILTER_COLUMNS 中没有 data_key / data_value 级的内建列** → 属性值级的自定义过滤只能通过 parseFilters 的 `columns` 选项手动映射（见 getEventDataProperties 的做法）。
+
+7. event_data 表**不分区**，所有查询都必须带 `created_at BETWEEN` 时间范围来减少扫描量；但由于 created_at 在排序键末位，时间过滤对 mark 跳跃帮助有限，主要靠**每 mark 内的二级裁剪**。
