@@ -145,8 +145,8 @@ Schema 文件：[`db/clickhouse/schema.sql`](db/clickhouse/schema.sql)
 | `website_event` | MergeTree | `(toStartOfHour(created_at), website_id, session_id, visit_id)` | **宽表**：冗余 session 全部维度，避免 JOIN |
 | `event_data` | MergeTree | `(website_id, event_id, data_key, created_at)` | 自定义事件属性 |
 | `session_data` | **ReplacingMergeTree** | `(website_id, session_id, data_key)` | 会话属性，同键覆盖，天然 upsert |
-| `website_event_stats_hourly` | **AggregatingMergeTree** | `(website_id, event_type, toStartOfHour(created_at), cityHash64(visit_id), visit_id)` | 小时级预聚合（由 MV 自动生成） |
-| `website_revenue` | MergeTree | `(website_id, session_id, created_at)` | 收入表（由 MV 从 event_data 自动 JOIN 生成） |
+| `website_event_stats_hourly` | **AggregatingMergeTree** | `(website_id, event_type, toStartOfHour(created_at), cityHash64(visit_id), visit_id)` | 小时级预聚合（由 MV 自动生成）。**关键说明**：`session_id` / `visit_id` 是普通 UUID 列（非 State 函数），去重发生在**查询侧**用 `uniq(session_id)` / `uniq(visit_id)`；只有 `entry_url` / `exit_url` 用 `argMinState` / `argMaxState`，`views` 列用 `SimpleAggregateFunction(sum, UInt64)` |
+| `website_revenue` | MergeTree | `(website_id, session_id, created_at)` | 收入表（由 MV 从 event_data 自动 JOIN 生成）。同一 `event_id` 若 event_data 中有重复 revenue 行则本表也会有重复行 |
 | `session_replay` | MergeTree | `(replay_id, website_id, session_id, visit_id, chunk_index)` | 录像分块 |
 
 **PostgreSQL vs ClickHouse 建模关键差异**：
@@ -468,7 +468,7 @@ async function relationalQuery(args) {
 
 - `createSession`：`INSERT … ON CONFLICT (session_id) DO NOTHING`，重复调用安全，幂等。
 - `saveSessionData`：先 `updateMany({sessionId,dataKey})`，影响 0 行时再 `create`，语义 upsert，幂等。
-- `saveEvent` / `saveEventData` / `saveRevenue`：**不幂等**，每次调用都会新建 UUID 后 `INSERT`，重试会产生重复事件。
+- `saveEvent` / `saveEventData` / `saveRevenue`：**不幂等**，每次调用都会新建 UUID 后 `INSERT`，重试会产生重复事件行。重复行对 PostgreSQL 查询指标的影响与 ClickHouse 一致：`visitors`/`visits` 等 `count(distinct ...)` 指标不受影响，但 `pageviews`/`events`/`revenue sum` 等 `count(*)`/`sum(...)` 指标**随重复行数线性放大**。
 
 #### 失败边界
 
