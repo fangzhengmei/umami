@@ -1,22 +1,87 @@
-# 告警规则与 Webhook 投递代码协作分析
+# 告警规则与 Webhook 投递链路分析报告
 
-## 概述
+---
 
-本文档分析 umami 项目中告警规则与 Webhook 投递相关的代码协作机制，涵盖阈值匹配、签名校验、防重放、节流、失败重试和外部通知格式等核心环节，并指出各环节中容易漏掉的异常分支。
+## 0. 前置结论：告警规则与 Webhook 投递链路不存在
 
-## 1. 阈值匹配
+经过对项目代码、数据库 Schema、API 端点和配置文件的全面排查，**本项目（umami v3.1.0）中不存在告警规则（Alert Rules）和 Webhook 投递（Webhook Delivery）链路**。
 
-### 1.1 Web Vitals 性能阈值
+### 0.1 不存在的具体证据
 
-**核心代码**：[constants.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/constants.ts#L106-L112)
+| 检查维度 | 是否存在 | 证据 |
+|----------|----------|------|
+| **告警规则数据表** | ❌ 不存在 | [schema.prisma](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/prisma/schema.prisma) 中无 `Alert` / `Rule` / `Trigger` / `Threshold` 等表；[schema.sql](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/db/clickhouse/schema.sql) 中同样缺失 |
+| **Webhook 配置数据表** | ❌ 不存在 | Prisma 和 ClickHouse schema 中无 `WebhookConfig` / `WebhookSubscription` / `WebhookDeliveryLog` 等表 |
+| **告警规则 API 端点** | ❌ 不存在 | [src/app/api](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/app/api) 目录下无 alert / rule / trigger 相关路由 |
+| **Webhook 管理 API 端点** | ❌ 不存在 | 无 webhook / callback / endpoint 管理 API |
+| **Webhook 投递代码** | ❌ 不存在 | 全项目无 webhook / outbound-http / http-callback 相关代码；`src/lib/fetch.ts` 仅为前端 HTTP 客户端，不是服务端 webhook 投递 |
+| **环境变量配置** | ❌ 不存在 | [check-env.js](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/scripts/check-env.js) 无告警/Webhook 相关检查；全项目无 `WEBHOOK_*` / `ALERT_*` / `NOTIFY_*` 环境变量定义 |
+
+### 0.2 容易被误判的代码澄清
+
+以下代码常被误归类为"告警"或"Webhook"，但实际上是其他功能：
+
+| 代码 | 实际用途 | 非告警/Webhook 原因 |
+|------|----------|-------------------|
+| [kafka.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/kafka.ts) | **内部数据管道**：将事件异步投递到 ClickHouse | 是**Inbound 数据写入**，不是对外部系统的 HTTP 回调；Kafka topic 消费者是 umami 自身的 ClickHouse |
+| [/api/send](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/app/api/send/route.ts) | **客户端数据上报入口**：接收 tracker 脚本的页面事件 | 是接收浏览器端数据，不是向外部发送告警 |
+| [getGoal.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/queries/sql/reports/getGoal.ts) | **目标转化统计报告**：计算页面浏览/事件触发的转化率 | 仅在用户主动查询时返回数据，无定时评估和自动触发机制 |
+| [WEB_VITALS_THRESHOLDS](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/constants.ts#L106-L112) | **前端性能评级常量**：用于给 LCP/INP 等指标打 good/poor 标签 | 仅用于 UI 展示颜色区分，不触发任何告警或通知 |
+| [useApi.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/components/hooks/useApi.ts) | **前端 React Query 封装**：浏览器端调用后端 API | 运行在客户端，不是服务端对外投递 |
+
+---
+
+## 1. 缺失部分清单
+
+为了实现"告警规则 + Webhook 投递"的完整能力，本项目需要从头构建以下模块：
+
+### 1.1 告警规则模块（缺失）
+
+| 缺失项 | 说明 | 建议实现位置 |
+|--------|------|-------------|
+| **告警规则数据模型** | 存储规则定义（名称、类型、指标、阈值、比较符、评估周期、通知渠道） | `prisma/schema.prisma` 新增 `AlertRule` 表 |
+| **告警实例数据模型** | 存储告警触发记录（规则ID、触发时间、当前值、阈值、状态：触发/恢复） | `prisma/schema.prisma` 新增 `AlertIncident` 表 |
+| **规则评估引擎** | 定时（如每分钟）拉取指标数据，匹配阈值，判断是否触发/恢复 | 新增 `src/lib/alert/engine.ts` |
+| **规则 CRUD API** | 创建/编辑/删除/启停告警规则的 REST 端点 | 新增 `src/app/api/alerts/route.ts` |
+| **告警状态 API** | 查询告警历史、当前活跃告警、告警确认 | 新增 `src/app/api/alerts/[alertId]/route.ts` |
+| **告警抑制/静默** | 防止告警风暴（连续触发只发一次、维护期静默） | `AlertIncident` 状态机 + 静默窗口配置 |
+
+### 1.2 Webhook 投递模块（缺失）
+
+| 缺失项 | 说明 | 建议实现位置 |
+|--------|------|-------------|
+| **Webhook 配置数据模型** | 存储 Webhook 端点（URL、签名密钥、自定义请求头、订阅的告警类型、启用状态） | `prisma/schema.prisma` 新增 `WebhookEndpoint` 表 |
+| **Webhook 投递日志数据模型** | 记录每次投递（端点ID、告警ID、请求体、HTTP状态、耗时、错误信息、重试次数） | `prisma/schema.prisma` 新增 `WebhookDeliveryLog` 表 |
+| **Webhook 投递器** | 构造标准请求体、计算 HMAC 签名、发送 HTTP POST、处理超时 | 新增 `src/lib/webhook/dispatcher.ts` |
+| **投递重试队列** | 投递失败时按指数退避重试（建议最大 5 次），死信队列 | 基于 Redis List 或数据库轮询表 |
+| **Webhook 管理 API** | 创建/编辑/删除/测试 Webhook 端点 | 新增 `src/app/api/webhooks/route.ts` |
+| **Webhook 标准通知格式** | 定义触发/恢复通知的 JSON Schema（见第 8 章建议格式） | `src/lib/webhook/schema.ts` |
+
+### 1.3 两者协作桥接（缺失）
+
+| 缺失项 | 说明 |
+|--------|------|
+| **告警 → 通知 路由** | 告警引擎触发后，根据规则配置的通知渠道（Webhook 列表）分发事件 |
+| **通知节流（Alert Throttling）** | 同一告警短时间内重复触发时，合并发送或静默 |
+| **批量投递** | 同一时刻多个告警触发，批量打包投递减少 HTTP 调用 |
+
+---
+
+## 2. 现有代码分析：阈值匹配（非告警场景）
+
+### 2.1 Web Vitals 性能评级阈值
+
+**定位**：前端 UI 展示用评级常量，**不是告警触发阈值**
+
+**代码位置**：[constants.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/constants.ts#L106-L112)
 
 ```typescript
 export const WEB_VITALS_THRESHOLDS = {
-  lcp: { good: 2500, poor: 4000, unit: 'ms' },
-  inp: { good: 200, poor: 500, unit: 'ms' },
-  cls: { good: 0.1, poor: 0.25, unit: '' },
-  fcp: { good: 1800, poor: 3000, unit: 'ms' },
-  ttfb: { good: 800, poor: 1800, unit: 'ms' },
+  lcp:  { good: 2500, poor: 4000, unit: 'ms' },
+  inp:  { good:  200, poor:  500, unit: 'ms' },
+  cls:  { good:  0.1, poor: 0.25, unit: ''   },
+  fcp:  { good: 1800, poor: 3000, unit: 'ms' },
+  ttfb: { good:  800, poor: 1800, unit: 'ms' },
 } as const;
 ```
 
@@ -32,62 +97,55 @@ function getRating(metric: string, value: number): 'good' | 'needs-improvement' 
 }
 ```
 
-### 1.2 Goal 目标阈值
+**当前用途**：驱动 `Badge` 组件显示绿色/黄色/红色标签，无任何后端告警动作。
 
-**核心代码**：[getGoal.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/queries/sql/reports/getGoal.ts)
+**异常分支风险**：
+| # | 问题 | 影响 |
+|---|------|------|
+| 1 | `value <= 0` 直接返回 `'good'` | 数据采集异常（如负值）被掩盖，评级永远正常 |
+| 2 | 边界值均用 `<=`，`threshold.poor` 边界归属 `needs-improvement` 而非 `poor` | 语义和预期不符：达到 poor 阈值却仍显示"需改进" |
+| 3 | 硬编码常量，不支持按网站自定义 | SaaS 多租户场景无法差异化阈值 |
 
-Goal 报告通过 `num`（目标达成数）和 `total`（总会话数）计算转化率，但**未设置显式的告警阈值**，仅在前端展示进度条。
+### 2.2 Goal 转化目标阈值（概念层面，无代码实现）
 
-### 1.3 过滤器操作符阈值
+**代码位置**：[getGoal.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/queries/sql/reports/getGoal.ts)
 
-**核心代码**：[constants.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/constants.ts#L137-L154)
+Goal 报告返回 `{ num, total }`，前端计算 `num/total` 百分比并画进度条，但**没有配置"转化率低于 X% 即告警"的入口**。
+
+**异常分支风险**：
+| # | 问题 | 影响 |
+|---|------|------|
+| 1 | `total === 0` 时转化率为 `0%`（[Goal.tsx#L84](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/app/(main)/websites/[websiteId]/(reports)/goals/Goal.tsx#L84)） | 分母为零时的除零保护了，但如果这是异常情况（如数据延迟），无法区分 |
+| 2 | 目标匹配用 `LIKE` 通配符时，`*` 只替换首尾 | `path = "*foo*bar*"` 只能匹配 `%foo*bar%`，中间的 `*` 未处理 |
+
+### 2.3 过滤器比较操作符
+
+**代码位置**：[constants.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/constants.ts#L137-L154)
 
 ```typescript
 export const OPERATORS = {
-  equals: 'eq',
-  notEquals: 'neq',
-  greaterThan: 'gt',
-  lessThan: 'lt',
-  greaterThanEquals: 'gte',
-  lessThanEquals: 'lte',
+  equals: 'eq', notEquals: 'neq',
+  greaterThan: 'gt', lessThan: 'lt',
+  greaterThanEquals: 'gte', lessThanEquals: 'lte',
+  contains: 'c', doesNotContain: 'dnc',
   // ...
 } as const;
 ```
 
-### ⚠️ 容易漏掉的异常分支
-
-1. **阈值边界值处理不一致**：`value <= threshold.good` 使用 `<=`，但 `value <= threshold.poor` 也使用 `<=`，边界值归属可能引发争议
-2. **负值或零值直接返回 good**：`value <= 0` 时直接返回 `'good'`，可能掩盖数据异常
-3. **Goal 无阈值配置**：Goal 报告只有转化率计算，没有触发告警的阈值配置，无法自动触发告警
-4. **动态阈值缺失**：所有阈值都是硬编码常量，不支持按网站/用户自定义配置
+这些操作符用于数据查询过滤，**不是告警规则的阈值比较器**，但未来告警引擎可以复用其语义。
 
 ---
 
-## 2. 签名校验
+## 3. 现有代码分析：签名验证（认证场景，非 Webhook）
 
-### 2.1 JWT Token 机制
+### 3.1 JWT + AES-256-GCM 双重安全 Token
 
-**核心代码**：[jwt.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/jwt.ts)
+**定位**：用户登录态认证，**不是 Webhook 请求签名**
 
-```typescript
-export function createToken(payload: any, secret: any, options?: any) {
-  return jwt.sign(payload, secret, options);
-}
-
-export function parseToken(token: string, secret: any) {
-  try {
-    return jwt.verify(token, secret);
-  } catch {
-    return null;
-  }
-}
-```
-
-### 2.2 安全 Token（加密 + JWT）
-
-**核心代码**：[jwt.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/jwt.ts#L16-L26)
+**核心代码**：[jwt.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/jwt.ts) + [crypto.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/crypto.ts)
 
 ```typescript
+// 认证 Token：先 JWT 签名，再 AES-256-GCM 加密
 export function createSecureToken(payload: any, secret: any, options?: any) {
   return encrypt(createToken(payload, secret, options), secret);
 }
@@ -101,40 +159,31 @@ export function parseSecureToken(token: string, secret: any) {
 }
 ```
 
-### 2.3 加密算法
+**加密算法细节**：
+- AES-256-GCM，带 128 位认证标签（[crypto.ts#L5-L10](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/crypto.ts#L5-L10)）
+- PBKDF2 密钥派生：10000 轮，SHA-512
+- 密钥来源：`secret() = hash(APP_SECRET || DATABASE_URL)`
 
-**核心代码**：[crypto.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/crypto.ts)
+### 3.2 认证校验流程
 
-使用 AES-256-GCM 算法，带认证标签（TAG）验证。
+**代码位置**：[auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/auth.ts#L17-L60)
 
-### 2.4 认证校验流程
-
-**核心代码**：[auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/auth.ts#L17-L60)
-
-```typescript
-export async function checkAuth(request: Request) {
-  const token = getBearerToken(request);
-  const payload = parseSecureToken(token, secret());
-  const shareToken = await parseShareToken(request);
-
-  let user = null;
-  const { userId, authKey } = payload || {};
-
-  if (userId) {
-    user = await getUser(userId);
-  } else if (redis.enabled && authKey) {
-    const key = await redis.client.get(authKey);
-    if (key?.userId) {
-      user = await getUser(key.userId);
-    }
-  }
-  // ...
-}
+```
+请求 Authorization Header
+       ↓
+getBearerToken() 提取 "Bearer xxx"
+       ↓
+parseSecureToken() → 解密 + JWT 校验
+       ↓
+├─ userId → getUser(userId)
+└─ authKey → redis.get(authKey) → getUser(key.userId)
+       ↓
+同时检查 x-umami-share-token + x-umami-share-context（分享链接场景）
 ```
 
-### 2.5 Share Token 校验
+### 3.3 Share Token 验证（分享链接场景）
 
-**核心代码**：[auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/auth.ts#L80-L87)
+**代码位置**：[auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/auth.ts#L80-L87)
 
 ```typescript
 export function parseShareToken(request: Request) {
@@ -147,56 +196,49 @@ export function parseShareToken(request: Request) {
 }
 ```
 
-### ⚠️ 容易漏掉的异常分支
+### 3.4 Cache Token 验证（数据采集去重场景）
 
-1. **Token 解密失败静默返回 null**：`parseSecureToken` 和 `parseToken` 捕获所有异常返回 `null`，无法区分是签名无效、过期还是解密失败
-2. **Auth Key 过期无感知**：Redis 中 authKey 过期后，用户不会收到明确的过期提示
-3. **Share Token 上下文校验缺失**：仅检查 `SHARE_CONTEXT_HEADER` 是否存在，未校验上下文与 token 的匹配关系
-4. **JWT 未指定过期时间**：`createToken` 调用时未强制设置 `expiresIn`，存在长期有效 token 风险
-5. **加密与 JWT 使用同一密钥**：`secret()` 同时用于加密和 JWT 签名，密钥用途不分离
-6. **Token 刷新机制缺失**：没有 token 刷新机制，过期后需重新登录
-7. **GCM 认证标签验证错误无区分**：`decrypt` 中 `decipher.setAuthTag(tag)` 失败与解密失败混为一谈
+**代码位置**：[send/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/app/api/send/route.ts#L100-L122)
+
+```typescript
+const cacheHeader = request.headers.get('x-umami-cache');
+if (cacheHeader) {
+  const result = await parseToken(cacheHeader, secret()); // 纯 JWT，未加密
+  if (result) cache = result;
+}
+```
+
+**异常分支风险汇总**：
+
+| # | 问题 | 具体代码 | 影响 |
+|---|------|----------|------|
+| 1 | 所有 parse* 函数**静默吞异常**，统一返回 `null` | [jwt.ts#L8-L14](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/jwt.ts#L8-L14) | 无法区分「签名无效」vs「Token 过期」vs「解密失败」，调试噩梦 |
+| 2 | JWT 创建**未强制 expiresIn** | 各处 `createToken(...)` 调用 | 泄露后永久有效，无内置过期机制 |
+| 3 | 加密密钥 = JWT 密钥 = 同一个 `secret()` | [crypto.ts#L56-L58](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/crypto.ts#L56-L58) | 密钥用途不分离，违反最小权限原则 |
+| 4 | Share Token 验证**只验 header 是否存在** | [auth.ts#L43-L48](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/auth.ts#L43-L48) | 仅判断 `SHARE_CONTEXT_HEADER` 是否为非空，未校验其内容是否与 token 匹配 |
+| 5 | Cache Token 用**裸 JWT（未加密）** 且**无过期** | [send/route.ts#L107](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/app/api/send/route.ts#L107) | 抓包后可永久复用 |
+
+> **对未来 Webhook 的启示**：如果后续实现 Webhook，HMAC 签名计算需要参考当前 AES-GCM 的严谨性，但应避免「静默吞异常」的错误处理模式。
 
 ---
 
-## 3. 防重放
+## 4. 现有代码分析：防重放（数据采集场景）
 
-### 3.1 Session / Visit ID 机制
+### 4.1 SessionId 确定性生成
 
-**核心代码**：[send/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/app/api/send/route.ts#L147-L175)
+**定位**：将同一用户的多次事件聚合到同一个 session，**防止重复统计**，不是 API 请求级防重放
 
-```typescript
-const sessionId = id ? uuid(sourceId, id) : uuid(sourceId, ip, userAgent, sessionSalt);
-let visitId = cache?.visitId || uuid(sessionId, visitSalt);
-let iat = cache?.iat || now;
-
-// Expire visit after 30 minutes
-if (!timestamp && now - iat > 1800) {
-  visitId = uuid(sessionId, visitSalt);
-  iat = now;
-}
-```
-
-### 3.2 Cache Token 防重放
-
-**核心代码**：[send/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/app/api/send/route.ts#L100-L122)
+**代码位置**：[send/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/app/api/send/route.ts#L143-L149)
 
 ```typescript
-if (websiteId) {
-  const cacheHeader = request.headers.get('x-umami-cache');
-  if (cacheHeader) {
-    const result = await parseToken(cacheHeader, secret());
-    if (result) {
-      cache = result;
-    }
-  }
-  // ...
-}
+const saltRotation = process.env.SALT_ROTATION || 'month';
+const sessionSalt = getSalt(saltRotation, createdAt);
+const sessionId = id
+  ? uuid(sourceId, id)                           // 有 identify() 时基于 distinctId
+  : uuid(sourceId, ip, userAgent, sessionSalt);  // 否则基于 IP + UA + 盐值
 ```
 
-### 3.3 盐值轮换
-
-**核心代码**：[crypto.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/crypto.ts#L72-L78)
+**盐值轮换逻辑**：[crypto.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/crypto.ts#L72-L78)
 
 ```typescript
 export function getSalt(saltRotation: string, createdAt: Date): string {
@@ -208,300 +250,353 @@ export function getSalt(saltRotation: string, createdAt: Date): string {
 }
 ```
 
-### 3.4 Visit 过期机制
+### 4.2 VisitId 30 分钟过期
 
-- Visit 有效期：30 分钟（1800 秒）
-- 过期后重新生成 visitId 和 iat
-- 带 timestamp 的请求跳过期校验
+**代码位置**：[send/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/app/api/send/route.ts#L168-L175)
 
-### ⚠️ 容易漏掉的异常分支
+```typescript
+let visitId = cache?.visitId || uuid(sessionId, visitSalt);
+let iat = cache?.iat || now;
 
-1. **带 timestamp 的请求跳过期校验**：`!timestamp` 条件下才判断过期，攻击者可通过设置旧 timestamp 绕过 visit 过期检查
-2. **Cache Token 无过期校验**：`parseToken` 仅验证签名，不校验 token 本身是否过期（JWT 未设置 exp）
-3. **盐值轮换边界问题**：盐值按天/周/月轮换，轮换时刻可能导致同一用户 sessionId 变化，统计数据断裂
-4. **SessionId 生成依赖客户端信息**：基于 IP + UserAgent + 盐值生成，用户更换网络/浏览器后 sessionId 会变，无法真正防重放
-5. **VisitId 基于小时盐值**：整点切换时 visitId 会变化，可能导致同一会话被拆分为多个 visit
-6. **无请求唯一标识**：没有 nonce 或 request ID 机制，无法防止完全相同的请求被重复处理
-7. **重放攻击窗口**：30 分钟 visit 有效期内，同一请求可重复提交
+// Expire visit after 30 minutes
+if (!timestamp && now - iat > 1800) {
+  visitId = uuid(sessionId, visitSalt);
+  iat = now;
+}
+```
+
+`visitSalt = hash(startOfHour(createdAt).toUTCString())`，按小时变化。
+
+### 4.3 Cache Token 回传机制
+
+**代码位置**：[send/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/app/api/send/route.ts#L311-L313)
+
+```typescript
+const token = createToken({ websiteId, sessionId, visitId, iat }, secret());
+return json({ cache: token, sessionId, visitId });
+```
+
+客户端下次请求通过 `x-umami-cache` header 回传，服务端直接复用 sessionId/visitId，**避免重新计算**（从而达到去重效果）。
+
+**异常分支风险汇总**：
+
+| # | 问题 | 影响 |
+|---|------|------|
+| 1 | **带 `timestamp` 参数绕过过期检查**：`!timestamp` 条件成立才判断 `now - iat > 1800` | 攻击者可构造旧 timestamp，强制复用过期的 visitId，扭曲访问时长统计 |
+| 2 | **Cache Token 无 `exp` 声明**：`createToken` 时未传 `expiresIn` | 即使 visitId 逻辑过期，JWT 本身仍然有效；结合第 1 条可长期复用 |
+| 3 | **盐值轮换边界数据断裂**：月/周/日轮换时刻，同一用户 sessionId 突变 | 跨轮换点的用户被统计为两个新用户，数据一致性受损 |
+| 4 | **VisitSalt 按小时轮换**：整点时 visitId 突变 | 同一次长会话（跨整点）被拆分为多个 visit |
+| 5 | **无请求级 nonce**：没有 `X-Request-ID` / nonce 去重 | 完全相同的 HTTP 请求（复制粘贴重放）会被当作新事件重复入库 |
+| 6 | **SessionId 依赖 IP + UA**：用户换网络或浏览器升级，被当新用户 | 统计数据高估独立访客数 |
+
+> **对未来 Webhook 的启示**：Webhook 防重放应独立实现 `timestamp + nonce + 签名过期窗口` 三件套，不要复用数据采集的 session 机制。
 
 ---
 
-## 4. 节流
+## 5. 现有代码分析：节流（Redis RateLimit 未实际应用）
 
-### 4.1 Redis 限流
+### 5.1 Redis 固定窗口限流函数
 
-**核心代码**：[redis.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/redis.ts#L72-L82)
+**代码位置**：[redis.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/redis.ts#L72-L82)
 
 ```typescript
 async rateLimit(key: string, limit: number, seconds: number): Promise<boolean> {
   await this.connect();
-
   const res = await this.client.incr(key);
-
   if (res === 1) {
     await this.client.expire(key, seconds);
   }
-
   return res >= limit;
 }
 ```
 
-### 4.2 限流算法分析
+**算法**：固定窗口计数器
+- 返回 `true` 表示已超限，应拒绝请求
+- 返回 `false` 表示放行
 
-使用 **固定窗口计数器** 算法：
-- INCR 递增计数器
-- 首次请求设置过期时间
-- 返回是否达到限制
+### 5.2 IP 黑名单（CIDR 支持）
 
-### 4.3 IP 黑名单
-
-**核心代码**：[detect.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/detect.ts#L140-L169)
+**代码位置**：[detect.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/detect.ts#L140-L169)
 
 ```typescript
 export function hasBlockedIp(clientIp: string) {
   const ignoreIps = process.env.IGNORE_IP;
-  // ... 支持单个 IP 和 CIDR 网段
+  // 支持单个 IP 和 CIDR 网段（ipaddr.js match）
 }
 ```
 
-### ⚠️ 容易漏掉的异常分支
+在 `/api/send` 中被调用：[send/route.ts#L135-L138](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/app/api/send/route.ts#L135-L138)
 
-1. **固定窗口临界问题**：窗口切换瞬间可能通过双倍请求（如 59 秒和 0 秒各发 limit 个）
-2. **INCR 与 EXPIRE 非原子**：如果 INCR 成功后 EXPIRE 失败，key 将永不过期，导致永久限流
-3. **限流未应用于核心 API**：`rateLimit` 函数存在但未在 `/api/send` 等核心接口中使用
-4. **无降级策略**：Redis 连接失败时如何处理？是放行还是拒绝？目前会抛出异常
-5. **限流 Key 设计缺失**：没有统一的限流 key 命名规范，不同接口可能重复或冲突
-6. **无滑动窗口支持**：固定窗口精度不足，无法应对突发流量
-7. **超限后无延迟惩罚**：仅返回是否超限，没有渐进式延迟或封禁机制
+### 5.3 机器人检测
+
+**代码位置**：[send/route.ts#L130-L133](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/app/api/send/route.ts#L130-L133)
+
+使用 `isbot` 库检测爬虫 UA，返回 `{ beep: 'boop' }` 静默不入库。
+
+**异常分支风险汇总**：
+
+| # | 问题 | 影响 |
+|---|------|------|
+| 1 | **`rateLimit` 函数存在但从未被任何 API 调用** | 核心数据入口 `/api/send` 无限流保护，可被刷量攻击 |
+| 2 | **INCR + EXPIRE 非原子**：两步操作之间如果进程崩溃 | Key 永久存在且永远递增，导致**永久限流**该 key |
+| 3 | **无 Redis 降级策略**：Redis 连接失败时直接抛异常 | 应配置「Redis 不可用时放行」还是「Redis 不可用时拒绝」 |
+| 4 | **固定窗口临界突刺**：窗口边界 1 秒内可能通过 2× limit 请求 | 高并发场景保护不足 |
+| 5 | **限流 Key 无命名规范**：函数只接收裸 key，不自动加前缀 | 不同调用方可能冲突（如 `send:ip:1.2.3.4` 被别处使用同名） |
+
+> **对未来 Webhook 的启示**：Webhook **出向**节流（控制向外部端点的发送频率，防止被对端封禁）需要单独实现，与入向限流方向相反。建议使用令牌桶算法。
 
 ---
 
-## 5. 失败重试
+## 6. 现有代码分析：失败重试（实际几乎无重试）
 
-### 5.1 Kafka 消息投递
+### 6.1 Kafka 消息投递
 
-**核心代码**：[kafka.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/kafka.ts#L66-L91)
+**代码位置**：[kafka.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/kafka.ts#L66-L91)
 
 ```typescript
-async function sendMessage(
-  topic: string,
-  message: Record<string, string | number> | Record<string, string | number>[],
-): Promise<RecordMetadata[]> {
+async function sendMessage(topic, message) {
   try {
     await connect();
     return producer.send({
-      topic,
-      messages: Array.isArray(message)
-        ? message.map(a => { return { value: JSON.stringify(a) }; })
-        : [{ value: JSON.stringify(message) }],
-      timeout: SEND_TIMEOUT,
-      acks: ACKS,
+      topic, messages: [...],
+      timeout: 3000,   // SEND_TIMEOUT = 3000
+      acks: 1,          // 只等 leader 确认
     });
   } catch (e) {
     console.log('KAFKA ERROR:', serializeError(e));
+    // ← 只打日志！不抛出异常，不重试，不回退到 ClickHouse 直写
   }
 }
 ```
 
-### 5.2 Batch API 错误处理
-
-**核心代码**：[batch/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/app/api/batch/route.ts)
+**被调用方**：[saveEvent.ts#L259-L263](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/queries/sql/events/saveEvent.ts#L259-L263)
 
 ```typescript
-const errors = [];
-let index = 0;
-for (const data of body) {
-  const response = await send.POST(newRequest);
-  const responseJson = await response.json();
+if (kafka.enabled) {
+  await sendMessage('event', message);        // 失败了？saveEvent 完全不知情
+} else {
+  await insert('website_event', [message]);   // ← Kafka 可用时永远不会走这里
+}
+```
 
+### 6.2 Batch API 错误收集（无重试）
+
+**代码位置**：[batch/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/app/api/batch/route.ts#L17-L54)
+
+```typescript
+for (const data of body) {
+  const response = await send.POST(newRequest);   // 逐条串行调用
+  const responseJson = await response.json();
   if (!response.ok) {
     errors.push({ index, response: responseJson });
   }
   index++;
 }
+// 仅把错误索引记录下来返回给调用方，不做任何重试
 ```
 
-### 5.3 数据库写入重试
+### 6.3 数据库写入（Prisma / ClickHouse）
 
-**核心代码**：[saveEvent.ts](file:///d:/fz/0601-2\solo-dogfeeding\code\54-umami\src\queries\sql\events\saveEvent.ts)
+[saveEvent.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/queries/sql/events/saveEvent.ts) 中的 Prisma `create` 和 ClickHouse `insert` 均为**一次性调用**，无 catch，无重试。
 
-事件保存依赖数据库（PostgreSQL/ClickHouse），但**无内置重试机制**。
+**异常分支风险汇总**：
 
-### ⚠️ 容易漏掉的异常分支
+| # | 问题 | 影响 |
+|---|------|------|
+| 1 | **Kafka 失败静默吞错**：catch 不抛异常，调用方 `await sendMessage(...)` 收到 `undefined` 以为成功 | **数据静默丢失**，最严重问题 |
+| 2 | **无任何重试机制**：Kafka / DB / Batch 全部失败即终态 | 瞬时故障（网络抖动）直接丢数据 |
+| 3 | **无死信队列**：重试耗尽后无法人工介入 | 故障恢复后补数困难 |
+| 4 | **Kafka 不可用时无降级**：配置了 `KAFKA_URL` 就走 Kafka，失败了不会回退直写 | 发送方成功/消费者滞后时，上层无感知 |
+| 5 | **Batch 串行调用 + 无短路**：100 条里第 1 条就超时，也要等 99 次尝试 | 雪崩加剧 |
 
-1. **Kafka 发送失败静默吞错**：catch 块仅打日志，不向上层抛出，调用方无法感知失败
-2. **Kafka 无重试配置**：`acks: 1` 仅等待 leader 确认，无重试次数和退避策略
-3. **连接失败无降级**：Kafka 不可用时，是否回退到直接写入 ClickHouse？目前没有
-4. **Batch 部分失败无补偿**：批量处理中部分失败，仅记录错误，没有自动重试机制
-5. **数据库写入失败无重试**：saveEvent 失败直接抛出，没有重试逻辑
-6. **失败消息无持久化**：Kafka 发送失败后，消息丢失，没有本地存储重试机制
-7. **重试风暴风险**：如果后续添加重试，需注意重试间隔和指数退避，否则可能加剧故障
-8. **无死信队列**：多次重试失败的消息没有进入死信队列的机制
+> **对未来 Webhook 的启示**：Webhook 投递必须有指数退避重试（1s, 2s, 4s, 8s, 16s, max 5 次）+ 死信队列 + 人工重放 UI。可以吸取 Kafka 这里的教训，**绝对不能静默吞错**。
 
 ---
 
-## 6. 外部通知格式
+## 7. 现有代码分析：外部通知 / 事件投递（完全不存在 Webhook）
 
-### 6.1 数据收集 API 请求格式
+### 7.1 Kafka 不是 Webhook
 
-**核心代码**：[send/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/app/api/send/route.ts#L24-L64)
+| 维度 | Kafka（本项目） | Webhook（告警投递） |
+|------|-----------------|-------------------|
+| **方向** | 服务内部：应用 → 消息队列 → 本应用的消费者 | 对外：本应用 → 第三方系统 |
+| **协议** | Kafka 二进制协议（TCP） | HTTP/HTTPS POST |
+| **载荷格式** | 本应用自定义 snake_case JSON | 需标准化（建议 CloudEvents） |
+| **消费方** | 本应用 ClickHouse 消费者进程 | 用户配置的任意 URL |
+| **认证方式** | SASL PLAIN / SCRAM（Kafka 内部） | HMAC 签名（Header 携带） |
+| **重试策略** | 无（消费者失败自处理） | 必须：指数退避 + 死信 |
 
-```typescript
-const schema = z.object({
-  type: z.enum(['event', 'identify', 'performance']),
-  payload: z.object({
-    website: z.uuid().optional(),
-    link: z.uuid().optional(),
-    pixel: z.uuid().optional(),
-    data: anyObjectParam.optional(),
-    hostname: z.string().max(100).optional(),
-    // ... 更多字段
-  }),
-});
+### 7.2 数据采集 API（/api/send）不是告警通知
+
+`/api/send` 是**入向数据接收**（Inbound）：浏览器 tracker 脚本把页面事件上报给后端。
+
+告警通知是**出向数据发送**（Outbound）：后端把告警事件 POST 到用户的 Webhook URL。
+
+两者方向完全相反，代码模式也完全不同。
+
+### 7.3 前端 React Query（useApi.ts）不是服务端投递
+
+[useApi.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/components/hooks/useApi.ts) 运行在浏览器中，用 `@tanstack/react-query` 做客户端数据缓存。**服务端没有类似的对外 HTTP POST 封装库。**
+
+---
+
+## 8. 建议的 Webhook 通知标准格式（待实现参考）
+
+由于本项目尚无此模块，以下为推荐实现方案（对齐 CNCF CloudEvents 1.0 规范）：
+
+### 8.1 告警触发通知
+
+```http
+POST /your-webhook-endpoint HTTP/1.1
+Host: example.com
+Content-Type: application/cloudevents+json
+X-Webhook-Signature: sha256=<HMAC_HEX>
+X-Webhook-Timestamp: 1718889600
+X-Webhook-Nonce: a1b2c3d4e5f6
+X-Webhook-Event: alert.fired
+X-Webhook-Delivery-ID: evt_abc123def456
 ```
 
-### 6.2 数据收集 API 响应格式
-
-**成功响应**：
 ```json
 {
-  "cache": "eyJhbGciOiJIUzI1NiIs...",
-  "sessionId": "uuid",
-  "visitId": "uuid"
-}
-```
-
-**错误响应**：[response.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/lib/response.ts)
-
-```json
-{
-  "error": {
-    "message": "Bad request",
-    "code": "bad-request",
-    "status": 400
+  "specversion": "1.0",
+  "type": "umami.alert.fired",
+  "source": "https://umami.example.com/api/alerts",
+  "subject": "alert_7f9c2b4a-e6d1-4f3a-8b0c-1d2e3f4a5b6c",
+  "id": "evt_abc123def456",
+  "time": "2024-06-20T08:00:00Z",
+  "datacontenttype": "application/json",
+  "data": {
+    "alert": {
+      "id": "alert_7f9c2b4a-e6d1-4f3a-8b0c-1d2e3f4a5b6c",
+      "name": "LCP 性能告警",
+      "description": "首页 LCP 超过 4 秒",
+      "severity": "critical",
+      "rule": {
+        "metric": "performance.lcp.p95",
+        "operator": "gt",
+        "threshold": 4000,
+        "windowSeconds": 300,
+        "websiteId": "web_12345678-1234-1234-1234-1234567890ab"
+      },
+      "triggeredAt": "2024-06-20T08:00:00Z",
+      "status": "firing"
+    },
+    "currentValue": {
+      "metric": "performance.lcp.p95",
+      "value": 5231,
+      "unit": "ms",
+      "samples": 42,
+      "windowStart": "2024-06-20T07:55:00Z",
+      "windowEnd": "2024-06-20T08:00:00Z"
+    },
+    "threshold": {
+      "metric": "performance.lcp.p95",
+      "value": 4000,
+      "operator": "greater_than"
+    },
+    "links": {
+      "dashboard": "https://umami.example.com/websites/web_12345678/performance",
+      "alertDetails": "https://umami.example.com/alerts/alert_7f9c2b4a-e6d1-4f3a-8b0c-1d2e3f4a5b6c"
+    },
+    "tags": {
+      "website": "example.com",
+      "environment": "production",
+      "team": "frontend"
+    }
   }
 }
 ```
 
-### 6.3 Kafka 消息格式
+### 8.2 告警恢复通知
 
-**核心代码**：[saveEvent.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/54-umami/src/queries/sql/events/saveEvent.ts#L216-L257)
-
-```typescript
-const message = {
-  website_id: websiteId,
-  session_id: sessionId,
-  visit_id: visitId,
-  event_id: eventId,
-  url_path: urlPath,
-  event_type: eventType,
-  event_name: eventName,
-  created_at: getUTCString(createdAt),
-  // ... 更多字段（snake_case 命名）
-};
 ```
-
-### 6.4 Batch API 响应格式
+X-Webhook-Event: alert.resolved
+```
 
 ```json
 {
-  "size": 10,
-  "processed": 8,
-  "errors": 2,
-  "details": [
-    { "index": 2, "response": { "error": { ... } } }
-  ],
-  "cache": "eyJhbGciOiJIUzI1NiIs..."
+  "type": "umami.alert.resolved",
+  "data": {
+    "alert": { "id": "...", "status": "resolved", "resolvedAt": "2024-06-20T08:15:00Z" },
+    "resolvedValue": {
+      "metric": "performance.lcp.p95",
+      "value": 2150,
+      "unit": "ms",
+      "windowStart": "2024-06-20T08:10:00Z",
+      "windowEnd": "2024-06-20T08:15:00Z"
+    },
+    "durationSeconds": 900,
+    "peakValue": 5820
+  }
 }
 ```
 
-### 6.5 签名请求头
+### 8.3 签名算法（建议）
 
-- **认证**：`Authorization: Bearer <secure_token>`
-- **Share Token**：`x-umami-share-token: <jwt_token>`
-- **Share Context**：`x-umami-share-context`
-- **Cache Token**：`x-umami-cache: <jwt_token>`
+```
+payload_string = JSON.stringify(body)
+timestamp = 1718889600
+signature_base = f"{timestamp}.{payload_string}"
+hmac = HMAC-SHA256(webhook_secret, signature_base)
+X-Webhook-Signature = "sha256=" + hex(hmac)
+X-Webhook-Signature 支持逗号分隔多个版本（密钥轮换用）
+```
 
-### ⚠️ 容易漏掉的异常分支
+接收方校验：
+1. 检查 `X-Webhook-Timestamp` 与当前时间差不超过 300 秒（防重放）
+2. 校验 HMAC 签名
+3. 检查 `id` / `X-Webhook-Nonce` 在去重缓存中是否已处理过（防重放）
 
-1. **字段截断无声失败**：`urlPath?.substring(0, URL_LENGTH)` 等截断操作无日志，数据丢失不可感知
-2. **Kafka 与数据库字段命名不一致**：Kafka 使用 snake_case（`website_id`），Prisma 使用 camelCase（`websiteId`），转换遗漏风险
-3. **空值处理不一致**：部分字段用 `null`，部分用 `undefined`，序列化后行为不同
-4. **时间格式不统一**：ClickHouse 用 UTC 字符串，PostgreSQL 用 Date 对象，边界时区问题
-5. **响应无版本号**：API 响应格式没有版本标识，后续变更可能破坏兼容性
-6. **错误码不完整**：只有基础的 bad-request/unauthorized/forbidden/not-found/server-error，缺少业务错误码
-7. **Batch 响应 cache 语义模糊**：`cache ??= responseJson.cache` 只取第一个成功的 cache，不保证是最新的
-8. **无 Webhook 标准格式**：项目目前没有定义 Webhook 通知的标准 payload 格式，如告警触发/恢复的结构
+### 8.4 投递响应约定
+
+| 接收方响应 | 投递方行为 |
+|-----------|-----------|
+| `2xx` | 标记成功，归档日志 |
+| `401` / `403` | **不重试**，标记失败，告警管理员（密钥失效） |
+| `404` | **不重试**，标记失败，告警管理员（URL 失效） |
+| `429` | 读取 `Retry-After` header，延迟重试 |
+| `5xx` / 超时 / 连接失败 | 指数退避重试（1s, 2s, 4s, 8s, 16s），共 5 次 |
 
 ---
 
-## 7. 整体协作流程与风险点
+## 9. 推荐的端到端实现顺序
 
-### 7.1 数据流示意图
+如果后续要实现告警规则 + Webhook 投递，建议按以下顺序开发：
 
 ```
-客户端 tracker
-    ↓ (HTTP POST + x-umami-cache)
-/api/send 端点
-    ├─ 签名校验 (JWT + 加密)
-    ├─ 防重放 (sessionId/visitId 生成)
-    ├─ 数据验证 (Zod schema)
-    └─ 事件保存
-        ├─ Kafka → (无重试) → ClickHouse 消费者
-        └─ 直接写入 PostgreSQL/ClickHouse
+阶段 1：数据模型 + 告警引擎
+  └─ ① AlertRule / AlertIncident 数据表
+  └─ ② 告警评估引擎（定时拉指标 → 阈值比较 → 写 incident）
+  └─ ③ 规则 CRUD API
+
+阶段 2：Webhook 基础能力
+  └─ ④ WebhookEndpoint 数据表
+  └─ ⑤ dispatcher（HTTP POST + HMAC 签名 + 超时）
+  └─ ⑥ 端点 CRUD + 测试 API
+
+阶段 3：可靠性增强
+  └─ ⑦ 指数退避重试队列
+  └─ ⑧ WebhookDeliveryLog 表
+  └─ ⑨ 死信队列 + 人工重放 UI
+
+阶段 4：质量完善
+  └─ ⑩ 告警静默 / 抑制 / 合并
+  └─ ⑪ 出向令牌桶限流（防被封禁）
+  └─ ⑫ 告警触发时自动截图 / 指标快照链接
 ```
-
-### 7.2 关键协作风险
-
-| 环节 | 协作接口 | 风险点 | 严重程度 |
-|------|----------|--------|----------|
-| 阈值匹配 → 告警触发 | Goal 报告无阈值配置 | 无法自动触发告警 | 高 |
-| 签名校验 → 权限判断 | checkAuth 返回 null | 无法区分失败原因 | 中 |
-| 防重放 → 数据统计 | salt 轮换边界 | 数据统计不准 | 中 |
-| 节流 → 请求处理 | rateLimit 未使用 | 可能被流量攻击 | 高 |
-| 失败重试 → 数据一致性 | Kafka 失败静默 | 数据丢失 | 高 |
-| 外部格式 → 消费方 | 字段命名不一致 | 集成困难 | 中 |
-
-### 7.3 最容易漏掉的异常分支 Top 5
-
-1. **Kafka 发送失败静默吞错**：消息丢失但无任何告警，最危险
-2. **带 timestamp 的请求跳过期校验**：可被利用绕过防重放机制
-3. **INCR 与 EXPIRE 非原子操作**：Redis 限流可能永久失效
-4. **JWT Token 无过期时间**：token 泄露后长期有效
-5. **字段截断无声失败**：URL/标题超长被截断但无日志
 
 ---
 
-## 8. 改进建议
+## 10. 总结
 
-### 8.1 阈值匹配
-- 为 Goal 报告增加告警阈值配置
-- 支持按网站/用户自定义性能阈值
-- 边界值处理文档化
-
-### 8.2 签名校验
-- 强制 JWT 设置过期时间
-- 区分不同类型的校验失败（返回具体错误码）
-- 加密密钥与签名密钥分离
-
-### 8.3 防重放
-- 引入 nonce 机制，请求唯一标识去重
-- 修复 timestamp 绕过问题
-- 使用滑动窗口替代固定窗口
-
-### 8.4 节流
-- 将 rateLimit 应用于核心收集接口
-- 使用 Lua 脚本保证 INCR+EXPIRE 原子性
-- Redis 故障时降级策略
-
-### 8.5 失败重试
-- Kafka 发送失败抛出异常或回调通知
-- 添加指数退避重试机制
-- 引入死信队列
-- 本地持久化失败消息
-
-### 8.6 外部通知格式
-- 定义标准 Webhook 告警格式（含告警类型、级别、详情、恢复通知）
-- API 版本化管理
-- 统一字段命名规范
-- 添加请求/响应 Trace ID 便于排查
+| 项目 | 当前状态 | 关键问题 |
+|------|----------|---------|
+| **告警规则** | ❌ 完全不存在 | 无数据表、无评估引擎、无触发 API |
+| **Webhook 投递** | ❌ 完全不存在 | 无端点表、无投递器、无签名与重试 |
+| **阈值匹配** | ⚠️ 仅评级展示用 | Web Vitals 有常量但无告警联动；Goal 无阈值配置 |
+| **签名验证** | ✅ 认证场景完善 | 但静默吞异常 + 无过期，不可直接套用到 Webhook |
+| **防重放** | ⚠️ 数据采集去重层面 | session/visit 机制，无请求级 nonce；有 timestamp 绕过漏洞 |
+| **节流** | ⚠️ 函数存在但未调用 | rateLimit 没挂到任何 API；INCR+EXPIRE 非原子 |
+| **失败重试** | ❌ 几乎为零 | Kafka 静默吞错最危险；无死信队列 |
+| **外部通知格式** | ❌ 无标准 | 需全新设计，建议参考 CloudEvents 1.0 |
