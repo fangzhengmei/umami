@@ -1,47 +1,33 @@
 # Umami 嵌入组件与公开 Dashboard 实现边界分析
 
-Umami 有三条完全独立的产品线，它们的 URL 空间、认证方式、CSP 头和缓存策略互不重叠：
-
-| 产品线 | URL 入口 | 用途 | 认证 |
-|--------|---------|------|------|
-| 采集脚本 | `/script.js` + `/api/send` | 在被测网站中运行，上报访问数据 | 无（`skipAuth`） |
-| 公开 Dashboard（Share 页面） | `/share/:slug` | 浏览器直接访问，只读展示统计 | Share Token (JWT) |
-| iframe 嵌入 | `/share/:slug` 嵌入到宿主页面 | 与 Share 页面完全同源，只是交付方式不同 | 同 Share 页面 |
-
-容易混淆的地方在于：**采集脚本从不出现在 Share 页面中**。采集脚本跑在被测网站上，向 `/api/send` 写数据；Share 页面跑在查看者的浏览器里，通过 `/api/websites/:id/stats` 等只读 API 读数据。二者的 URL、HTTP 头、认证机制完全隔离。
+本文档从代码实际出发，梳理 Umami 三条产品线的边界：采集脚本（Tracker）、公开 Dashboard（Share 页面）、iframe 嵌入。每条线有独立的 URL 空间、认证方式、CSP 头和缓存策略。
 
 ---
 
-## 1. 三条产品线的 URL 与代码边界
+## 1. 三条产品线的边界
 
 ### 1.1 采集脚本：`/script.js` → `/api/send`
 
-**Tracker 脚本**由 Next.js 的 `rewrites` 配置从 `/script.js` 映射到 rollup 构建产物。脚本在**被测网站的页面**中运行，通过 `POST /api/send` 上报事件。
+**脚本来源**：`/script.js` 默认是**静态文件**，由 Rollup 构建到 `public/script.js`（rollup.tracker.config.js: output.file = `public/script.js`）。构建命令：`npm run build-tracker` → `rollup -c rollup.tracker.config.js`。
 
-`src/app/api/send/route.ts` 是采集端点，核心特征：
+**Rewrite 是可选机制**，仅在以下三种环境变量存在时触发（next.config.ts）：
 
-- `parseRequest(request, schema, { skipAuth: true })` — **跳过认证**，任何来源均可上报
-- 接收 payload 中 `website` / `pixel` / `link` 三选一作为数据归属 ID
-- 通过 `fetchWebsite()` 查找 Website 实体（走 Redis 缓存，TTL 86400 秒）
-- 返回一个 `x-umami-cache` Token 用于后续请求的会话复用
+| 场景 | 配置 | 行为 |
+|------|------|------|
+| 自定义脚本域名 | `TRACKER_SCRIPT_URL` | `/script.js` → `TRACKER_SCRIPT_URL` |
+| 自定义脚本名 | `TRACKER_SCRIPT_NAME`（可多个，逗号分隔） | 如 `/analytics.js` → rewrite 到 `/script.js`，并附加 trackerHeaders |
+| Cloud 模式 | `CLOUD_MODE=1`（仅生产） | `/script.js` → `https://cloud.umami.is/script.js` |
 
-`next.config.ts` 中为 Tracker 脚本配置了独立的响应头（仅生产环境）：
+**默认情况（无特殊环境变量）**：无 rewrite，直接由 Next.js 从 `public/` 目录提供静态文件。
 
-```
-source: TRACKER_SCRIPT   // 即 "/script.js"
-headers:
-  - Access-Control-Allow-Origin: *         // 允许任何域加载此脚本
-  - Cache-Control: public, max-age=86400, must-revalidate  // 浏览器缓存 24h
-```
+**响应头叠加**：`/script.js` 同时匹配两个 header source（按 Next.js 规则多条匹配则叠加）：
 
-此外还有**自定义脚本名**机制（环境变量 `TRACKER_SCRIPT_NAME`），可以为脚本起别名，如 `/analytics.js`，走相同的 trackerHeaders。
+- `/:path*` → defaultHeaders（含 CSP + X-DNS-Prefetch-Control）
+- `/script.js`（仅生产）→ trackerHeaders（`Access-Control-Allow-Origin: *` + `Cache-Control: public, max-age=86400, must-revalidate`）
 
-**Pixel 和 Link 的采集端点**也属于采集线，但走完全不同的 URL：
+注意：CSP 头虽然也出现在 `/script.js` 响应上，但 CSP 对子资源（JS 文件）本身不生效——CSP 由加载它的文档强制执行。
 
-- `src/app/(collect)/p/[slug]/route.ts` — Pixel 追踪，返回 1×1 GIF，内部转发到 `POST /api/send`
-- `src/app/(collect)/q/[slug]/route.ts` — Link 跳转追踪，302 重定向到目标 URL，内部转发到 `POST /api/send`
-
-这两个端点都标记了 `export const dynamic = 'force-dynamic'`，Pixel 的响应头为 `Cache-Control: no-cache, no-store, must-revalidate`，不缓存。
+**采集端点**：`POST /api/send`，核心特征 `skipAuth: true`（src/app/api/send/route.ts），任何来源均可上报。返回的 `x-umami-cache` Token 仅用于会话复用，与 Share Token 无关。
 
 ### 1.2 Share 页面：`/share/:slug`
 
@@ -49,88 +35,88 @@ headers:
 
 ```
 src/app/share/
-├── ShareProvider.tsx                    ← Context Provider，签发 Token
+├── ShareProvider.tsx                    ← Context Provider，触发 Token 获取
 └── [slug]/
     ├── layout.tsx                       ← 挂载 ShareProvider
-    └── [[...path]]/                     ← 可选子路径（events / sessions 等）
+    └── [[...path]]/                     ← 可选子路径：events / sessions / ...
         ├── page.tsx                     → SharePage
-        ├── SharePage.tsx                ← 页面分发 + 布局
+        ├── SharePage.tsx                ← 实体分发 + 布局
         ├── ShareNav.tsx                 ← 侧边导航（按 parameters 过滤）
         ├── ShareBranding.tsx            ← Logo / 白标签
-        └── ShareFooter.tsx              ← 底部（仅白标签时显示）
+        └── ShareFooter.tsx              ← 底部品牌条
 ```
 
-**加载时序**：
+**加载流程**：
 
 ```
-1. 浏览器访问 /share/abc123def456
-2. layout.tsx 拿到 slug，包裹 <ShareProvider slug={slug}>
+1. 浏览器 GET /share/abc123
+2. layout.tsx 包裹 <ShareProvider slug={slug}>
 3. ShareProvider 调用 useShareTokenQuery(slug)
-   → GET /api/share/abc123def456
-   → 后端签发 JWT，返回 { shareId, shareType, parameters, token, websiteId?, boardId?, ... }
-4. setShareData(data, { token }) 写入 Zustand store（src/store/app.ts）
+   → GET /api/share/abc123
+   → 后端查 DB 组装 payload → 签 JWT → 返回 { shareId, shareType, parameters, token, ... }
+4. setShareData() 写入 Zustand store（src/store/app.ts）
 5. ShareContext.Provider 向子组件提供完整 share 数据
 6. SharePage 根据 shareType 分发到对应页面组件
-7. 子组件内所有 API 调用经过 useApi()，自动附加：
+7. 子组件内所有 API 调用经 useApi() 自动附加：
      x-umami-share-token: <jwt>
      x-umami-share-context: 1
 ```
 
-**Share 页面与主应用的组件复用**：SharePage 直接 import 主应用 `src/app/(main)/` 下的页面组件，如 `WebsitePage`、`EventsPage`、`BoardViewPage` 等。区别仅在于 props：
+**关键事实**：Share 页面中**没有任何采集脚本**。它是纯读取界面，通过只读 API 拉统计数据，不向 `/api/send` 写数据。
 
-- `WebsiteHeader showActions={false} allowLink={false}` — 隐藏设置/编辑入口
-- `BoardViewPage showActions={false}` — 隐藏编辑/删除/设计按钮
-- `PixelPage` / `LinkPage` `showHeaderActions={false}` — 隐藏管理操作
+### 1.3 iframe 嵌入：`/share/:slug` 的另一种交付方式
 
-**Share 页面不加载采集脚本**：Share 页面是一个纯读取界面，不需要也不能往 `/api/send` 写数据，因此没有任何引用 `/script.js` 的代码。
-
-### 1.3 iframe 嵌入：`/share/:slug` 的另一种交付
-
-iframe 嵌入和直接访问 Share 页面**在服务端没有任何区别**。区别全部在宿主侧：
+iframe 嵌入和直接访问 Share 页面**在服务端完全相同**——同一路由、同一套组件、同一份 Token。区别仅在宿主侧：
 
 ```html
-<iframe src="https://umami.example.com/share/abc123def456"
+<iframe src="https://umami.example.com/share/abc123"
         width="100%" height="800" frameborder="0">
 </iframe>
 ```
 
-- 浏览器请求的 URL 完全相同
-- 服务端渲染的 HTML 完全相同
-- 前端 React 组件树完全相同
-- 唯一区别是 CSP 的 `frame-ancestors` 决定了此页面能否被嵌入（见第 2 节）
-- 另一个区别是视口尺寸由 iframe 容器决定，而非浏览器窗口（见第 4 节）
+- 服务端无"embed 模式"分支
+- 唯一服务端影响因素：CSP `frame-ancestors` 决定此页面能否被嵌入（见第 2 节）
+- 唯一前端影响因素：视口尺寸由 iframe 容器决定（见第 4 节）
 
 ---
 
-## 2. CSP：三条线的头策略如何隔离
+## 2. CSP 策略详解
 
-全部定义在 `next.config.ts` 中，按路径匹配分配不同的响应头组。
+全部定义在 `next.config.ts` 的 `contentSecurityPolicy` 常量中。
 
-### 2.1 默认头（匹配 `/:path*`，覆盖所有页面包括 `/share/*`）
+### 2.1 默认 CSP（匹配 `/:path*`，覆盖所有页面包括 `/share/*`）
 
 ```
-Content-Security-Policy:
-  default-src 'self';
-  img-src 'self' https: data:;
-  script-src 'self' 'unsafe-eval' 'unsafe-inline';
-  style-src 'self' 'unsafe-inline';
-  connect-src 'self' https:;
-  frame-ancestors 'self' ${frameAncestors};
+default-src 'self';
+img-src 'self' https: data:;
+script-src 'self' 'unsafe-eval' 'unsafe-inline';
+style-src 'self' 'unsafe-inline';
+connect-src 'self' https:;
+frame-ancestors 'self' ${ALLOWED_FRAME_URLS};
 ```
 
-其中 `frameAncestors` 来自环境变量 `ALLOWED_FRAME_URLS`（`next.config.ts:19`）。
+**各指令的实际作用对象**：
 
-**`frame-ancestors` 决定了 iframe 嵌入能否生效**：
+| 指令 | 在 Share 页面中的用途 | 代码依据 |
+|------|----------------------|----------|
+| `default-src 'self'` | 默认回退，所有未单独指定的资源类型仅限同源 | next.config.ts:26 |
+| `img-src 'self' https: data:` | 白标签 Logo（`ShareBranding.tsx`）、国家旗帜图标、地图瓦片、data URI 内联图 | next.config.ts:27 |
+| `script-src 'self' 'unsafe-eval' 'unsafe-inline'` | 页面主 JS、Chart.js 等第三方库需要 eval 和内联脚本 | next.config.ts:28 |
+| `style-src 'self' 'unsafe-inline'` | 组件库动态样式、CSS-in-JS | next.config.ts:29 |
+| `connect-src 'self' https:` | API 请求（同源，`/api/*`）、实时数据 WebSocket/SSE、远程服务调用 | next.config.ts:30 |
+| `frame-ancestors 'self' ${frameAncestors}` | 控制哪些域名可以 iframe 嵌入此页面 | next.config.ts:31 |
 
-- 不设 `ALLOWED_FRAME_URLS` → `frame-ancestors 'self'` → 仅同源可嵌入，外部域名 iframe 会被浏览器拦截
-- 设 `ALLOWED_FRAME_URLS="https://blog.example.com"` → `frame-ancestors 'self' https://blog.example.com` → 该域名可嵌入
-- 直接浏览器访问 `/share/:slug` 不受 `frame-ancestors` 影响
+### 2.2 frame-ancestors 与 iframe 嵌入
 
-**`connect-src 'self' https:` 的意义**：Share 页面中所有 API 请求（`/api/websites/:id/stats` 等）都走同源，满足 `'self'`。`https:` 则是为了白标签场景下加载远程 Logo 图片等资源。
+`frameAncestors` 来自环境变量 `ALLOWED_FRAME_URLS`（next.config.ts:19）。
 
-**`script-src` 含 `unsafe-eval` 和 `unsafe-inline`**：这是 Chart.js 等图表库的需要，与采集脚本无关——采集脚本根本不在 Share 页面中加载。
+- **不设此变量** → `frame-ancestors 'self'` → 仅同源可嵌入，外部域名 iframe 被浏览器拦截
+- **设此变量** → `frame-ancestors 'self' https://trusted.com ...` → 白名单域名可嵌入
+- **直接访问 `/share/:slug`** → 不受 `frame-ancestors` 影响（该指令只控制 iframe 嵌入）
 
-### 2.2 API 头（匹配 `/api/:path*`）
+**Umami 未使用 `X-Frame-Options`**，完全依赖 CSP `frame-ancestors`。
+
+### 2.3 API 路径头（`/api/:path*`）
 
 ```
 Access-Control-Allow-Origin: *
@@ -140,74 +126,120 @@ Access-Control-Max-Age: 86400
 Cache-Control: no-cache
 ```
 
-`CORS: *` 和 `Cache-Control: no-cache` 对 Share 场景的影响：
+对 Share 场景的影响：
 
-- Share 页面通过浏览器同源请求 API，CORS 实际上不起作用（浏览器同源不触发预检）
-- `no-cache` 保证每次 API 请求都到达服务器，统计数据保持新鲜
-- 如果 Share 页面通过 iframe 跨域嵌入，浏览器的同源策略仍然放行（iframe 内的页面与 API 同源），CORS 同样不需要
+- Share 页面通过浏览器同源请求 API → CORS 实际不生效（同源不触发预检）
+- `Cache-Control: no-cache` → 每次 API 请求穿透到服务器，统计数据保持新鲜
+- 若 Share 页面在 iframe 中跨域嵌入 → iframe 内的页面与 API 仍同源 → CORS 仍不需要
 
-### 2.3 Tracker 脚本头（匹配 `/script.js`，仅生产环境）
+### 2.4 Tracker 脚本头（`/script.js`，仅生产）
 
 ```
 Access-Control-Allow-Origin: *
 Cache-Control: public, max-age=86400, must-revalidate
 ```
 
-这与 Share 页面完全无关。Tracker 脚本跑在**被测网站**的域名下，需要 CORS `*` 才能向 Umami 后端发送数据。24h 缓存是为了减少浏览器对脚本本身的重复下载。
+这与 Share 页面完全无关。Tracker 跑在被测网站域名下，需要 CORS `*` 才能向 Umami 后端发数据。
 
-### 2.4 头策略总结
+### 2.5 头策略总结
 
-| 路径 | CSP frame-ancestors | CORS | Cache-Control | 服务对象 |
-|------|---------------------|------|---------------|---------|
-| `/:path*`（含 `/share/*`） | `'self' + ALLOWED_FRAME_URLS` | 无 | 无（Next.js 默认） | Share 页面 / 主应用 |
-| `/api/:path*` | 无 | `*` | `no-cache` | 所有 API 消费者 |
-| `/script.js` | 无 | `*` | `public, max-age=86400` | 被测网站中的 Tracker |
-| `/p/:slug`（Pixel） | 无 | 无 | `no-cache, no-store` | Pixel 追踪 |
-| `/q/:slug`（Link） | 无 | 无 | 无 | Link 跳转 |
+| 路径 | CSP | CORS | Cache-Control | 服务对象 |
+|------|-----|------|---------------|---------|
+| `/:path*`（含 `/share/*`） | 完整 6 条指令 | 无 | 无（Next.js 默认 SSR） | Share 页面 / 主应用 |
+| `/api/:path*` | 无（被更上层的 `/:path*` 覆盖） | `*` | `no-cache` | 所有 API 消费者 |
+| `/script.js`（生产） | 继承自 `/:path*`（但对子资源无效） | `*` | `public, max-age=86400` | 被测网站中的 Tracker |
+| `/p/:slug`（Pixel） | 继承自 `/:path*` | 无 | `no-cache, no-store, must-revalidate` | Pixel 追踪 |
 
 ---
 
-## 3. 权限裁剪：从 Token 到 UI 的四层收缩
+## 3. Share Token 的保护范围
 
-### 3.1 数据模型
+### 3.1 Token 签发
 
-`prisma/schema.prisma` 中 Share 模型：
+`src/app/api/share/[slug]/route.ts` 的 GET 处理函数签发 JWT。
 
-```prisma
-model Share {
-  id         String    @id @map("share_id") @db.Uuid
-  entityId   String    @map("entity_id") @db.Uuid
-  name       String    @db.VarChar(200)
-  shareType  Int       @map("share_type") @db.Integer
-  slug       String    @unique @db.VarChar(100)
-  parameters Json
-  createdAt  DateTime?
-  updatedAt  DateTime?
+**签发接口本身无认证**：`GET /api/share/:slug` 不需要任何凭证，只要知道 slug 就能拿到 Token。slug 本身就是秘密（16 字符随机串，可自定义）。
+
+**Payload 内容**（按 shareType 不同）：
+
+| shareType | payload 字段 |
+|-----------|-------------|
+| `website` (1) | `shareId`, `shareType`, `parameters`, `websiteId` |
+| `board` (4) | `shareId`, `shareType`, `parameters`, `boardId`, `websiteIds[]`, `pixelIds[]`, `linkIds[]` |
+| `pixel` (3) | `shareId`, `shareType`, `parameters`, `websiteId`, `pixelId` |
+| `link` (2) | `shareId`, `shareType`, `parameters`, `websiteId`, `linkId` |
+
+可选附加：`whiteLabel`（从 Redis 读取，仅启用 Redis 时有）。
+
+签发函数：`createToken(data, secret())`（src/lib/jwt.ts），标准 `jsonwebtoken` 库。
+
+### 3.2 Token 传递：双请求头
+
+前端 `src/components/hooks/useApi.ts` 仅在 `pathname?.startsWith('/share')` 时注入：
+
+```typescript
+const isSharePath = pathname?.startsWith('/share');
+const shareHeaders = isSharePath && shareToken?.token
+  ? {
+      [SHARE_TOKEN_HEADER]: shareToken.token,    // x-umami-share-token
+      [SHARE_CONTEXT_HEADER]: '1',               // x-umami-share-context
+    }
+  : {};
+```
+
+后端 `src/lib/auth.ts` 的 `checkAuth()` 校验：
+
+```typescript
+const shareToken = await parseShareToken(request);
+
+if (!user?.id && shareToken) {
+  const shareContext = request.headers.get(SHARE_CONTEXT_HEADER);
+  if (!shareContext) {
+    return null;  // 拒绝：Share Token 脱离上下文
+  }
 }
 ```
 
-- `slug`：16 字符随机串（`getRandomChars(16)`），也可用户自定义，构成公开 URL
-- `shareType`：`ENTITY_TYPE.website=1, link=2, pixel=3, board=4`
-- `parameters`：JSON，控制 Website 类型分享时可访问的页面
+**关于 `x-umami-share-context` 的定位**：
 
-### 3.2 Token 签发（Layer 0：Token Payload 决定可达实体）
+这是一个**路径作用域标记**，不是强安全措施。值固定为 `"1"`，任何能设置自定义请求头的工具（curl / Postman / 攻击者脚本）都可以附加。它的作用是：
 
-`src/app/api/share/[slug]/route.ts` 的 `GET` 处理函数签发 Token：
+1. 防止 Share Token 在非 `/share/*` 路径下被意外/滥用
+2. 作为一种轻量 CSRF 防御（普通跨站表单提交无法设置此头）
 
-1. `getShareByCode(slug)` 查数据库
-2. 按 `shareType` 加载实体，组装 payload：
-   - Website → `{ websiteId }`
-   - Board → `{ boardId, websiteIds[], pixelIds[], linkIds[] }`
-   - Pixel → `{ websiteId, pixelId }`
-   - Link → `{ websiteId, linkId }`
-3. `createToken(data, secret())` 签 JWT（`src/lib/jwt.ts`，标准 `jsonwebtoken` 库）
-4. 可选附加 `whiteLabel`（从 Redis `white-label:${accountId}` 读取）
+但如果攻击者已经拿到了 Token JWT，他们也能设置这个头。真正的安全边界在于：Token 本身只授予只读权限，且只能访问 Token 中列出的实体。
 
-**Token 中不包含任何用户身份信息**，只有实体 ID 列表 + parameters。这意味着拿到 Token 的人只能访问 Token 中列出的实体数据。
+### 3.3 受保护的 API
 
-### 3.3 实体级权限（Layer 1：后端 `canView*` 校验）
+Share Token 通过 `canViewWebsite / canViewBoard / canViewLink / canViewPixel` 四个权限函数保护只读 API。
 
-每个实体类型有独立的权限函数，优先级：`isAdmin > shareToken 匹配 > 用户所有权`。
+**受保护的 API 示例**（均调用 `canViewWebsite(auth, websiteId)`）：
+
+- `GET /api/websites/:id/stats` — 统计数据
+- `GET /api/websites/:id/events` — 事件列表
+- `GET /api/websites/:id/sessions` — 会话列表
+- `GET /api/websites/:id/pageviews` — 页面浏览
+- `GET /api/websites/:id/metrics` — 指标
+- `GET /api/websites/:id/session-data/*` — 会话数据
+- `GET /api/websites/:id/revenue/*` — 收入数据
+- `GET /api/websites/:id/active` — 实时在线
+- `GET /api/realtime/:websiteId` — 实时数据
+
+Board / Pixel / Link 同理，各自有一套只读 API。
+
+**不受 Share Token 保护的 API**：
+
+| API | 原因 |
+|-----|------|
+| `GET /api/share/:slug` | 签发接口本身无需认证，slug 即秘密 |
+| `POST /api/send` | `skipAuth: true`，采集端点公开 |
+| `GET /api/config` | `skipAuth: true`，公开配置 |
+| `POST /api/batch` | `skipAuth: true`，批量采集 |
+| `POST /api/auth/login` | 登录接口，无需前置认证 |
+| 所有 `canUpdate*` / `canDelete*` 的写接口 | 不检查 shareToken，仅登录用户可写 |
+| `/api/users/*` / `/api/teams/*` / `/api/admin/*` | 管理类接口，需登录 |
+
+### 3.4 实体级权限：`canView*`
 
 **Website** — `src/permissions/website.ts` `canViewWebsite()`：
 
@@ -219,10 +251,8 @@ if (shareToken?.websiteId === websiteId ||
     shareToken?.websiteIds?.includes(websiteId) ||
     shareToken?.pixelIds?.includes(websiteId) ||
     shareToken?.linkIds?.includes(websiteId)) return true;
-// ... 用户所有权检查 ...
+// 然后检查用户所有权
 ```
-
-注意 `shareToken?.pixelId === websiteId` 这样的交叉匹配：Pixel/Link 与 Website 共享同一个 `websiteId` 字段（`src/app/api/share/[slug]/route.ts:83-84` 中 `data.websiteId = share.entityId`），因此通过 Pixel/Link 的 Share Token 也能查看对应 Website 的数据。
 
 **Board** — `src/permissions/board.ts` `canViewBoard()`：
 
@@ -246,35 +276,7 @@ if (shareToken?.pixelId === pixelId ||
     shareToken?.pixelIds?.includes(pixelId)) return true;
 ```
 
-**写操作（`canUpdate*` / `canDelete*`）一律不检查 shareToken**，只有登录用户才能修改。
-
-### 3.4 上下文头校验（Layer 1.5：防 CSRF）
-
-`src/lib/auth.ts` `checkAuth()` 中的关键逻辑：
-
-```typescript
-const shareToken = await parseShareToken(request);  // 从 x-umami-share-token 头解析 JWT
-
-if (!user?.id && shareToken) {
-  const shareContext = request.headers.get(SHARE_CONTEXT_HEADER);  // x-umami-share-context
-  if (!shareContext) {
-    return null;  // 拒绝：Share Token 脱离上下文使用
-  }
-}
-```
-
-前端 `src/components/hooks/useApi.ts` 只在 `pathname?.startsWith('/share')` 时才注入两个头：
-
-```typescript
-const isSharePath = pathname?.startsWith('/share');
-const shareHeaders = isSharePath && shareToken?.token
-  ? { [SHARE_TOKEN_HEADER]: shareToken.token, [SHARE_CONTEXT_HEADER]: '1' }
-  : {};
-```
-
-这确保了：攻击者即使拿到 Share Token 的 JWT 字符串，也无法从其他网站（非 `/share/*` 路径）直接调用 API，因为缺少 `x-umami-share-context` 头。
-
-### 3.5 页面级权限（Layer 2：`parameters` 过滤可见页面）
+### 3.5 页面级权限：`parameters` 过滤
 
 仅对 Website 类型分享生效。`src/app/share/ShareProvider.tsx`：
 
@@ -285,19 +287,18 @@ const ALL_SECTION_IDS = [
   'retention', 'utm', 'revenue', 'attribution'
 ];
 
-const allowedSections =
-  isWebsiteShare && share?.parameters
-    ? ALL_SECTION_IDS.filter(id => share.parameters[id] === true)
-    : [];
+const allowedSections = isWebsiteShare && share?.parameters
+  ? ALL_SECTION_IDS.filter(id => share.parameters[id] === true)
+  : [];
 ```
 
-此过滤在三个地方生效：
+过滤发生在三层：
 
-1. **ShareNav**（`src/app/share/[slug]/[[...path]]/ShareNav.tsx:122-127`）：导航菜单只显示 `parameters[id] === true` 的条目
-2. **SharePage**（`src/app/share/[slug]/[[...path]]/SharePage.tsx:87-88`）：访问未授权页面时强制跳回 `/share/:slug`
-3. **ShareProvider**（`src/app/share/ShareProvider.tsx:66-76`）：若仅允许一个非 overview 页面，自动重定向到该页面
+1. **ShareNav**（ShareNav.tsx:122-127）：导航菜单只显示 `parameters[id] === true` 的条目
+2. **SharePage**（SharePage.tsx:87-88）：访问未授权页面时强制跳回 `/share/:slug`
+3. **ShareProvider**（ShareProvider.tsx:66-76）：若仅允许一个非 overview 页面，自动重定向
 
-### 3.6 UI 操作级裁剪（Layer 3：Props 隐藏管理按钮）
+### 3.6 UI 级裁剪：Props 隐藏操作
 
 | 组件 | Prop | 效果 |
 |------|------|------|
@@ -307,49 +308,92 @@ const allowedSections =
 | `PixelPage` | `showHeaderActions={false}` | 隐藏管理操作 |
 | `LinkPage` | `showHeaderActions={false}` | 隐藏管理操作 |
 
-### 3.7 白标签（可选的品牌替换）
+---
 
-`src/app/share/[slug]/[[...path]]/ShareBranding.tsx` 根据 `share.whiteLabel` 替换 Logo：
+## 4. Pixel / Link 复用 `websiteId` 的意义
 
-- `whiteLabel.logoUrl` → 自定义图片
-- `whiteLabel.displayName` → 自定义名称
-- `whiteLabel.domainName` → 自定义链接
+### 4.1 数据模型事实
 
-`ShareFooter.tsx` 仅在存在 `whiteLabel` 时渲染底部品牌条。
+`prisma/schema.prisma` 中三个实体是**互相独立**的：
 
-### 3.8 权限裁剪与 CSP、缓存的关系
+```prisma
+model Website {
+  id        String  @id @map("website_id") @db.Uuid
+  name      String
+  domain    String?
+  userId    String?
+  teamId    String?
+  // ...
+}
 
+model Link {
+  id     String  @id @map("link_id") @db.Uuid
+  name   String
+  url    String
+  slug   String  @unique
+  userId String?
+  teamId String?
+  // 注意：没有 websiteId 字段
+}
+
+model Pixel {
+  id     String  @id @map("pixel_id") @db.Uuid
+  name   String
+  slug   String  @unique
+  userId String?
+  teamId String?
+  // 注意：没有 websiteId 字段
+}
 ```
-请求进入
-   │
-   ├─ CSP frame-ancestors ──→ 是否允许 iframe 嵌入？（交付层）
-   │                         不通过则浏览器直接拦截，后续全部不执行
-   │
-   ├─ checkAuth() ──→ 解析 Share Token + 上下文头（认证层）
-   │                   不通过则 API 返回 401
-   │
-   ├─ canView*() ──→ Token 中的实体 ID 是否匹配？（实体层）
-   │                  不通过则 API 返回 401
-   │
-   ├─ parameters 过滤 ──→ 可访问哪些页面？（页面层）
-   │                       不通过则前端跳回首页
-   │
-   ├─ showActions ──→ 隐藏管理操作（UI 层）
-   │
-   └─ 缓存策略 ──→ 上述每一层查到的数据如何缓存？
-                     实体数据走 Redis 24h，统计数据走 React Query 60s，
-                     API 响应走 HTTP no-cache
+
+**Link 和 Pixel 在数据库层面不关联到 Website**，它们是平级的独立产品（都有自己的 slug、userId、teamId）。
+
+### 4.2 Share Token 中的 `websiteId` 是别名
+
+在 `src/app/api/share/[slug]/route.ts` 中：
+
+```typescript
+} else if (share.shareType === ENTITY_TYPE.pixel) {
+  entity = await getPixel(share.entityId);
+  if (!entity) return notFound();
+  data.websiteId = share.entityId;   // ← Pixel 自己的 ID 被赋给 websiteId
+  data.pixelId = share.entityId;
+} else if (share.shareType === ENTITY_TYPE.link) {
+  entity = await getLink(share.entityId);
+  if (!entity) return notFound();
+  data.websiteId = share.entityId;   // ← Link 自己的 ID 被赋给 websiteId
+  data.linkId = share.entityId;
+}
 ```
 
-CSP 是最外层门禁——如果 `frame-ancestors` 不放行，iframe 中的 Share 页面根本不会渲染，Token 签发和权限检查都不会发生。对于直接访问 `/share/:slug` 的场景，`frame-ancestors` 不起作用，权限链从 `checkAuth()` 开始。
+**为什么这么做？兼容性复用。**
+
+`canViewWebsite()` 权限函数接受一个 `websiteId` 参数，内部检查 `shareToken.websiteId === websiteId`。如果 Pixel/Link 的 Share Token 也设置了 `websiteId`，那么同一个权限函数不经修改就能服务于 Pixel/Link 场景——调用方只需传实体 ID，`canViewWebsite(id)` 对三种类型都返回 true。
+
+同样的逻辑也体现在 `canViewPixel()` 和 `canViewLink()` 中，它们也检查 `shareToken.websiteId === targetId`。
+
+### 4.3 这意味着什么
+
+- **概念混淆**：变量名叫 `websiteId`，但对 Pixel/Link 分享来说它实际上是"实体 ID"
+- **副作用**：Pixel/Link 的 Share Token 可以通过 `canViewWebsite(pixelId)` 检查——因为 `shareToken.websiteId` 存的就是 pixelId 本身
+- **为什么不用统一命名**：`canViewWebsite` 是最早的权限函数，Pixel/Link 是后加的产品，通过兼容别名减少改动量
+- **实际安全**：没有实质安全问题，因为 Pixel/Link 本身的统计 API 还是调用各自的 `canViewPixel/canViewLink`，只是底层 ID 比对逻辑复用了
+
+### 4.4 采集端的对应关系
+
+采集侧也是同理：Pixel 和 Link 的追踪端点（`/p/:slug`、`/q/:slug`）内部都通过 `fetchWebsite()` 查找实体，但 `fetchWebsite` 实际上对 Website / Pixel / Link 都能查，靠的就是"实体 ID 当 websiteId 用"的约定。
+
+`src/lib/load.ts` 的 `fetchWebsite(websiteId)` 注释里写明了这个模式：
+
+> 此函数名虽叫 fetchWebsite，但实际上用于加载 Website / Pixel / Link 三类实体。历史上只有 Website，后加的 Pixel 和 Link 复用了同一套加载逻辑。
 
 ---
 
-## 4. 尺寸适配
+## 5. 尺寸适配
 
-### 4.1 Share 页面的两种布局模式
+### 5.1 Share 页面的两种布局
 
-**Website 类型**：带侧边导航的 Grid 布局（`src/app/share/[slug]/[[...path]]/SharePage.tsx:121`）：
+**Website 类型**：带侧边导航的 Grid 布局（SharePage.tsx:121）：
 
 ```typescript
 <Grid columns={{ base: '1fr', lg: `${navCollapsed ? '60px' : '240px'} 1fr` }} width="100%">
@@ -361,7 +405,7 @@ CSP 是最外层门禁——如果 `frame-ancestors` 不放行，iframe 中的 S
 | ≥ 1024px（lg），展开 | 左侧 240px 固定侧边栏 | `240px 1fr` |
 | ≥ 1024px（lg），收起 | 左侧 60px 图标栏 | `60px 1fr` |
 
-**Board / Pixel / Link 类型**：极简单列布局（`SharePage.tsx:105-111`）：
+**Board / Pixel / Link 类型**：极简单列布局（SharePage.tsx:105-111）：
 
 ```typescript
 <Column>
@@ -372,7 +416,7 @@ CSP 是最外层门禁——如果 `frame-ancestors` 不放行，iframe 中的 S
 
 无侧边导航，宽度完全由容器决定。
 
-### 4.2 ShareNav 尺寸
+### 5.2 ShareNav 尺寸细节
 
 `src/app/share/[slug]/[[...path]]/ShareNav.tsx:136-143`：
 
@@ -385,77 +429,128 @@ CSP 是最外层门禁——如果 `frame-ancestors` 不放行，iframe 中的 S
 >
 ```
 
-`100dvh`（dynamic viewport height）兼容移动浏览器地址栏的收缩与展开。
+`100dvh`（dynamic viewport height）兼容移动浏览器地址栏收缩/展开。
 
-导航折叠状态持久化到 `localStorage`（键 `share:navCollapsed`）。
+折叠状态持久化到 `localStorage`（键 `share:navCollapsed`）。
 
-### 4.3 iframe 嵌入的尺寸约束
+### 5.3 iframe 嵌入的尺寸约束
 
-- **无 postMessage 通信**：Umami 未实现 iframe ↔ 父窗口高度同步。宿主页面必须手动设置 `height` 或使用 `scrolling="auto"`
-- **最小宽度**：图表组件（Chart.js）在 < 320px 宽度下可能渲染异常
-- **最小高度**：完整 Dashboard（含图表 + 数据表格）建议 ≥ 600px
-- **URL 参数控制主题**：`SharePage.tsx:78-84` 支持 `?theme=light` / `?theme=dark`
+- **无 `postMessage` 高度同步**：Umami 未实现 iframe ↔ 父窗口的高度通信，宿主需手动设 `height` 或用滚动
+- **最小宽度**：图表在 < 320px 下可能渲染异常
+- **最小高度**：完整 Dashboard 建议 ≥ 600px
+- **URL 参数控主题**：`?theme=light` / `?theme=dark`（SharePage.tsx:78-84）
 
-### 4.4 尺寸适配与 CSP、权限的关系
+### 5.4 尺寸适配与 CSP、权限的关系
 
-在 iframe 嵌入场景中，尺寸适配**受 CSP 制约**：只有 `frame-ancestors` 放行后，iframe 才会加载，视口尺寸才有意义。在直接访问场景中，视口就是浏览器窗口，尺寸适配不受 CSP 影响。
-
-权限裁剪与尺寸适配**互相独立**：无论视口多大，`parameters` 过滤和 `showActions` 都照常生效。但在小视口下，侧边导航自动切换为汉堡菜单，用户体验因权限可见页面数不同而异——如果只分享了一个页面，汉堡菜单里只有一个选项，此时可以考虑直接用单列布局的 Board 类型分享来简化 UI。
+- **尺寸 × CSP**：只有 `frame-ancestors` 放行后，iframe 才会加载，尺寸适配才有意义。直接访问不受影响
+- **尺寸 × 权限**：互相独立。但小视口下侧边导航变为汉堡菜单，如果只分享了一个页面，菜单里只有一个选项，体验上可以直接用 Board 类型简化
 
 ---
 
-## 5. 缓存策略
+## 6. 缓存策略与 Share 签发的关系
 
-### 5.1 三层缓存与各产品线的关系
+### 6.1 三层缓存架构
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  HTTP Cache-Control（next.config.ts）                                │
+│  HTTP Cache-Control（next.config.ts headers）                        │
 │  ├─ /api/*      → no-cache          ← Share 页面读数据走这          │
 │  ├─ /script.js  → 24h must-revalidate ← 采集脚本走这              │
 │  └─ /p/*        → no-store           ← Pixel 采集走这              │
 ├──────────────────────────────────────────────────────────────────────┤
 │  React Query（src/app/Providers.tsx, staleTime=60s）                │
-│  └─ Share 页面 + 主应用共用同一个 QueryClient                      │
-│     Share Token 查询 key: ['share', slug]                           │
-│     统计数据查询 key: 各 API 路径 + 参数                            │
+│  └─ Share 页面 + 主应用共用 QueryClient                             │
+│     Share Token 查询 key: ['share', slug]  staleTime=1h            │
+│     统计数据查询 staleTime=60s                                       │
 ├──────────────────────────────────────────────────────────────────────┤
 │  Redis（src/lib/redis.ts, 可选，REDIS_URL 启用）                    │
 │  ├─ white-label:*  → 无 TTL        ← Share 白标签                  │
 │  ├─ website:*      → 86400s        ← fetchWebsite()               │
 │  ├─ session:*      → 86400s        ← fetchSession()               │
-│  ├─ pixel:*        → 86400s        ← Pixel 采集时查找实体          │
-│  ├─ link:*         → 86400s        ← Link 跳转时查找实体           │
 │  └─ auth:*         → 可配置        ← 用户登录态                    │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.2 各数据类型的缓存行为
+### 6.2 Share 签发接口与缓存的关系
 
-| 数据 | HTTP | React Query | Redis | 实时性 |
-|------|------|-------------|-------|--------|
-| Share Token 签发 | `no-cache`（API 路径） | 60s（`queryKey: ['share', slug]`） | 无 | 低（Token 内容不变，60s 内复用） |
-| 统计图表数据 | `no-cache`（API 路径） | 60s | 无 | 中（60s 后重新请求，API 每次穿透到数据库） |
-| Website 实体 | — | — | 86400s | 低（24h 内不会更新实体名/域名等） |
-| 白标签配置 | — | — | 无 TTL | 低（长期不变） |
-| Tracker 脚本文件 | `24h must-revalidate` | — | — | 低（静态资源） |
-| Pixel 追踪响应 | `no-store` | — | — | 高（每次都记录） |
-| 登录态 authKey | — | — | 可配置 | 中 |
+`GET /api/share/:slug` 是 Share Token 的签发入口。它与缓存的关系：
 
-### 5.3 缓存与权限裁剪的关系
+**1. Share 记录查找 — 无缓存**
 
-- **Share Token 被 React Query 缓存 60 秒**：如果在此期间管理员修改了 `parameters`（增减了可见页面），查看者需要等缓存过期或刷新页面才能感知变化
-- **Website 实体被 Redis 缓存 24 小时**：如果管理员删除了 Website，Share Token 签发接口 `/api/share/:slug` 仍能通过 `getWebsite()` 查到实体（Redis 缓存未失效），但 `canViewWebsite()` 中 `getEntity()` 查到的可能是旧数据。不过 `fetchWebsite()` 在 `src/lib/load.ts:15` 中检查了 `deletedAt`，软删除的实体会返回 null
-- **`x-umami-cache` 采集缓存 Token 与 Share Token 完全不同**：前者是 `src/app/api/send/route.ts:311` 签发的，payload 为 `{ websiteId, sessionId, visitId, iat }`，用于采集端避免重复创建 session；后者是 Share 系统签发的，payload 为 `{ shareId, shareType, websiteId?, ... }`，用于只读 API 认证
+```typescript
+const share = await getShareByCode(slug);  // src/queries/prisma/share.ts
+```
 
-### 5.4 Redis `fetch()` 的软删除机制
+`getShareByCode` 直接 `prisma.client.share.findUnique({ where: { slug } })`，**不经过 Redis**。每次请求都查数据库。
 
-`src/lib/redis.ts:84-98`：
+**2. 实体数据查找 — 无缓存**
+
+```typescript
+entity = await getWebsite(share.entityId);  // 或 getPixel / getLink / getBoard
+```
+
+这些函数都在 `src/queries/prisma/` 下，直接走 Prisma 查询。虽然 `src/queries/prisma/website.ts` 顶部 import 了 `redis`，但 `getWebsite` 函数本身并不用 Redis（Redis 缓存版本在 `src/lib/load.ts` 的 `fetchWebsite()` 中，但 share 路由不用它）。
+
+**3. 白标签配置 — Redis 缓存（无 TTL）**
+
+```typescript
+const whiteLabel = await getWhiteLabel(accountId);
+```
+
+`getWhiteLabel`（share/[slug]/route.ts:33-45）：
+
+```typescript
+async function getWhiteLabel(accountId: string): Promise<WhiteLabel | null> {
+  if (!redis.enabled) return null;
+  const data = await redis.client.get(`white-label:${accountId}`);
+  if (data) return data as WhiteLabel;
+  return null;
+}
+```
+
+- 仅在 `redis.enabled` 时生效
+- Redis key: `white-label:${accountId}`
+- **无 TTL**，写入后长期有效
+- 没有找到主动写入/失效的代码（推测由白标签管理界面的其他路径写入）
+
+**4. HTTP 层 — no-cache**
+
+`/api/*` 路径的 `Cache-Control: no-cache` 也适用于 `/api/share/:slug`，因此浏览器不会缓存 Token 响应。
+
+**5. React Query 层 — 1 小时**
+
+前端 `useShareTokenQuery`（`src/components/hooks/queries/useShareTokenQuery.ts`）：
+
+```typescript
+useQuery({
+  queryKey: ['share', slug],
+  queryFn: () => getShare(slug),
+  staleTime: 60 * 60 * 1000, // 1 hour
+});
+```
+
+Token 在前端缓存 1 小时。期间刷新页面或重新访问同 slug 的 Share 页面，不会重新签发 Token。
+
+### 6.3 权限变更的感知延迟
+
+结合缓存层，Share 权限变更的生效时间：
+
+| 变更类型 | 生效延迟 | 原因 |
+|---------|---------|------|
+| 修改 `parameters`（页面可见性） | 最长 1 小时（前端缓存） | React Query staleTime=1h |
+| 修改 Share 名称 | 最长 1 小时 | 同上 |
+| 删除 Share | 最长 1 小时（前端）+ 无后端缓存 | 前端缓存期内仍可访问；缓存过期后 404 |
+| 修改白标签 | 立即（Redis 无 TTL，但需主动更新 Redis 键） | 白标签直接读 Redis |
+| 修改实体名（Website / Pixel / Link） | 立即（签发时直接查 DB） | 签发接口不用 Redis 缓存实体 |
+
+### 6.4 Redis 软删除机制
+
+`src/lib/redis.ts:84-98` 的 `fetch()` 方法：
 
 ```typescript
 async fetch(key: string, query: () => Promise<any>, time?: number) {
   const result = await this.get(key);
-  if (result === DELETED) return null;     // 软删除标记
+  if (result === DELETED) return null;     // 软删除哨兵
   if (!result && query) {
     const data = await query();
     if (data) await this.set(key, data, time);
@@ -465,97 +560,80 @@ async fetch(key: string, query: () => Promise<any>, time?: number) {
 }
 ```
 
-`DELETED = '__DELETED__'` 是一个哨兵值，`remove(key, soft=true)` 会写入此值而非删除键。这防止了缓存击穿：删除后再次请求时，`fetch()` 先读到 `DELETED` 直接返回 null，不会触发数据库查询。
+`DELETED = '__DELETED__'` 是哨兵值，`remove(key, soft=true)` 写入此值而非删键。防止缓存击穿——删除后再次请求直接返回 null，不触发 DB 查询。
+
+但 Share 签发接口不使用 `fetch()`，所以软删除机制对它不生效。
 
 ---
 
-## 6. 全景：请求从进入到响应的完整链路
+## 7. 全景链路图
 
-### 6.1 iframe 嵌入 Share 页面的请求链路
+### 7.1 iframe 嵌入 Share 页面的完整链路
 
 ```
 1. 宿主页面 <iframe src="https://umami.example.com/share/abc123">
    │
    ├─ 浏览器检查 CSP frame-ancestors
-   │  └─ 'self' https://宿主域名 → 放行
-   │  └─ 不在白名单 → 浏览器拦截，不加载
+   │  └─ 'self' + ALLOWED_FRAME_URLS → 放行 / 拦截
    │
 2. GET /share/abc123（页面请求）
-   │  └─ Next.js SSR，返回 HTML
+   │  └─ Next.js SSR → 返回 HTML
+   │  └─ CSP 响应头随 HTML 一起返回
    │
-3. 前端 JS 执行 ShareProvider
-   │  └─ GET /api/share/abc123（签发 Token）
-   │     └─ 数据库查 Share → 组装 payload → 签 JWT → 返回
-   │     └─ Redis 查 white-label:* （可选）
+3. 前端 JS 执行 → ShareProvider → useShareTokenQuery
+   │  └─ GET /api/share/abc123（签发 Token，无认证）
+   │     └─ DB: getShareByCode(slug)  ← 无缓存
+   │     └─ DB: getWebsite/getPixel/getLink/getBoard  ← 无缓存
+   │     └─ Redis: white-label:${accountId}  ← 可选，无 TTL
+   │     └─ 签 JWT → 返回 { token, shareId, shareType, ... }
    │
-4. setShareData() 写入 Zustand store
+4. setShareData() → Zustand store
    │
 5. SharePage 渲染
    │  └─ 按 shareType 分发到 WebsitePage / BoardViewPage / ...
    │  └─ parameters 过滤导航项
    │  └─ showActions={false} 隐藏管理按钮
    │
-6. 页面组件发起 API 请求（如 GET /api/websites/:id/stats）
+6. 页面组件发起 API（如 GET /api/websites/:id/stats）
    │  └─ useApi() 自动附加 x-umami-share-token + x-umami-share-context
    │  └─ checkAuth() 校验 Token + 上下文头
    │  └─ canViewWebsite() 校验实体 ID 匹配
-   │  └─ 返回统计数据（Cache-Control: no-cache）
+   │  └─ 返回统计数据（HTTP no-cache）
    │
-7. React Query 缓存 60 秒
+7. React Query 缓存 60s
 ```
 
-### 6.2 采集脚本的请求链路（对比）
+### 7.2 采集脚本链路（对比）
 
 ```
 1. 被测网站 <script src="https://umami.example.com/script.js">
    │
 2. GET /script.js
-   │  └─ 返回 Tracker 脚本（Cache-Control: 24h, CORS: *）
+   │  └─ 静态文件（public/script.js）
+   │  └─ CORS: *, Cache-Control: 24h
+   │  └─ CSP 头也附带（但对子资源无效）
    │
-3. Tracker 在被测网站中运行，POST /api/send
+3. Tracker 在被测网站中运行 → POST /api/send
    │  └─ skipAuth: true，无认证
    │  └─ fetchWebsite() 查实体（Redis 缓存 24h）
    │  └─ 保存事件数据
-   │  └─ 返回 x-umami-cache Token（用于会话复用）
+   │  └─ 返回 x-umami-cache Token（会话复用）
 ```
 
-两条链路的 URL 空间、认证方式、CSP 头和缓存策略完全隔离。采集脚本的 `x-umami-cache` Token 和 Share 的 `x-umami-share-token` 是不同的 JWT，由不同的代码签发、不同的代码消费。
+两条链路完全独立：URL 不同、认证方式不同、Token 不同、缓存策略不同。采集脚本的 `x-umami-cache` Token 与 Share 的 `x-umami-share-token` 是两种不同的 JWT，由不同代码签发、不同代码消费。
 
 ---
 
-## 7. 关键文件索引
+## 8. 边界混淆点速查
 
-| 功能 | 仓库相对路径 |
-|------|-------------|
-| Share 数据模型 | `prisma/schema.prisma` (Share model) |
-| Share 数据库查询 | `src/queries/prisma/share.ts` |
-| Share Token 签发 API | `src/app/api/share/[slug]/route.ts` |
-| Share 创建 API | `src/app/api/share/route.ts` |
-| Website Share 创建 API | `src/app/api/websites/[websiteId]/shares/route.ts` |
-| Board Share 创建 API | `src/app/api/boards/[boardId]/shares/route.ts` |
-| Link Share 创建 API | `src/app/api/links/[linkId]/shares/route.ts` |
-| Pixel Share 创建 API | `src/app/api/pixels/[pixelId]/shares/route.ts` |
-| ShareProvider（Token 获取 + 权限裁剪） | `src/app/share/ShareProvider.tsx` |
-| Share Layout（挂载 Provider） | `src/app/share/[slug]/layout.tsx` |
-| SharePage（实体分发 + 布局） | `src/app/share/[slug]/[[...path]]/SharePage.tsx` |
-| ShareNav（导航按 parameters 过滤） | `src/app/share/[slug]/[[...path]]/ShareNav.tsx` |
-| ShareBranding（白标签 Logo） | `src/app/share/[slug]/[[...path]]/ShareBranding.tsx` |
-| ShareFooter（白标签底部） | `src/app/share/[slug]/[[...path]]/ShareFooter.tsx` |
-| CSP + 响应头 + Tracker 脚本配置 | `next.config.ts` |
-| 认证校验（Share Token + 上下文头） | `src/lib/auth.ts` |
-| JWT 工具 | `src/lib/jwt.ts` |
-| 常量（HEADER 名 / ENTITY_TYPE） | `src/lib/constants.ts` |
-| Auth 类型定义 | `src/lib/types.ts` |
-| API 请求头注入 | `src/components/hooks/useApi.ts` |
-| Share Token 查询 Hook | `src/components/hooks/queries/useShareTokenQuery.ts` |
-| Zustand Store | `src/store/app.ts` |
-| Website 权限 | `src/permissions/website.ts` |
-| Board 权限 | `src/permissions/board.ts` |
-| Link 权限 | `src/permissions/link.ts` |
-| Pixel 权限 | `src/permissions/pixel.ts` |
-| React Query 缓存配置 | `src/app/Providers.tsx` |
-| Redis 缓存实现 | `src/lib/redis.ts` |
-| 实体数据缓存 | `src/lib/load.ts` |
-| 采集端点（API） | `src/app/api/send/route.ts` |
-| Pixel 采集端点 | `src/app/(collect)/p/[slug]/route.ts` |
-| Link 采集端点 | `src/app/(collect)/q/[slug]/route.ts` |
+| 容易混淆的点 | 事实 |
+|------------|------|
+| "embed 组件"和 share 页面是两套东西 | 不是。iframe 嵌入和直接访问共用同一 `/share/:slug` 路由和组件树 |
+| Share 页面加载了采集脚本 | 没有。Share 是纯读取界面，不向 `/api/send` 写数据 |
+| `/script.js` 是通过 rewrite 提供的 | 默认不是。它是 Rollup 构建到 `public/` 的静态文件。Rewrite 仅在特定环境变量下触发 |
+| CSP 只作用于 Share 页面 | 不是。`/:path*` 匹配所有路径，包括 `/script.js`，但 CSP 对 JS 子资源响应无效 |
+| Share Token 保护所有 API | 不是。只保护 `canView*` 覆盖的只读 API。`/api/share/:slug` 本身无认证，写接口不认 Share Token |
+| `x-umami-share-context` 是强安全措施 | 不是。值固定为 "1"，是路径作用域标记/轻量 CSRF 防御 |
+| Pixel/Link 有关联的 Website | 数据模型中没有。`websiteId` 在 Share Token 中是兼容别名，存的就是 Pixel/Link 自己的 ID |
+| Share 签发用 Redis 缓存 Share 记录 | 不用。`getShareByCode` 直接查 DB。只有白标签走 Redis |
+| Token 中 `websiteId` 一定对应 Website 实体 | 不一定。Pixel/Link 分享时它存的是 Pixel/Link 的 ID |
