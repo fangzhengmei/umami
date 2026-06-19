@@ -65,38 +65,55 @@ Schema 文件：[`prisma/schema.prisma`](prisma/schema.prisma)
 
 ### 2.2 Prisma Client 初始化
 
-代码位置：[`src/lib/prisma.ts`](src/lib/prisma.ts)
+代码位置：[`src/lib/prisma.ts`](src/lib/prisma.ts#L370-L418)
 
 ```typescript
+// 模块顶层单例声明 [L418]
+// 每次模块被 import 时先读 globalThis，存在则直接复用，不再调用 getClient()
+const client = (globalThis[PRISMA] || getClient()) as ReturnType<typeof getClient>;
+
 // 关键函数 getClient() [L370-L416]
 function getClient() {
   const url = process.env.DATABASE_URL;
   const replicaUrl = process.env.DATABASE_REPLICA_URL;
+  const logQuery = process.env.LOG_QUERY;
   // 从 DATABASE_URL query string 解析 schema 参数
   const schema = getSchema();
 
+  // ① 构造主库 adapter + client（使用 @prisma/adapter-pg，非 Prisma 默认驱动）
   const baseAdapter = new PrismaPg({ connectionString: url }, { schema });
   const baseClient = new PrismaClient({ adapter: baseAdapter, errorFormat: 'pretty', … });
+  if (logQuery) baseClient.$on('query', log);
 
   if (!replicaUrl) {
+    // ② 无只读副本：??= 空值赋值，globalThis 已存在则不覆盖 → 保证 HMR / 多次 import 复用同一实例
+    log('Prisma initialized');
     globalThis[PRISMA] ??= baseClient;
     return baseClient;
   }
 
-  // 只读副本：@prisma/extension-read-replicas 扩展
+  // ③ 有只读副本：分别构造 adapter，用 @prisma/extension-read-replicas 扩展主库 client
   const replicaAdapter = new PrismaPg({ connectionString: replicaUrl }, { schema });
   const replicaClient = new PrismaClient({ adapter: replicaAdapter, … });
+  if (logQuery) replicaClient.$on('query', log);
   const extended = baseClient.$extends(readReplicas({ replicas: [replicaClient] }));
-  globalThis[PRISMA] ??= extended;
+
+  log('Prisma initialized (with replica)');
+  globalThis[PRISMA] ??= extended;   // 同样 ??= 做全局单例
   return extended;
 }
 ```
 
-特性：
-- 基于 `@prisma/adapter-pg`（自定义 pg adapter，非 Prisma 默认驱动）
-- 支持 `DATABASE_URL?schema=xxx` 指定 schema
-- 支持 `DATABASE_REPLICA_URL` 只读副本，查询自动走 `client.$replica()`
-- 全局单例缓存到 `globalThis['prisma']`，HMR 热更新不复用连接
+初始化特性：
+
+- **基于 `@prisma/adapter-pg`**：使用 Prisma 官方 pg adapter，非默认的 Node.js pg 驱动。
+- **Schema 注入**：从 `DATABASE_URL?schema=xxx` 解析参数并透传给 `PrismaPg` adapter，所有查询自动走指定 schema（内部执行 `SET search_path TO "xxx"`）。
+- **只读副本**：设置 `DATABASE_REPLICA_URL` 后，通过 `@prisma/extension-read-replicas` 扩展主库 client，读请求会自动路由到 `client.$replica()`（具体由扩展内部策略决定）。
+- **全局单例缓存 —— HMR 复用**：
+  - `globalThis[PRISMA] ??= baseClient` 中的 `??=` 是空值赋值运算符：只有当左侧为 `null/undefined` 时才写入。
+  - 模块顶层 `const client = (globalThis[PRISMA] || getClient())` 进一步保证：每次模块被 Next.js HMR（热更新）重新 import 时，只要 `globalThis` 里已有实例，就直接复用，不再新建 PrismaClient、不再打开新的数据库连接池。
+  - 这是 Next.js + Prisma 在开发环境的标准 HMR 兼容做法——避免每次改代码触发热更新时连接池泄漏。
+- **与 ClickHouse / Kafka 全局缓存的差异**：Prisma **无条件**写入 `globalThis`（生产环境也做单例）；而 ClickHouse 和 Kafka 的 `globalThis` 写入加了 `process.env.NODE_ENV !== 'production'` 守卫，生产环境只靠模块级 `let` 变量维持单例（见 [`src/lib/clickhouse.ts`](src/lib/clickhouse.ts#L41-L43)、[`src/lib/kafka.ts`](src/lib/kafka.ts#L44-L46)）。
 
 ### 2.3 原始查询封装
 
