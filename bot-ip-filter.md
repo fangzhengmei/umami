@@ -183,6 +183,23 @@ export async function getClientInfo(request: Request, payload: Record<string, an
 #### 判断逻辑
 
 ```typescript
+if (!process.env.DISABLE_BOT_CHECK && isbot(userAgent)) {
+  return json({ beep: 'boop' });
+}
+```
+
+#### 关键特性
+
+- **使用库**：`isbot`（基于 user-agent 字符串匹配）
+- **开关**：`DISABLE_BOT_CHECK` 环境变量可禁用
+- **返回值**：HTTP 200 + `{ beep: 'boop' }`，伪装成正常响应，避免被机器人探测到过滤逻辑
+- **位置**：在 IP 黑名单检查**之前**，优先过滤机器人流量，减少后续黑名单匹配开销
+
+### 3.4 IP 黑名单基础 ([detect.ts:140-170](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/detect.ts#L140-L170))
+
+#### 函数签名与主逻辑
+
+```typescript
 export function hasBlockedIp(clientIp: string) {
   const ignoreIps = process.env.IGNORE_IP;
   if (ignoreIps) {
@@ -209,13 +226,15 @@ export function hasBlockedIp(clientIp: string) {
 2. **CIDR 网段匹配**：`192.168.0.0/16`
 3. **多个 IP**：逗号分隔，如 `1.1.1.1, 2.2.2.2/32`
 
-#### 边界条件
+#### 基础边界条件
 
 - 环境变量未设置时直接返回 `false`（不拦截）
+- 精确匹配使用 `===`，类型不同（string vs undefined）永远不命中
 - IPv4 和 IPv6 需要同类型才能匹配（`addr.kind() === range[0].kind()`）
-- 解析失败会抛出异常（未做 try-catch）
+- **CIDR 分支无空值防御**：`clientIp` 为 undefined/''/null 时，`ipaddr.parse()` 会抛异常
+- **异常无捕获**：整个函数无 try-catch，异常直接冒泡到调用方
 
-### 3.4 地理信息 ([detect.ts:79-124](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/detect.ts#L79-L124))
+### 3.5 地理信息 ([detect.ts:79-124](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/detect.ts#L79-L124))
 
 #### 获取流程
 
@@ -253,7 +272,7 @@ IP 地址
 - **Header 编码**：使用 `latin1` 解码后转 `utf-8`
 - **Region 格式**：不含 `-` 时自动补全国家前缀
 
-### 3.5 缓存 token 对 sessionId 计算的逐行影响
+### 3.6 缓存 token 对 sessionId 计算的逐行影响
 
 **缓存生效的前置条件**：[send/route.ts:103](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L103)
 
@@ -290,7 +309,7 @@ const sessionId = id ? uuid(sourceId, id) : uuid(sourceId, ip, userAgent, sessio
 
 ---
 
-### 3.6 缓存 token 对 createSession 会话记录创建的逐行影响
+### 3.7 缓存 token 对 createSession 会话记录创建的逐行影响
 
 [send/route.ts:149-165](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L149-L165)
 
@@ -357,7 +376,7 @@ export function parseToken(token: string, secret: any) {
 
 ---
 
-### 3.7 缓存 token 对 visitId + 30 分钟过期的逐行影响
+### 3.8 缓存 token 对 visitId + 30 分钟过期的逐行影响
 
 [send/route.ts:167-175](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L167-L175)
 
@@ -425,7 +444,7 @@ iat = now;                               // ← 重置为当前时间
 
 ---
 
-### 3.8 空 IP + CIDR 黑名单匹配的异常边界（按代码事实）
+### 3.9 空 IP + CIDR 黑名单匹配的异常边界（按代码事实）
 
 相关代码：[detect.ts:140-170](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/detect.ts#L140-L170) + [send/route.ts:314-320](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L314-L320)
 
@@ -523,14 +542,138 @@ send/route.ts:66 外层 try { ... } catch (e) {
 ---
 
 ## 四、边界条件汇总（逐行验证版）
-| 有缓存 visitId | 使用缓存值 |
-| 无缓存 | 基于 sessionId + visitSalt 生成 |
-| `now - iat > 1800` 秒 | 重新生成 visitId（30 分钟过期） |
-| 有 `timestamp` 参数 | 跳过 30 分钟过期检查 |
-| visitSalt 每小时变化 | 整点后首次请求生成新 visitId |
+
+### 4.1 入口参数  cache 是否生效
+
+基于 [send/route.ts:103](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L103) 的 `if (websiteId)` 判断：
+
+| payload 中的来源 | `websiteId` | cache 分支是否进入 | cache 最终值 | 说明 |
+|---|---|---|---|---|
+| `payload.website`（事件采集） | 有值 |  进入 | 解析 token 成功 = JWT 内容；失败 / 无 token = `null` | 仅 website 模式支持缓存 |
+| `payload.link`（短链接） | undefined |  不进入 | 恒为 `null` | 整个 if 块跳过 |
+| `payload.pixel`（像素追踪） | undefined |  不进入 | 恒为 `null` | 整个 if 块跳过 |
+
+**结论：`/q/[slug]` 短链接和 `/p/[slug]` 像素追踪完全不经过缓存逻辑，cache 恒为 null。**
 
 ---
 
+### 4.2 cache  sessionId 计算
+
+基于 [send/route.ts:147](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L147)：
+
+`	ypescript
+const sessionId = id ? uuid(sourceId, id) : uuid(sourceId, ip, userAgent, sessionSalt);
+`
+
+| 场景 | `id` (identify) | `ip` | `userAgent` | `sessionSalt` | `cache.sessionId` 影响 | sessionId 结果 |
+|---|---|---|---|---|---|---|
+| 1. identify 模式 | 有值 | 任意 | 任意 | 任意 |  完全无关 | `uuid(sourceId, id)`（确定性） |
+| 2. 首次匿名请求（无缓存） | 无 | 正常 | 正常 | 正常 |  完全无关 | `uuid(sourceId, ip, ua, salt)` |
+| 3. 有缓存且 IP/UA 未变 | 无 | 正常 | 正常 | 正常 |  完全无关 | 与缓存值相同（因为输入相同） |
+| 4. 有缓存但 IP 变了 | 无 | 新 IP | 正常 | 正常 |  完全无关 | 新值（与缓存不同） |
+| 5. 有缓存但 UA 变了 | 无 | 正常 | 新 UA | 正常 |  完全无关 | 新值（与缓存不同） |
+| 6. 有缓存但跨 salt 周期 | 无 | 正常 | 正常 | 新 salt |  完全无关 | 新值（与缓存不同） |
+| 7. IP + UA 都变了 | 无 | 新 IP | 新 UA | 正常 |  完全无关 | 新值（与缓存不同） |
+
+**结论：sessionId 的计算完全不引用 cache 变量，缓存只影响 createSession 判断，不影响 sessionId 的值本身。**
+
+---
+
+### 4.3 cache  createSession 执行判断
+
+基于 [send/route.ts:150](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L150)：
+
+`	ypescript
+if (!clickhouse.enabled && !cache?.sessionId) {
+`
+
+| `clickhouse.enabled` | `cache?.sessionId` | `!cache?.sessionId` | 条件结果 | 是否执行 createSession | 说明 |
+|---|---|---|---|---|---|
+| true | 任意 |  | false |  永不执行 | CH 模式异步合并，不实时插入 |
+| false | 有值（非空字符串） | false | false |  不执行 | 即使 sessionId 已被重算为新值 |
+| false | `undefined` (cache=null) | true | true |  执行 | 首次请求 / 缓存失效 |
+| false | `""` (空字符串) | true | true |  执行 | `cache?.sessionId = ""`，`!"" = true` |
+| false | `null` | true | true |  执行 | null 为 falsy |
+
+**危险边界：第 2 行场景  sessionId 重算值  cache.sessionId 时，跳过 createSession 后产生孤儿事件。**
+
+---
+
+### 4.4 cache  visitId + 30 分钟过期
+
+基于 [send/route.ts:168-175](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L168-L175)。
+
+#### 4.4.1 visitId 初始化真值表（`cache?.visitId || uuid(...)`）
+
+| cache 状态 | `cache?.visitId` 的值 | `\|\|` 左侧 truthy? | 最终 visitId |
+|---|---|---|---|
+| cache = null | `undefined` |  | `uuid(sessionId, visitSalt)` |
+| cache = { } (visitId 字段缺失) | `undefined` |  | `uuid(...)` |
+| cache.visitId = `""` | `""` (空串 falsy) |  | `uuid(...)` |
+| cache.visitId = `"ABC"` | `"ABC"` |  | `"ABC"` |
+
+#### 4.4.2 iat 初始化真值表（`cache?.iat || now`）
+
+| cache 状态 | `cache?.iat` 的值 | `\|\|` 左侧 truthy? | 最终 iat | 说明 |
+|---|---|---|---|---|
+| cache = null | `undefined` |  | `now` | 首次请求 |
+| cache.iat = `0` | `0` (falsy) |  | `now` |  误判为「从未初始化」 |
+| cache.iat = `1718000000` | `1718000000` (truthy) |  | `1718000000` | 正常缓存 |
+
+#### 4.4.3 30 分钟过期触发判断（`!timestamp && now - iat > 1800`）
+
+| 场景 | `!timestamp` (条件 A) | `now - iat > 1800` (条件 B) | 触发重算? | 说明 |
+|---|---|---|---|---|
+| 普通请求 + 29 分钟不活动 | true | `1740 > 1800 = false` |  | 正常窗口内 |
+| 普通请求 + 31 分钟不活动 | true | `1860 > 1800 = true` |  | 触发过期 |
+| 传了 timestamp 参数 + 31 分钟 | **false** | true |  | A 短路，跳过过期检查 |
+| identify 清缓存后首次（iat=now） | true | `0 > 1800 = false` |  | 新 session 立即开始新窗口 |
+| cache.iat = 0（误判） | true | 取决于 now | 与「普通请求」一致 | iat 被重置为 now，相当于新开窗口 |
+| 同一小时内过期触发（salt 未变） | true | true |  | 重算的 visitId 与原值**相同**（输入未变），只刷新 iat |
+| 跨整点过期触发（salt 变了） | true | true |  | 重算的 visitId **不同**（visitSalt 变了） |
+
+**核心结论：30 分钟「过期」在同一小时内实际上不换 visitId，只刷新 iat。真正导致 visitId 变化的只有两个原因：整点跨边界、sessionId 本身变化。**
+
+---
+
+### 4.5 空 IP + CIDR 黑名单异常边界
+
+基于 [detect.ts:156-157](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/detect.ts#L156-L157)。
+
+`IGNORE_IP` 配置  `clientIp` 值 的完整组合矩阵：
+
+| `IGNORE_IP` 配置 | `clientIp` 值 | 精确匹配分支 | CIDR 匹配分支 | 最终结果 | HTTP 状态 |
+|---|---|---|---|---|---|
+| 未设置（undefined） | 任意 |  |  | `false`（不拦截） | 正常 200 |
+| `"1.1.1.1"`（仅精确） | `"1.1.1.1"` |  命中 | 不进入 | `true`（拦截） | 403 |
+| `"1.1.1.1"`（仅精确） | `"2.2.2.2"` |  不命中 | 不进入（无 `/`） | `false` | 200 |
+| `"1.1.1.1"`（仅精确） | `undefined` |  (`===` 类型不同) | 不进入 | `false` | 200 |
+| `"10.0.0.0/8"`（仅 CIDR） | `"10.0.0.1"` |  不匹配 |  命中 | `true` | 403 |
+| `"10.0.0.0/8"`（仅 CIDR） | `"11.0.0.1"` |  |  不命中 | `false` | 200 |
+| `"10.0.0.0/8"`（仅 CIDR） | `undefined` |  |  `ipaddr.parse(undefined)` 抛 TypeError | **异常冒泡** | **500** |
+| `"10.0.0.0/8"`（仅 CIDR） | `""` (空串) |  |  `ipaddr.parse("")` 抛错误 | **异常冒泡** | **500** |
+| `"1.1.1.1, 10.0.0.0/8"`（混合） | `undefined` |  第一轮精确不命中 |  第二轮 CIDR 抛异常 | **异常冒泡** | **500** |
+| `"10.0.0.0/8, 1.1.1.1"`（CIDR 在前） | `undefined` |  |  第一轮 CIDR 就抛异常 | **异常冒泡** | **500** |
+
+**异常冒泡链：** `hasBlockedIp()`  `ips.find()` 回调  无 try-catch  send/route.ts 外层 try-catch  `serverError()`  HTTP 500
+
+---
+
+### 4.6 UA / IP / Browser 等字段覆盖链
+
+基于 [detect.ts:126-137](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/detect.ts#L126-L137)。
+
+| 字段 | 代码 | 操作符 | payload 传 `undefined` | payload 传 `""` (空串) | 说明 |
+|---|---|---|---|---|---|
+| `userAgent` | `payload?.userAgent \|\| request.headers.get('user-agent')` | `\|\|` | fallback 到 header | fallback 到 header | `undefined` 和 `""` 都是 falsy |
+| `ip` | `payload?.ip \|\| getIpAddress(request.headers)` | `\|\|` | fallback 到 getIpAddress | fallback 到 getIpAddress | 同上 |
+| `browser` | `payload?.browser ?? browserName(userAgent)` | `??` | fallback 到自动检测 | **直接使用空串** | 空值合并只排除 null/undefined |
+| `os` | `payload?.os ?? detectOS(userAgent)` | `??` | fallback 到自动检测 | **直接使用空串** | 同上 |
+| `device` | `payload?.device ?? getDevice(userAgent, payload?.screen)` | `??` | fallback 到自动检测 | **直接使用空串** | 同上 |
+
+**核心差异：** `||` 是「falsy 合并」（空串会 fallback），`??` 是「空值合并」（只有 null/undefined 才 fallback）。
+
+---
 ## 五、关键代码位置索引
 
 ### 主入口
@@ -661,7 +804,7 @@ send/route.ts:66 外层 try { ... } catch (e) {
 5. **sessionId「重算」+「跳过创建」的缓存策略**：
    - 每次请求都会根据 IP/UA/salt **重新计算** sessionId 以保证一致性
    - 但用 `cache?.sessionId` 控制是否执行 INSERT，避免重复写库
-   - 副作用：IP/UA 变化时，新 sessionId 与缓存中不一致，会导致重复 INSERT 或主键冲突
+   - 副作用：IP/UA 变化时，新 sessionId 与缓存中不一致，跳过 createSession 后产生孤儿事件
 6. **盐值轮转机制**：按月/周/日重置 salt，即使 IP/UA 相同也会生成新 session，保护隐私
 7. **30 分钟 Visit 过期 + 整点变化的双重机制**：
    - 同小时内超时只会更新 iat，visitId 实际不变
@@ -676,7 +819,7 @@ send/route.ts:66 外层 try { ... } catch (e) {
 | 1 | CIDR 配置 + 空 IP（undefined/''）→ `ipaddr.parse()` 抛 TypeError，外层 catch 返回 500 | 裸机部署且配了 CIDR 黑名单的环境必现 | [detect.ts:157](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/detect.ts#L157) |
 | 2 | 空 IP + 空 UA → `hash()` 中 `args.join('')` 将 undefined 拼成空串，所有匿名请求碰撞为同一个 sessionId | unique visitors 统计严重失真 | [crypto.ts:49](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/crypto.ts#L49) + [send/route.ts:147](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L147) |
 | 3 | UA/IP 中途变化 → 新 sessionId 与 cache 中旧值不同，但因 cache.sessionId 存在跳过 createSession → 事件表引用不存在的会话 | 非 ClickHouse 模式产生孤儿事件记录，外键可能失败或数据孤立 | [send/route.ts:147](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L147) + [send/route.ts:150](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L150) |
-| 4 | `payload.browser=''` 等空串覆盖 → `??` 操作符不走 fallback，browser/os 字段被写为空串 | 报表中出现空值浏览器/操作系统 | [detect.ts:150](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/detect.ts#L150) |
+| 4 | `payload.browser=''` 等空串覆盖 → `??` 操作符不走 fallback，browser/os/device 字段被写为空串 | 报表中出现空值浏览器/操作系统/设备 | [detect.ts:133-135](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/detect.ts#L133-L135) |
 | 5 | `/p /q` 采集入口使用 linkId/pixelId → `if (websiteId)` 缓存分支完全不进入 → cache=null → 每次请求都执行 createSession | 像素/短链接场景完全没有缓存优化，重复写库 | [send/route.ts:103](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L103) |
 | 6 | sessionId 变了（如 IP 切换）但 visitId 仍沿用缓存中的旧值（场景 4.2 #7） | 同一个 visitId 下挂了不同 sessionId 的事件 → 会话/访问归属混乱 | [send/route.ts:168](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L168) |
 | 7 | `cache.iat = 0` → `0 || now` 被误判为未初始化 → iat 重置为当前时间 | 意外地延长了 visit 的「30 分钟窗口」，应过期的 visit 不会过期 | [send/route.ts:169](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L169) |
