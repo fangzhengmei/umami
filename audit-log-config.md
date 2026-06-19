@@ -2,39 +2,190 @@
 
 ## 1. 概述
 
-本文档对 Umami 系统中审计日志与配置变更追踪的实现进行代码层面的分析，涵盖站点、团队、用户设置变更记录、敏感字段脱敏、保留策略和导出边界。
+本文档对 Umami 系统中审计日志与配置变更追踪的实现进行代码层面的分析，涵盖站点、团队、账号、偏好、敏感字段脱敏、保留策略和导出边界。
+
+分析结论：系统未实现专门的 `audit_log` 审计日志表，变更追踪仅依赖实体表自身的时间戳字段，部分偏好设置仅保存在浏览器 localStorage 中。
 
 ---
 
 ## 2. 变更记录覆盖范围
 
-### 2.1 数据模型时间戳字段
+### 2.1 设置入口总览
 
-所有核心实体模型均包含时间戳字段，用于追踪实体的创建、更新和删除时间，但**无专门的审计日志表或变更历史记录表**。
+**代码位置**: [SettingsNav.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/(main)/settings/SettingsNav.tsx)
 
-#### 2.1.1 用户（User）
-- **代码位置**: [schema.prisma#L12-L32](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/prisma/schema.prisma#L12-L32)
-- **追踪字段**:
-  - `createdAt`: 创建时间（自动生成）
-  - `updatedAt`: 更新时间（Prisma `@updatedAt` 自动更新）
-  - `deletedAt`: 删除时间（软删除标记）
+| 分类 | 设置项 | 路由 | 存储位置 | 可审计 |
+|------|--------|------|----------|--------|
+| Application | Preferences（偏好） | `/settings/preferences` | 浏览器 localStorage | ❌ 仅客户端 |
+| Account | Profile（个人资料） | `/settings/profile` | PostgreSQL | ⚠️ 部分 |
+| Account | Teams（团队） | `/settings/teams` | PostgreSQL | ⚠️ 部分 |
+| Websites | Website 设置 | `/settings/websites/[id]` | PostgreSQL | ⚠️ 部分 |
 
-#### 2.1.2 站点（Website）
-- **代码位置**: [schema.prisma#L66-L97](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/prisma/schema.prisma#L66-L97)
-- **追踪字段**:
-  - `createdAt`: 创建时间
-  - `updatedAt`: 更新时间
-  - `deletedAt`: 删除时间
-  - `resetAt`: 数据重置时间（[resetWebsite](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/website.ts#L133-L186) 操作时更新
+---
 
-#### 2.1.3 团队（Team）
-- **代码位置**: [schema.prisma#L197-L214](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/prisma/schema.prisma#L197-L214)
-- **追踪字段**:
-  - `createdAt`: 创建时间
-  - `updatedAt`: 更新时间（[updateTeam](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/team.ts#L129-L141) 显式设置 `updatedAt: new Date()`
-  - `deletedAt`: 删除时间
+### 2.2 站点（Website）设置变更
 
-#### 2.1.4 其他实体
+#### 2.2.1 数据模型时间戳
+**代码位置**: [schema.prisma#L66-L97](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/prisma/schema.prisma#L66-L97)
+
+| 字段 | 说明 | 触发方式 |
+|------|------|----------|
+| `createdAt` | 创建时间 | Prisma `@default(now())` |
+| `updatedAt` | 最后更新时间 | Prisma `@updatedAt` 自动更新 |
+| `deletedAt` | 删除时间 | 手动设置（仅 CLOUD_MODE） |
+| `resetAt` | 数据重置时间 | 调用 `resetWebsite()` 时设置 |
+
+#### 2.2.2 可变更字段列表
+**代码位置**: [route.ts#L37-L104](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/websites/[websiteId]/route.ts#L37-L104)
+
+```typescript
+name: string                                    // 站点名称
+domain: string                                  // 站点域名
+shareId: string                                 // 共享ID（增删 Share 记录）
+replayEnabled: boolean                          // 会话重放启用状态
+replayConfig: {
+  sampleRate: number                            // 采样率 0-1
+  maskLevel: 'strict' | 'moderate'              // 脱敏级别
+  maxDuration: number                           // 最大录制时长(ms)
+  blockSelector: string                         // 阻止录制的 CSS 选择器
+}
+```
+
+#### 2.2.3 站点数据重置
+**代码位置**: [reset/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/websites/[websiteId]/reset/route.ts)
+
+操作内容：级联清空站点所有分析数据
+- `sessionReplaySaved`、`sessionReplay`、`revenue`
+- `eventData`、`sessionData`、`websiteEvent`、`session`
+
+追踪方式：更新 `Website.resetAt = new Date()`
+
+**代码位置**: [website.ts#L133-L186](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/website.ts#L133-L186)
+
+---
+
+### 2.3 团队（Team）设置变更
+
+#### 2.3.1 数据模型时间戳
+**代码位置**: [schema.prisma#L197-L214](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/prisma/schema.prisma#L197-L214)
+
+| 字段 | 说明 |
+|------|------|
+| `createdAt` | 创建时间 |
+| `updatedAt` | 最后更新时间（`updateTeam` 中显式 `updatedAt: new Date()`） |
+| `deletedAt` | 删除时间（仅 CLOUD_MODE） |
+
+#### 2.3.2 可变更字段列表
+**代码位置**: [route.ts#L29-L50](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/teams/[teamId]/route.ts#L29-L50)
+
+```typescript
+name: string        // 团队名称（最大 50 字符）
+accessCode: string  // 访问码（最大 50 字符，唯一约束）
+```
+
+#### 2.3.3 团队成员管理
+**代码位置**: [teams/[teamId]/users/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/teams/[teamId]/users/route.ts) 和 [teams/[teamId]/users/[userId]/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/teams/[teamId]/users/[userId]/route.ts)
+
+可变更内容：
+- 添加成员（指定 `role`）
+- 修改成员角色
+- 移除成员
+
+追踪方式：TeamUser 表自身的 `createdAt` / `updatedAt` 字段。
+
+---
+
+### 2.4 账号（User）设置变更
+
+#### 2.4.1 数据模型时间戳
+**代码位置**: [schema.prisma#L12-L32](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/prisma/schema.prisma#L12-L32)
+
+| 字段 | 说明 |
+|------|------|
+| `createdAt` | 创建时间 |
+| `updatedAt` | 最后更新时间 |
+| `deletedAt` | 删除时间（仅 CLOUD_MODE） |
+
+#### 2.4.2 个人资料页面展示字段
+**代码位置**: [ProfileSettings.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/(main)/settings/profile/ProfileSettings.tsx)
+
+页面中展示但**只读**的字段：
+- `username`（用户名）
+- `role`（角色：admin / user / view-only）
+
+可操作项：
+- 修改密码（仅非 CLOUD_MODE 显示按钮）
+
+#### 2.4.3 管理员管理用户（可变更字段）
+**代码位置**: [users/[userId]/route.ts#L27-L81](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/users/[userId]/route.ts#L27-L81)
+
+```typescript
+username: string   // 仅管理员可修改，需唯一
+password: string   // 管理员可直接重置（哈希后存储）
+role: string       // 仅管理员可修改（admin / user / view-only）
+```
+
+#### 2.4.4 自助修改密码
+**代码位置**: [PasswordEditForm.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/(main)/settings/profile/PasswordEditForm.tsx) 和 [me/password/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/me/password/route.ts)
+
+验证流程：
+1. 校验 `currentPassword`（对比 bcrypt 哈希）
+2. `newPassword` 与 `confirmPassword` 一致校验
+3. 密码长度 >= 8 位
+4. 写入前执行 `hashPassword(newPassword)`
+
+API 路由：`POST /api/me/password`
+
+---
+
+### 2.5 偏好（Preferences）设置
+
+> **重要**：所有偏好设置均保存在**浏览器 localStorage** 中，**不发送到服务端**，不在数据库留痕，无法进行服务端审计。
+
+#### 2.5.1 偏好设置入口
+**代码位置**: [PreferenceSettings.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/(main)/settings/preferences/PreferenceSettings.tsx)
+
+包含 5 项设置：默认日期范围、时区、语言、主题、版本。
+
+#### 2.5.2 默认日期范围
+**代码位置**: [DateRangeSetting.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/(main)/settings/preferences/DateRangeSetting.tsx)
+
+- localStorage Key：`umami.date-range`（常量 `DATE_RANGE_CONFIG`）
+- 默认值：`24hour`（常量 `DEFAULT_DATE_RANGE_VALUE`）
+- 存储方式：`setItem(DATE_RANGE_CONFIG, value)`
+
+#### 2.5.3 时区
+**代码位置**: [TimezoneSetting.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/(main)/settings/preferences/TimezoneSetting.tsx) 和 [useTimezone.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/components/hooks/useTimezone.ts)
+
+- localStorage Key：`umami.timezone`（常量 `TIMEZONE_CONFIG`）
+- 默认值：浏览器系统时区 `Intl.DateTimeFormat().resolvedOptions().timeZone`
+- 保存函数：`saveTimezone(value)` -> `setItem(TIMEZONE_CONFIG, value)`
+
+#### 2.5.4 语言
+**代码位置**: [LanguageSetting.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/(main)/settings/preferences/LanguageSetting.tsx) 和 [useLocale.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/components/hooks/useLocale.ts)
+
+- localStorage Key：`umami.locale`（常量 `LOCALE_CONFIG`）
+- 默认值：`en-US`（常量 `DEFAULT_LOCALE`）
+- 保存函数：`saveLocale(value)` -> `setItem(LOCALE_CONFIG, value)`
+
+#### 2.5.5 主题
+**代码位置**: [ThemeSetting.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/(main)/settings/preferences/ThemeSetting.tsx)
+
+- localStorage Key：`umami.theme`（常量 `THEME_CONFIG`）
+- 可选值：`light` / `dark`
+- 默认值：`light`（常量 `DEFAULT_THEME`）
+- 通过 `@umami/react-zen` 的 `useTheme()` hook 读写
+
+#### 2.5.6 版本设置
+**代码位置**: [VersionSetting.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/(main)/settings/preferences/VersionSetting.tsx)
+
+- localStorage Key：`umami.version-check`
+- 功能：开启 / 关闭新版本检查
+- 不涉及数据变更追踪。
+
+---
+
+### 2.6 其他实体的时间戳字段
 
 | 实体 | 代码位置 | 追踪字段 |
 |------|----------|----------|
@@ -47,76 +198,29 @@
 | Share | [schema.prisma#L348-L360](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/prisma/schema.prisma#L348-L360) | createdAt, updatedAt |
 | SessionReplaySaved | [schema.prisma#L386-L401](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/prisma/schema.prisma#L386-L401) | createdAt, updatedAt |
 
-### 2.2 站点设置变更追踪
+---
 
-#### 2.2.1 站点可变更字段
-- **代码位置**: [route.ts#L37-L104](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/websites/[websiteId]/route.ts#L37-L104)
-- **可变更字段**:
-  ```typescript
-  name: string           // 站点名称
-  domain: string         // 站点域名
-  shareId: string        // 共享ID
-  replayEnabled: boolean   // 会话重放启用状态
-  replayConfig: {         // 会话重放配置
-    sampleRate: number    // 采样率 0-1
-    maskLevel: 'strict' | 'moderate'  // 脱敏级别
-    maxDuration: number // 最大录制时长
-    blockSelector: string  // 阻止选择器
-  }
-  ```
+### 2.7 变更记录局限性
 
-#### 2.2.2 站点数据重置
-- **代码位置**: [reset/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/websites/[websiteId]/reset/route.ts)
-- **操作**: 清空站点所有分析数据（session、event、sessionData、eventData、revenue、sessionReplay 等
-- **追踪**: 更新 `resetAt` 字段记录重置时间
+1. **无审计日志表**：系统未设计 `audit_log` / `change_history` 表，无法追踪以下信息：
+   - 变更操作人 ID（Website 有 `createdBy` 但仅记录创建人）
+   - 变更字段的 before / after 值对比
+   - 变更的精确时间（`updatedAt` 只能知道最后一次修改时间，中间历史丢失）
 
-### 2.3 团队设置变更追踪
+2. **偏好设置不可审计**：语言 / 时区 / 主题 / 默认日期范围纯客户端 localStorage，服务端无记录。
 
-#### 2.3.1 团队可变更字段
-- **代码位置**: [route.ts#L29-L50](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/teams/[teamId]/route.ts#L29-L50)
-- **可变更字段**:
-  ```typescript
-  name: string        // 团队名称（最大50字符）
-  accessCode: string  // 访问码（最大50字符）
-  ```
-
-### 2.4 用户设置变更追踪
-
-#### 2.4.1 用户可变更字段
-- **代码位置**: [route.ts#L27-L81](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/users/[userId]/route.ts#L27-L81)
-- **可变更字段**:
-  ```typescript
-  username: string  // 用户名（仅管理员可改）
-  password: string  // 密码（哈希后存储）
-  role: string    // 角色（仅管理员可改）
-  ```
-
-#### 2.4.2 用户密码变更
-- **代码位置**: [password/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/me/password/route.ts)
-- **验证**: 需验证当前密码
-- **存储**: 使用 bcrypt 哈希后存储（[hashPassword](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/lib/password.ts)
-
-### 2.5 变更记录局限性
-
-1. **无审计日志表**: 系统未设计专门的 `audit_log` 或 `change_history` 表，无法追踪：
-   - 谁做了什么变更
-   - 变更前后的值对比
-   - 变更的具体时间戳（仅有 `updatedAt` 只能知道最后更新时间）
-   - 变更的操作人（仅有 `createdBy` 仅记录创建人）
-
-2. **无变更历史**: 无法回滚或查看历史版本
+3. **无版本历史**：无法回滚任何配置变更。
 
 ---
 
 ## 3. 敏感字段脱敏
 
-### 3.1 会话重放数据脱敏
+### 3.1 会话重放（Session Replay）脱敏
 
 #### 3.1.1 脱敏级别配置
-- **代码位置**: [recorder/index.js#L87-L99](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/recorder/index.js#L87-L99)
-- **配置参数**: `maskLevel`（通过 `data-mask-level` 属性设置）
+**代码位置**: [recorder/index.js#L87-L99](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/recorder/index.js#L87-L99)
 
-#### 3.1.2 脱敏级别定义
+通过 `<script>` 标签的 `data-mask-level` 属性传入（在 Website 设置中配置 `replayConfig.maskLevel`）。
 
 ```javascript
 const getMaskConfig = level => {
@@ -134,39 +238,57 @@ const getMaskConfig = level => {
 };
 ```
 
-| 级别 | 配置 | 说明 |
-|------|------|------|
-| **strict** | `maskAllInputs: true, `maskTextSelector: '*' | 所有输入框 + 所有文本内容全部脱敏 |
-| **moderate**（默认） | `maskAllInputs: true | 仅所有输入框内容脱敏 |
+| 级别 | 配置项 | 实际效果 |
+|------|--------|----------|
+| `moderate`（默认） | `maskAllInputs: true` | 所有 `<input>` / `<textarea>` / `<select>` 等表单元素值替换为占位符 |
+| `strict` | `maskAllInputs: true` + `maskTextSelector: '*'` | 输入框脱敏 + 页面所有文本节点内容替换为 `***` |
 
-#### 3.1.3 脱敏实现
-- **底层实现**: 基于 rrweb 库的 `maskAllInputs` 和 `maskTextSelector` 配置
-- **输入框类型**: 所有 `<input>`、`<textarea>`、`<select>` 等表单元素
-- **文本脱敏**: `strict` 模式下所有文本节点内容替换为 `***`
+#### 3.1.2 脱敏底层实现
+基于 rrweb 库的录制参数：
+- `maskAllInputs`: rrweb 内置规则，将所有表单元素的值在录制时脱敏
+- `maskTextSelector: '*'`: 对匹配选择器的元素（此处为页面全部元素）的文本内容进行脱敏
 
-#### 3.1.4 其他录制限制
-- **代码位置**: [recorder/index.js#L136-L147](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/recorder/index.js#L136-L147)
-- **不录制内容**:
-  - `recordCanvas: false` - 不录制 Canvas
-  - `recordCrossOriginIframes: false` - 不录制跨域 iframe
-  - `slimDOMOptions` - 精简 DOM，移除 script、comment、各类 meta 标签
+#### 3.1.3 额外录制限制
+**代码位置**: [recorder/index.js#L136-L149](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/recorder/index.js#L136-L149)
+
+```javascript
+inlineStylesheet: true,
+slimDOMOptions: {
+  script: true, comment: true,
+  headMetaDescKeywords: true, headMetaSocial: true,
+  headMetaRobots: true, headMetaHttpEquiv: true,
+  headMetaAuthorship: true, headMetaVerification: true,
+},
+recordCanvas: false,
+recordCrossOriginIframes: false,
+blockSelector,  // 用户自定义的 CSS 选择器，完全阻止录制匹配元素
+```
+
+- 不录制 Canvas 内容
+- 不录制跨域 iframe
+- 精简 DOM，移除 `<script>`、注释、各类 `<meta>` 标签
+- 支持自定义 `blockSelector` 将整块元素从录制中排除
+
+---
 
 ### 3.2 密码字段保护
 
-#### 3.2.1 查询时排除密码
-- **代码位置**: [user.ts#L23-L30](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/user.ts#L23-L30)
+#### 3.2.1 查询时默认排除密码
+**代码位置**: [user.ts#L14-L30](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/user.ts#L14-L30)
+
 ```typescript
 select: {
   id: true,
   username: true,
-  password: includePassword,  // 默认 false
+  password: includePassword,   // 默认 false，不显式传参则不返回
   role: true,
   createdAt: true,
 }
 ```
 
-#### 3.2.2 API 返回时排除密码
-- **代码位置**: [admin/users/route.ts#L35-L37](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/admin/users/route.ts#L35-L37)
+#### 3.2.2 管理员用户列表中排除密码
+**代码位置**: [admin/users/route.ts#L35-L37](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/admin/users/route.ts#L35-L37)
+
 ```typescript
 omit: {
   password: true,
@@ -174,18 +296,34 @@ omit: {
 ```
 
 #### 3.2.3 密码哈希存储
-- **代码位置**: [users/[userId]/route.ts#L56-L58](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/users/[userId]/route.ts#L56-L58)
+**代码位置**: [users/[userId]/route.ts#L56-L58](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/users/[userId]/route.ts#L56-L58)
+
 ```typescript
 if (password) {
-  data.password = hashPassword(password);
+  data.password = hashPassword(password);  // bcrypt 哈希，字段长度 @db.VarChar(60)
 }
 ```
 
-### 3.3 用户删除时的数据脱敏
-- **代码位置**: [user.ts#L129-L146](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/user.ts#L129-L146)
-- **CLOUD_MODE 下用户删除时：
-  - 用户名替换为随机字符串：`username: getRandomChars(32)`
-  - 标记 `deletedAt` 软删除
+#### 3.2.4 密码校验
+**代码位置**: [me/password/route.ts#L24](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/me/password/route.ts#L24)
+
+```typescript
+if (!checkPassword(currentPassword, user.password)) {
+  return badRequest({ message: 'Current password is incorrect' });
+}
+```
+
+---
+
+### 3.3 用户删除时的数据脱敏（CLOUD_MODE）
+**代码位置**: [user.ts#L129-L146](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/user.ts#L129-L146)
+
+CLOUD_MODE 下执行用户删除时，为保留数据完整性不做物理删除，而是：
+1. 将 `User.username` 替换为 `getRandomChars(32)` 生成的 32 位随机字符串
+2. 标记 `User.deletedAt = new Date()`
+3. 同时将该用户名下所有 Website 标记 `deletedAt`
+
+作用：使已删除用户的个人信息无法通过用户名被识别。
 
 ---
 
@@ -193,74 +331,123 @@ if (password) {
 
 ### 4.1 数据保留策略现状
 
-**代码分析结论：系统未实现自动化数据保留（Data Retention）策略。**
+**结论：系统未实现基于时间的自动化数据保留（Data Retention）策略，无 TTL、无定时清理任务。**
 
-### 4.2 现有时间相关字段
+数据清理仅在以下两种场景触发：
+- 用户手动调用「重置站点数据」
+- 用户 / 站点 / 团队被执行删除操作
 
-| 字段 | 用途 | 代码位置 |
-|------|------|----------|
-| `createdAt` | 记录创建时间 | 所有实体表 |
-| `updatedAt` | 记录最后更新时间 | 配置类实体表 |
-| `deletedAt` | 软删除标记 | User, Website, Team, Link, Pixel |
-| `resetAt` | 站点数据重置时间 | Website 表 |
+---
 
-### 4.3 删除模式
+### 4.2 删除模式详解
 
-#### 4.3.1 软删除（CLOUD_MODE）
-- **触发条件**: `process.env.CLOUD_MODE === true`
-- **实现方式**: 设置 `deletedAt = new Date()`
-- **影响范围**:
-  - User: [user.ts#L129-L146](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/user.ts#L129-L146)
-  - Website: [website.ts#L234-L243](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/website.ts#L234-L243)
-  - Team: [team.ts#L147-L158](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/team.ts#L147-L158)
+删除行为由环境变量 `CLOUD_MODE` 控制，行为差异如下表：
 
-#### 4.3.2 硬删除（非 CLOUD_MODE）
-- **触发条件**: `process.env.CLOUD_MODE !== true`
-- **实现方式**: 物理删除数据库记录
+| 操作 | CLOUD_MODE = true（软删除） | CLOUD_MODE = false（硬删除） |
+|------|---------------------------|---------------------------|
+| **删除用户** | 用户名随机化 + `user.deletedAt`；名下网站 `website.deletedAt`；**团队与 teamUser 不处理** | 级联删除 website/event/session 数据、删除用户拥有的团队与 teamUser、删除用户 |
+| **删除网站** | 仅 `website.deletedAt = new Date()`；**下属数据（event/session/report/segment/share）不处理** | 级联删除网站所有分析数据 + report + segment + share + website 记录 |
+| **删除团队** | 仅 `team.deletedAt = new Date()`；**下属 teamUser / websites / links / pixels / boards 不处理** | 删除 teamUser 关联 + team 记录本身；**下属 websites / links / pixels / boards 不处理** |
+| **删除 Link** | 物理删除 `prisma.link.delete()`，**无 CLOUD_MODE 分支** | 同左（物理删除） |
+| **删除 Pixel** | 物理删除 `prisma.pixel.delete()`，**无 CLOUD_MODE 分支** | 同左（物理删除） |
 
-### 4.4 会话超时配置
+#### 4.2.1 用户删除细节
+**代码位置**: [user.ts#L102-L206](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/user.ts#L102-L206)
 
-#### 4.4.1 访问超时
-- **代码位置**: [auth.ts#L62-L74](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/lib/auth.ts#L62-L74)
-- **配置**: Redis 键过期时间（`expire` 参数）
+CLOUD_MODE 分支（第 129-146 行）仅执行：
+```typescript
+client.website.updateMany({ data: { deletedAt: new Date() }, where: { id: { in: websiteIds } }),
+client.user.update({ data: { username: getRandomChars(32), deletedAt: new Date() }, where: { id: userId } }),
+```
+注意：用户作为 teamOwner 的团队在 CLOUD_MODE 下**不会被删除或标记 deletedAt**，团队成员关联 `teamUser` 也不处理。
+
+#### 4.2.2 站点删除细节
+**代码位置**: [website.ts#L188-L257](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/website.ts#L188-L257)
+
+CLOUD_MODE 分支（第 234-243 行）：
+```typescript
+client.website.update({ data: { deletedAt: new Date() }, where: { id: websiteId } })
+```
+下属的 `session / websiteEvent / sessionData / eventData / revenue / sessionReplay` 等**不会被清理**，`report / segment / share` 也不清理。
+
+#### 4.2.3 团队删除细节
+**代码位置**: [team.ts#L143-L172](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/team.ts#L143-L172)
+
+CLOUD_MODE 分支（第 147-158 行）：仅 `team.deletedAt`。
+
+非 CLOUD_MODE 分支（第 160-171 行）：删除 `teamUser` 关联 + `team` 记录。注意团队下的 `websites`、`links`、`pixels`、`boards` 在**两种模式下都不会被删除**，只会变成 `teamId` 指向已删除团队的「孤儿」记录。
+
+#### 4.2.4 Link 删除
+**代码位置**: [link.ts#L64-L66](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/link.ts#L64-L66)
+
+```typescript
+export async function deleteLink(linkId: string) {
+  return prisma.client.link.delete({ where: { id: linkId } });
+}
+```
+始终为硬删除，Link 表即使有 `deletedAt` 字段也**未被使用**。
+
+---
+
+### 4.3 软删除过滤保证
+所有查询均带有 `deletedAt: null` 过滤条件，确保软删除记录不会出现在正常列表中：
+- `getUser` / `getUsers`（[user.ts#L21](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/user.ts#L21), [user.ts#L54](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/user.ts#L54)）
+- `getWebsites`（[website.ts#L37](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/website.ts#L37)）
+- `getUserTeams`（[team.ts#L53](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/team.ts#L53)）
+- `getUserLinks`（[link.ts#L38](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/link.ts#L38)）
+
+---
+
+### 4.4 会话级超时（非数据保留）
+
+#### 4.4.1 鉴权 Token 过期
+**代码位置**: [auth.ts#L62-L74](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/lib/auth.ts#L62-L74)
+
+Redis 存储的鉴权 Key 通过 `redis.client.expire(authKey, expire)` 设置 TTL，过期后 Token 失效。此处仅影响登录态有效性，不删除持久化数据。
 
 #### 4.4.2 Visit 超时
-- **代码位置**: [send/route.ts#L171](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/send/route.ts#L171)
-- **配置**: Visit 30 分钟后过期
+**代码位置**: [send/route.ts#L171](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/send/route.ts#L171)
 
-### 4.5 保留报告（Retention Report）
+```javascript
+// Expire visit after 30 minutes
+```
 
-**注意**: 系统中的 "retention" 指的是**用户留存分析报告**，而非数据保留策略。
+用于区分「同一会话内连续访问」与「新的一次回访」，30 分钟空闲即视为新 visit。
+
+---
+
+### 4.5 「Retention」说明
+
+系统中出现的 `retention` / `label.retention` / `getRetention` **均指「用户留存分析报告」功能**（分析用户 N 天内回访率），与数据保留策略无关。
 
 - **代码位置**: [getRetention.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/sql/reports/getRetention.ts)
-- **用途**: 分析用户回访频率，衡量网站用户粘性
+- 入口路径：`/websites/[id]/retention`
 
-### 4.6 ClickHouse 数据保留
+---
 
-- **代码位置**: [schema.sql](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/db/clickhouse/schema.sql)
-- **现状**: 未配置 TTL（Time To Live）策略
-- **分区**: 按 `toYYYYMM(created_at)` 按月分区
-- **存储引擎**: MergeTree 系列引擎，无自动清理机制
+### 4.6 ClickHouse 分析数据保留
+**代码位置**: [schema.sql](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/db/clickhouse/schema.sql)
 
-### 4.7 手动数据清理
+- 所有 MergeTree 表（`website_event`、`event_data`、`session_data`、`session_replay`、`website_revenue`）按 `toYYYYMM(created_at)` 做月分区
+- **未配置 TTL 表达式**，数据不会自动过期
+- 未提供定期 `DROP PARTITION` / `DELETE` 的定时任务代码
 
-#### 4.7.1 站点数据重置
-- **代码位置**: [website.ts#L133-L186](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/website.ts#L133-L186)
-- **清理范围**:
-  ```
-  sessionReplaySaved
-  sessionReplay
-  revenue
-  eventData
-  sessionData
-  websiteEvent
-  session
-  ```
-- **触发**: 用户手动操作
+---
 
-#### 4.7.2 站点删除
-- **代码位置**: [website.ts#L188-L257](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/website.ts#L188-L257)
-- **清理范围**: 重置范围 + report + segment + share
+### 4.7 手动数据清理入口
+
+#### 4.7.1 站点重置
+**代码位置**: [website.ts#L133-L186](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/website.ts#L133-L186)
+
+清理范围（PostgreSQL 侧，均为 `deleteMany` 硬删除）：
+`sessionReplaySaved` → `sessionReplay` → `revenue` → `eventData` → `sessionData` → `websiteEvent` → `session`
+
+最后更新 `Website.resetAt = new Date()`。
+
+#### 4.7.2 站点删除（非 CLOUD_MODE）
+**代码位置**: [website.ts#L188-L257](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/prisma/website.ts#L188-L257)
+
+清理范围 = 重置范围 + `report` + `segment` + `share` + `website` 记录本身。
 
 ---
 
@@ -268,69 +455,63 @@ if (password) {
 
 ### 5.1 导出 API
 
-#### 5.1.1 导出接口
-- **代码位置**: [export/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/websites/[websiteId]/export/route.ts)
-- **路由**: `GET /api/websites/[websiteId]/export`
-- **权限**: `canViewWebsite`（[permissions.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/permissions.ts)
+**代码位置**: [export/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/websites/[websiteId]/export/route.ts)
 
-#### 5.1.2 导出参数
-```typescript
-{
-  ...pagingParams,    // 分页参数
-  ...withDateRange  // 日期范围
-}
-```
+| 项 | 内容 |
+|----|------|
+| 路由 | `GET /api/websites/[websiteId]/export` |
+| 权限 | `canViewWebsite(auth, websiteId)`（网站查看权限即可，不需要管理员） |
+| 请求参数 | `pagingParams`（分页）+ `withDateRange`（开始/结束日期） |
+| 返回格式 | `{ "zip": "<base64 编码的 ZIP 文件内容>" }` |
 
 ### 5.2 导出内容
 
-| 文件 | 数据来源 | 代码位置 |
-|------|----------|----------|
-| `events.csv` | 事件指标 | [getEventMetrics](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/sql/events/getEventMetrics.ts) |
-| `pages.csv` | 页面浏览指标 | [getPageviewMetrics](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/sql/events/getPageviewMetrics.ts) |
-| `referrers.csv` | 来源域名指标 | [getPageviewMetrics](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/sql/events/getPageviewMetrics.ts) |
-| `browsers.csv` | 浏览器指标 | [getSessionMetrics](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/sql/sessions/getSessionMetrics.ts) |
-| `os.csv` | 操作系统指标 | [getSessionMetrics](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/sql/sessions/getSessionMetrics.ts) |
-| `devices.csv` | 设备指标 | [getSessionMetrics](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/sql/sessions/getSessionMetrics.ts) |
-| `countries.csv` | 国家指标 | [getSessionMetrics](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/queries/sql/sessions/getSessionMetrics.ts) |
+| CSV 文件 | 数据来源函数 | 包含内容 |
+|----------|-------------|----------|
+| `events.csv` | `getEventMetrics(type: 'event')` | 自定义事件名称 + 触发次数（聚合指标） |
+| `pages.csv` | `getPageviewMetrics(type: 'path')` | URL 路径 + PV / UV 等聚合指标 |
+| `referrers.csv` | `getPageviewMetrics(type: 'referrer')` | 来源域名 + 聚合指标 |
+| `browsers.csv` | `getSessionMetrics(type: 'browser')` | 浏览器名称 + 会话数 |
+| `os.csv` | `getSessionMetrics(type: 'os')` | 操作系统名称 + 会话数 |
+| `devices.csv` | `getSessionMetrics(type: 'device')` | 设备类型 + 会话数 |
+| `countries.csv` | `getSessionMetrics(type: 'country')` | 国家代码 + 会话数 |
 
-### 5.3 导出格式
+**导出内容全部为聚合后的计数指标，不包含任何原始明细行。**
 
-- **压缩格式**: ZIP（JSZip 库）
-- **文件格式**: CSV（PapaParse 库）
-- **传输编码**: Base64 编码的 ZIP 内容
-- **返回格式**:
-  ```json
-  {
-    "zip": "base64_encoded_zip_content"
-  }
-  ```
+### 5.3 导出实现细节
+- 使用 `Papa.unparse(data, { header: true, skipEmptyLines: true })` 生成 CSV
+- 使用 `JSZip` 将 7 个 CSV 文件打包为 ZIP
+- 使用 `Buffer.toString('base64')` 做 Base64 编码返回
 
-### 5.4 导出边界限制
+---
 
-#### 5.4.1 不导出的数据
+### 5.4 导出边界（未导出的数据）
 
-1. **原始事件数据**（`website_event` 表的详细记录）
-2. **会话数据**（`session_data`、`event_data`）
-3. **会话重放数据**（`session_replay`）
-4. **收入数据**（`revenue`）
-5. **用户敏感信息**（密码等）
-6. **团队管理数据**（团队成员、权限等）
+下列数据在当前版本的导出接口中**完全不可导出**：
 
-#### 5.4.2 仅导出聚合指标
+| 类别 | 未导出项 |
+|------|----------|
+| 原始明细 | `website_event` 逐行事件、`session` 明细、`visitId`、`distinctId` 明细 |
+| 扩展数据 | `event_data`（自定义事件字段键值）、`session_data`（会话自定义属性键值） |
+| 会话重放 | `session_replay.events`（ZSTD 压缩的 rrweb 录制数据） |
+| 收入数据 | `revenue` 表逐笔交易数据 |
+| 站点配置 | `replayEnabled`、`replayConfig`、`shareId`、`domain` 等站点属性 |
+| 团队管理 | 团队列表、成员、角色、`accessCode` |
+| 用户敏感信息 | 所有 User 相关字段（密码已哈希、不提供任何形式导出） |
+| 报表/看板 | `Report`、`Segment`、`Board`、`Link`、`Pixel` 定义 |
 
-导出的数据均为**聚合后的指标数据**，而非原始明细数据：
-- 事件统计
-- 页面浏览统计
-- 会话属性统计
+---
 
 ### 5.5 权限控制
+**代码位置**: [export/route.ts#L25-L27](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/websites/[websiteId]/export/route.ts#L25-L27)
 
-- **代码位置**: [export/route.ts#L25-L27](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/app/api/websites/[websiteId]/export/route.ts#L25-L27)
 ```typescript
 if (!(await canViewWebsite(auth, websiteId))) {
   return unauthorized();
 }
 ```
+
+**注意**：导出操作本身**无审计日志记录**，无法追溯「何时、何人、导出了哪个网站的哪个时间范围数据」。
 
 ---
 
@@ -338,30 +519,33 @@ if (!(await canViewWebsite(auth, websiteId))) {
 
 ### 6.1 权限检查矩阵
 
-| 操作 | 所需权限 | 代码位置 |
+| 操作 | 权限函数 | 所需角色 |
 |------|----------|----------|
-| 查看站点 | `canViewWebsite` | [permissions.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/permissions.ts) |
-| 更新站点 | `canUpdateWebsite` | [permissions.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/permissions.ts) |
-| 删除站点 | `canDeleteWebsite` | [permissions.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/permissions.ts) |
-| 查看团队 | `canViewTeam` | [permissions.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/permissions.ts) |
-| 更新团队 | `canUpdateTeam` | [permissions.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/permissions.ts) |
-| 删除团队 | `canDeleteTeam` | [permissions.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/permissions.ts) |
-| 查看用户 | `canViewUser` | [permissions.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/permissions.ts) |
-| 更新用户 | `canUpdateUser` | [permissions.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/permissions.ts) |
-| 删除用户 | `canDeleteUser` | [permissions.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/permissions.ts) |
+| 查看站点 | `canViewWebsite` | 网站所有者 / 团队成员（含 view-only）/ 管理员 |
+| 更新站点配置 | `canUpdateWebsite` | 网站所有者 / teamOwner / teamManager / teamMember / admin |
+| 删除站点 | `canDeleteWebsite` | 网站所有者 / teamOwner / teamManager / teamMember / admin |
+| 重置站点数据 | `canUpdateWebsite` | 同上（复用更新权限） |
+| 导出站点数据 | `canViewWebsite` | 所有可查看站点的用户（含 view-only） |
+| 查看团队 | `canViewTeam` | 团队成员 |
+| 更新团队 | `canUpdateTeam` | teamOwner / teamManager / admin |
+| 删除团队 | `canDeleteTeam` | teamOwner / admin |
+| 查看用户 | `canViewUser` | admin（或查看自己） |
+| 修改用户（用户名/角色） | `canUpdateUser` | admin |
+| 删除用户 | `canDeleteUser` | admin |
+| 修改自己密码 | — | 任何已登录用户（非 CLOUD_MODE） |
 
 ### 6.2 角色权限定义
-
-- **代码位置**: [constants.ts#L186-L217](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/lib/constants.ts#L186-L217)
+**代码位置**: [constants.ts#L164-L217](file:///d:/fz/0601-2/solo-dogfeeding/code/53-umami/src/lib/constants.ts#L164-L217)
 
 | 角色 | 权限 |
 |------|------|
-| admin | 所有权限 |
-| user | 网站创建/更新/删除、团队创建 |
-| team-owner | 团队更新/删除、网站管理、网站转移 |
-| team-manager | 团队更新、网站管理 |
-| team-member | 网站创建/更新/删除 |
-| view-only / team-view-only | 无管理权限 |
+| `admin` | `all`（全部权限） |
+| `user` | 网站创建/更新/删除、团队创建 |
+| `view-only` | 无管理权限 |
+| `team-owner` | 团队更新/删除、网站管理、网站转移 |
+| `team-manager` | 团队更新、网站创建/更新/删除、网站转团队 |
+| `team-member` | 网站创建/更新/删除 |
+| `team-view-only` | 无管理权限 |
 
 ---
 
@@ -369,30 +553,43 @@ if (!(await canViewWebsite(auth, websiteId))) {
 
 ### 7.1 当前覆盖范围总结
 
-| 维度 | 覆盖情况 | 说明 |
-|------|----------|------|
-| **变更记录 | ⚠️ 部分覆盖 | 仅有 `updatedAt` 时间戳，无审计日志表 |
-| **敏感字段脱敏 | ✅ 良好覆盖 | 会话重放两级脱敏，密码哈希保护 |
-| **保留策略 | ❌ 未覆盖 | 无自动化数据保留策略 |
-| **导出边界 | ✅ 良好控制 | 仅导出聚合指标，不导出原始数据 |
+| 维度 | 覆盖情况 | 详细说明 |
+|------|----------|----------|
+| 变更记录 | ⚠️ 部分覆盖 | 数据库实体仅依赖 `updatedAt` 时间戳；无审计日志表；无操作人记录；无 before/after 值对比；Website 仅有 `createdBy` 记录创建人 |
+| 偏好设置 | ❌ 不可审计 | 语言/时区/主题/默认日期范围/版本检查均为浏览器 localStorage，服务端不落库 |
+| 账号资料 | ⚠️ 部分覆盖 | 密码变更有独立 API 但无审计表；用户名/角色变更只能在 `User.updatedAt` 看到最后变更时间 |
+| 团队/站点配置 | ⚠️ 部分覆盖 | 可变更字段有时间戳，但无字段级变更历史 |
+| 敏感字段脱敏 | ✅ 良好覆盖 | 会话重放提供 strict/moderate 两级脱敏；密码 bcrypt 哈希存储 + 查询时默认排除；CLOUD_MODE 删除用户时用户名随机化 |
+| 保留策略 | ❌ 未覆盖 | 无自动化 TTL / 定时清理；CLOUD_MODE 软删除存在残留数据（下属数据不清理）；ClickHouse 无 TTL 配置 |
+| 导出边界 | ✅ 良好控制 | 仅允许导出 7 类聚合指标；原始明细/会话重放/收入/用户信息均不暴露；但导出操作本身无审计 |
+| 导出操作审计 | ❌ 缺失 | 导出行为不记录任何日志 |
 
 ### 7.2 改进建议
 
-1. **增加审计日志表**：
-   - 建议新增 `audit_log` 表记录配置变更历史
-   - 记录字段：`entity_type`、`entity_id`、`field`、`old_value`、`new_value`、`user_id`、`created_at`
+1. **新增 `audit_log` 表**：记录所有配置类变更
+   - 推荐字段：`entity_type`、`entity_id`、`field_name`、`old_value`、`new_value`、`user_id`、`ip_address`、`user_agent`、`created_at`
+   - 覆盖：Website / Team / TeamUser / User（含密码变更）/ Segment / Report / Link / Pixel / Board 的增删改
 
-2. **实现数据保留策略**：
-   - 配置 ClickHouse TTL 自动清理旧数据
-   - 提供可配置的数据保留周期
+2. **偏好设置上云（可选）**：若需要审计偏好变更，将 localStorage 项迁移至用户表 JSON 字段或独立 `user_preference` 表，写操作走 API 并触发 audit_log。
 
-3. **增加操作人记录**：
-   - 在关键操作（删除、重置、权限变更）记录操作人 ID
+3. **补全 CLOUD_MODE 软删除的级联处理**：
+   - 删除用户时同步标记其拥有的团队 `deletedAt`、团队成员 `teamUser` 状态
+   - 删除团队时同步标记 `websites` / `links` / `pixels` / `boards` 的 `deletedAt`
+   - Website 软删除时同步标记 `reports` / `segments` / `shares`
+   - Link / Pixel 删除逻辑补充 CLOUD_MODE 分支
 
-4. **导出审计**：
-   - 记录导出操作日志，包括导出人、导出时间、导出范围
+4. **实现数据保留策略**：
+   - PostgreSQL：增加定时任务清理已超过保留期的 `website_event`、`session`、`session_replay` 等
+   - ClickHouse：为 MergeTree 表增加 `TTL created_at + INTERVAL X DAY` 配置，并按月分区定期 DROP PARTITION
+   - 提供保留期配置项（按站点或全局）
+
+5. **操作行为审计**：
+   - 网站重置、网站删除、用户删除、团队删除、数据导出等高危操作，强制写入 audit_log
+   - 导出接口记录 `website_id`、`date_range_start`、`date_range_end`、`exported_by`、`exported_at`
+
+6. **Link / Pixel 统一删除模式**：当前 `deleteLink` / `deletePixel` 未使用 `deletedAt` 字段，建议与 Website/Team/User 保持一致，补充 CLOUD_MODE 软删除分支。
 
 ---
 
-**分析日期**: 2026-06-20
-**代码版本**: Umami 分析系统
+**分析日期**：2026-06-20
+**代码版本**：Umami 分析系统（基于提交时工作目录快照）
