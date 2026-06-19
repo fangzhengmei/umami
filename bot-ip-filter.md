@@ -183,23 +183,6 @@ export async function getClientInfo(request: Request, payload: Record<string, an
 #### 判断逻辑
 
 ```typescript
-if (!process.env.DISABLE_BOT_CHECK && isbot(userAgent)) {
-  return json({ beep: 'boop' });
-}
-```
-
-#### 关键特性
-
-- **使用库**：`isbot`（基于 user-agent 字符串匹配）
-- **开关**：`DISABLE_BOT_CHECK` 环境变量可禁用
-- **返回值**：返回 `{ beep: 'boop' }` 而非错误，伪装成正常响应
-- **位置**：在 IP 黑名单检查**之前**
-
-### 3.3 IP 黑名单 ([detect.ts:140-170](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/detect.ts#L140-L170))
-
-#### 判断逻辑
-
-```typescript
 export function hasBlockedIp(clientIp: string) {
   const ignoreIps = process.env.IGNORE_IP;
   if (ignoreIps) {
@@ -686,12 +669,14 @@ send/route.ts:66 外层 try { ... } catch (e) {
 8. **identify() 主动清缓存**：强制触发 session 记录重建，切换到 id 模式
 9. **录屏接口强依赖缓存**：无缓存 token 直接拒绝，不重新计算 session/visit
 
-### 6.3 隐藏风险与 Bug 点
+### 6.3 隐藏风险与 Bug 点（逐行验证版）
 
-| # | 风险 | 影响 | 代码位置 |
-|---|------|------|----------|
-| 1 | CIDR 配置 + 空 IP → `ipaddr.parse(undefined)` 抛 TypeError | 无 IP headers 的部署场景直接 500 | [detect.ts:210](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/detect.ts#L210) |
-| 2 | 空 IP + 空 UA → 所有匿名请求共享同一个 sessionId | 统计数据严重失真（unique visitors 极低） | [crypto.ts:49](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/crypto.ts#L49) + [send/route.ts:147](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L147) |
-| 3 | UA 中途变化 → sessionId 变化，但缓存 sessionId 未变 → createSession 重插 | 主键冲突或重复数据 | [send/route.ts:147](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L147) |
-| 4 | payload.browser='' → `??` 逻辑使浏览器字段变为空串 | 报表中出现空值浏览器 | [detect.ts:150](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/detect.ts#L150) |
-| 5 | /p /q 采集入口无 websiteId → 缓存检查完全跳过 | 像素/短链接场景永远重算 session、重写库 | [send/route.ts:103](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L103) |
+| # | 风险 | 影响 | 精确代码位置 |
+|---|------|------|--------------|
+| 1 | CIDR 配置 + 空 IP（undefined/''）→ `ipaddr.parse()` 抛 TypeError，外层 catch 返回 500 | 裸机部署且配了 CIDR 黑名单的环境必现 | [detect.ts:157](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/detect.ts#L157) |
+| 2 | 空 IP + 空 UA → `hash()` 中 `args.join('')` 将 undefined 拼成空串，所有匿名请求碰撞为同一个 sessionId | unique visitors 统计严重失真 | [crypto.ts:49](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/crypto.ts#L49) + [send/route.ts:147](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L147) |
+| 3 | UA/IP 中途变化 → 新 sessionId 与 cache 中旧值不同，但因 cache.sessionId 存在跳过 createSession → 事件表引用不存在的会话 | 非 ClickHouse 模式产生孤儿事件记录，外键可能失败或数据孤立 | [send/route.ts:147](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L147) + [send/route.ts:150](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L150) |
+| 4 | `payload.browser=''` 等空串覆盖 → `??` 操作符不走 fallback，browser/os 字段被写为空串 | 报表中出现空值浏览器/操作系统 | [detect.ts:150](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/lib/detect.ts#L150) |
+| 5 | `/p /q` 采集入口使用 linkId/pixelId → `if (websiteId)` 缓存分支完全不进入 → cache=null → 每次请求都执行 createSession | 像素/短链接场景完全没有缓存优化，重复写库 | [send/route.ts:103](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L103) |
+| 6 | sessionId 变了（如 IP 切换）但 visitId 仍沿用缓存中的旧值（场景 4.2 #7） | 同一个 visitId 下挂了不同 sessionId 的事件 → 会话/访问归属混乱 | [send/route.ts:168](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L168) |
+| 7 | `cache.iat = 0` → `0 || now` 被误判为未初始化 → iat 重置为当前时间 | 意外地延长了 visit 的「30 分钟窗口」，应过期的 visit 不会过期 | [send/route.ts:169](file:///d:/fz/0601-2/solo-dogfeeding/code/48-umami/src/app/api/send/route.ts#L169) |
