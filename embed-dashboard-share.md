@@ -381,11 +381,29 @@ model Pixel {
 
 ### 4.4 采集端的对应关系
 
-采集侧也是同理：Pixel 和 Link 的追踪端点（`/p/:slug`、`/q/:slug`）内部都通过 `fetchWebsite()` 查找实体，但 `fetchWebsite` 实际上对 Website / Pixel / Link 都能查，靠的就是"实体 ID 当 websiteId 用"的约定。
+采集侧 Pixel 和 Link 有独立的追踪入口，先查各自实体，再构造 payload 调用 `/api/send` 的 POST 处理函数：
 
-`src/lib/load.ts` 的 `fetchWebsite(websiteId)` 注释里写明了这个模式：
+**Pixel 追踪**（`src/app/(collect)/p/[slug]/route.ts`）：
 
-> 此函数名虽叫 fetchWebsite，但实际上用于加载 Website / Pixel / Link 三类实体。历史上只有 Website，后加的 Pixel 和 Link 复用了同一套加载逻辑。
+```
+1. GET /p/:slug
+2. findPixel({ where: { slug } })  → 查 Pixel 实体（Redis 缓存 86400s）
+3. 构造 payload: { type: 'event', payload: { pixel: pixel.id, url, referrer } }
+4. 直接调用 POST(req) （即 /api/send 的处理函数）
+5. 返回 1×1 GIF，Cache-Control: no-cache, no-store, must-revalidate
+```
+
+**Link 追踪**（`src/app/(collect)/q/[slug]/route.ts`）：
+
+```
+1. GET /q/:slug
+2. findLink({ where: { slug } })  → 查 Link 实体（Redis 缓存 86400s）
+3. 构造 payload: { type: 'event', payload: { link: link.id, url, referrer } }
+4. 直接调用 POST(req) （即 /api/send 的处理函数）
+5. 302 重定向到 link.url
+```
+
+注意：两者是在服务端直接调用 `POST()` 函数，不是 HTTP 转发，也不是走 `fetchWebsite()`。`src/lib/load.ts` 的 `fetchWebsite(websiteId)` 只加载 Website 实体，不涉及 Pixel/Link。
 
 ---
 
@@ -460,7 +478,7 @@ model Pixel {
 ├──────────────────────────────────────────────────────────────────────┤
 │  React Query（src/app/Providers.tsx, staleTime=60s）                │
 │  └─ Share 页面 + 主应用共用 QueryClient                             │
-│     Share Token 查询 key: ['share', slug]  staleTime=1h            │
+│     Share Token 查询 key: ['share', slug]  staleTime=60s           │
 │     统计数据查询 staleTime=60s                                       │
 ├──────────────────────────────────────────────────────────────────────┤
 │  Redis（src/lib/redis.ts, 可选，REDIS_URL 启用）                    │
@@ -517,19 +535,22 @@ async function getWhiteLabel(accountId: string): Promise<WhiteLabel | null> {
 
 `/api/*` 路径的 `Cache-Control: no-cache` 也适用于 `/api/share/:slug`，因此浏览器不会缓存 Token 响应。
 
-**5. React Query 层 — 1 小时**
+**5. React Query 层 — 60 秒**
 
 前端 `useShareTokenQuery`（`src/components/hooks/queries/useShareTokenQuery.ts`）：
 
 ```typescript
 useQuery({
   queryKey: ['share', slug],
-  queryFn: () => getShare(slug),
-  staleTime: 60 * 60 * 1000, // 1 hour
+  queryFn: async () => {
+    const data = await get(`/share/${slug}`);
+    setShareData(data, { token: data?.token });
+    return data;
+  },
 });
 ```
 
-Token 在前端缓存 1 小时。期间刷新页面或重新访问同 slug 的 Share 页面，不会重新签发 Token。
+`useShareTokenQuery` 没有单独设置 `staleTime`，使用 `src/app/Providers.tsx` 中配置的全局默认 `staleTime: 1000 * 60`（60 秒）。Token 在前端缓存 60 秒。期间刷新页面或重新访问同 slug 的 Share 页面，不会重新签发 Token。
 
 ### 6.3 权限变更的感知延迟
 
@@ -537,9 +558,9 @@ Token 在前端缓存 1 小时。期间刷新页面或重新访问同 slug 的 S
 
 | 变更类型 | 生效延迟 | 原因 |
 |---------|---------|------|
-| 修改 `parameters`（页面可见性） | 最长 1 小时（前端缓存） | React Query staleTime=1h |
-| 修改 Share 名称 | 最长 1 小时 | 同上 |
-| 删除 Share | 最长 1 小时（前端）+ 无后端缓存 | 前端缓存期内仍可访问；缓存过期后 404 |
+| 修改 `parameters`（页面可见性） | 最长 60 秒（前端缓存） | React Query staleTime=60s |
+| 修改 Share 名称 | 最长 60 秒 | 同上 |
+| 删除 Share | 最长 60 秒（前端）+ 无后端缓存 | 前端缓存期内仍可访问；缓存过期后 404 |
 | 修改白标签 | 立即（Redis 无 TTL，但需主动更新 Redis 键） | 白标签直接读 Redis |
 | 修改实体名（Website / Pixel / Link） | 立即（签发时直接查 DB） | 签发接口不用 Redis 缓存实体 |
 
