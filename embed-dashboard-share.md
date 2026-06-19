@@ -535,7 +535,7 @@ async function getWhiteLabel(accountId: string): Promise<WhiteLabel | null> {
 
 `/api/*` 路径的 `Cache-Control: no-cache` 也适用于 `/api/share/:slug`，因此浏览器不会缓存 Token 响应。
 
-**5. React Query 层 — 60 秒**
+**5. React Query 层 — staleTime 60 秒**
 
 前端 `useShareTokenQuery`（`src/components/hooks/queries/useShareTokenQuery.ts`）：
 
@@ -550,19 +550,41 @@ useQuery({
 });
 ```
 
-`useShareTokenQuery` 没有单独设置 `staleTime`，使用 `src/app/Providers.tsx` 中配置的全局默认 `staleTime: 1000 * 60`（60 秒）。Token 在前端缓存 60 秒。期间刷新页面或重新访问同 slug 的 Share 页面，不会重新签发 Token。
+`useShareTokenQuery` 没有单独设置 `staleTime`，使用 `src/app/Providers.tsx` 中配置的全局默认 `staleTime: 1000 * 60`（60 秒）。
+
+**staleTime 的实际语义**（基于 React Query v5 行为）：
+
+- `staleTime` 只约束**当前运行时**内查询的新鲜度。60 秒内同一 `queryKey` 的 `useQuery` 调用直接返回缓存，不发请求
+- 查询变 stale 后，**不会自动 refetch**。需要以下触发条件之一才会重新请求：
+  - **组件重新挂载**（`mount`）：ShareProvider 内的 `useShareTokenQuery` 因路由切换被卸载再挂载
+  - **窗口重新聚焦**：但 `refetchOnWindowFocus: false`（Providers.tsx:15）禁用了此行为
+  - **手动触发**：`queryClient.invalidateQueries()` 或 `refetch()`——代码中未发现对 share 查询的手动 invalidate
+- **全页面刷新（F5 / Ctrl+R）**：`QueryClient` 实例在模块作用域创建（Providers.tsx:11 `const client = new QueryClient(...)`），但全页面刷新会销毁整个 JS 运行时并重新执行，QueryClient 被重建，所有缓存清空，`useShareTokenQuery` 会重新请求 `/api/share/:slug`
+- **SPA 路由跳转**：QueryClient 不销毁，缓存保留。在 60 秒内从 `/share/abc/events` 跳到 `/share/abc/sessions`（同 slug 的 ShareProvider 不卸载），不会重新请求 Token
+
+**对 Share Token 查询的具体影响**：
+
+| 场景 | 是否重新签发 Token | 原因 |
+|------|-------------------|------|
+| 首次访问 `/share/:slug` | 是 | QueryClient 刚创建，无缓存 |
+| 60 秒内在同 slug 页面间 SPA 跳转 | 否 | 查询仍 fresh，直接返回缓存 |
+| 超过 60 秒后 SPA 跳转导致 ShareProvider 重挂载 | 是 | 查询已 stale，重挂载触发 refetch |
+| 超过 60 秒但 ShareProvider 一直挂载未卸载 | 否 | stale 不会自动 refetch，`refetchOnWindowFocus` 已禁用 |
+| 全页面刷新（F5） | 是 | JS 运行时重建，QueryClient 重建，缓存清空 |
+| 新标签页打开同 URL | 是 | 独立运行时，独立 QueryClient |
 
 ### 6.3 权限变更的感知延迟
 
-结合缓存层，Share 权限变更的生效时间：
+结合上述缓存语义，Share 权限变更在不同场景下的生效时间：
 
-| 变更类型 | 生效延迟 | 原因 |
-|---------|---------|------|
-| 修改 `parameters`（页面可见性） | 最长 60 秒（前端缓存） | React Query staleTime=60s |
-| 修改 Share 名称 | 最长 60 秒 | 同上 |
-| 删除 Share | 最长 60 秒（前端）+ 无后端缓存 | 前端缓存期内仍可访问；缓存过期后 404 |
-| 修改白标签 | 立即（Redis 无 TTL，但需主动更新 Redis 键） | 白标签直接读 Redis |
-| 修改实体名（Website / Pixel / Link） | 立即（签发时直接查 DB） | 签发接口不用 Redis 缓存实体 |
+| 变更类型 | 用户仍在同一页面 | 用户刷新页面（F5） | 用户在新标签页打开 |
+|---------|----------------|-------------------|-------------------|
+| 修改 `parameters` | 60 秒内不变；超 60 秒后若 ShareProvider 不重挂载则仍不变 | 立即生效 | 立即生效 |
+| 删除 Share | 60 秒内仍可用；超 60 秒后若不重挂载则仍可用 | 立即 404 | 立即 404 |
+| 修改白标签 | 取决于 Redis 键是否被主动更新 | 立即生效 | 立即生效 |
+| 修改实体名 | 签发时直接查 DB，下次签发即生效 | 立即生效 | 立即生效 |
+
+**关键结论**：React Query 的 `staleTime` 不是"数据过期时间"，而是"缓存信任窗口"。数据变 stale 后，只有在特定触发条件下才会刷新。对于一直停留在同一 Share 页面且不刷新的用户，参数变更可能长期不被感知。
 
 ### 6.4 Redis 软删除机制
 
