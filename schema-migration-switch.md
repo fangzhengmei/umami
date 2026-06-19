@@ -519,11 +519,62 @@ async function clickhouseQuery(args) {
   - ⚠️ 主表成功 + event_data 失败 → 出现"宽表存在但属性缺"的中间态（与 PG 一致）。
 - `website_revenue` 由 MV 在后台异步生成，写入 `event_data` 后 MV 不保证立即可见（最终一致，通常毫秒级）。
 
-#### 幂等性
+#### 幂等性：按存储引擎 + 查询口径区分
 
-- **普通 MergeTree 表（website_event / event_data / session_replay）**：不幂等。重试会产生重复行，但查询端通常用 `uniq(session_id)` / `countDistinct` 做近似去重，对计数结果影响有限。
-- **ReplacingMergeTree 表（session_data）**：排序键 `(website_id, session_id, data_key)`，相同键在后台合并时只保留最新版本，实现天然 upsert。写入幂等。
-- **AggregatingMergeTree 表（website_event_stats_hourly）**：由 MV 写入，源表去重与否不影响聚合结果（sum/uniq 可抵抗重复）。
+ClickHouse 侧的幂等性**不是一个全局属性**，需同时看表引擎、聚合口径、以及是否经过预聚合 MV。以下是完整分析：
+
+**1. 按表引擎区分写入幂等**
+
+| 表 | 引擎 | 写入幂等 | 说明 |
+|----|------|----------|------|
+| `website_event` | MergeTree | ❌ 不幂等 | 主键不含 `event_id`，同 event 写 N 次就有 N 行重复 |
+| `event_data` | MergeTree | ❌ 不幂等 | 同上 |
+| `session_replay` | MergeTree | ❌ 不幂等 | 同上 |
+| `session_data` | **ReplacingMergeTree** | ✅ 幂等 | 排序键 `(website_id, session_id, data_key)`，同键重复写入在后台合并时只保留最新版本，天然 upsert |
+| `website_event_stats_hourly` | **AggregatingMergeTree** | 取决于源表 | 由 MV 从 `website_event` 自动写入，源表有重复则预聚合结果也会受影响 |
+| `website_revenue` | MergeTree | 取决于 event_data | 由 MV 从 `event_data` JOIN 生成，event_data 有重复则 revenue 表也重复 |
+
+**2. 按查询口径区分：哪些指标能抗重复、哪些会失真**
+
+⚠️ **核心修正**：`uniq(session_id)` 只能去重"按会话维度计数"的指标，**页面浏览、事件数、收入、预聚合 views 等 sum/count 类指标会被重复行线性放大**。
+
+**✅ 可去重（不受重复行影响）的指标**（基于 `uniq` / `countDistinct`）：
+
+| 指标 | 聚合函数 | 代码位置 |
+|------|----------|----------|
+| visitors（访客数） | `uniq(session_id)` | [`getWebsiteStats`](src/queries/sql/getWebsiteStats.ts#L90) / [`getWebsiteEventStats`](src/queries/sql/events/getWebsiteEventStats.ts#L76) |
+| visits（访问次数） | `uniq(visit_id)` | [`getWebsiteStats`](src/queries/sql/getWebsiteStats.ts#L91) / [`getWebsiteEventStats`](src/queries/sql/events/getWebsiteEventStats.ts#L77) |
+| uniqueEvents（唯一事件名） | `count(distinct event_name)` | [`getWebsiteEventStats`](src/queries/sql/events/getWebsiteEventStats.ts#L78) |
+| active visitors（实时访客） | `count(distinct session_id)` | [`getActiveVisitors`](src/queries/sql/getActiveVisitors.ts#L40) |
+| weekly traffic（周流量访客） | `count(distinct session_id)` | [`getWeeklyTraffic`](src/queries/sql/getWeeklyTraffic.ts#L60) |
+| revenue count（交易笔数） | `uniqExact(event_id)` | [`getRevenueStats`](src/queries/sql/reports/getRevenueStats.ts#L115) |
+| revenue unique_count（付费会话数） | `uniqExact(session_id)` | [`getRevenueStats`](src/queries/sql/reports/getRevenueStats.ts#L116) |
+| total_sessions（总会话数分母） | `uniqExact(session_id)` | [`getRevenueStats`](src/queries/sql/reports/getRevenueStats.ts#L117) |
+| performance 百分位数 | `quantile(0.75)(lcp)` | [`getPerformanceStats`](src/queries/sql/performance/getPerformanceStats.ts#L65) —— 近似抗重复，重复比例低时影响小 |
+| revenue average（均价） | `sum / count` | [`getRevenueStats`](src/queries/sql/reports/getRevenueStats.ts#L132) —— 分子分母同比例放大，比值不变 |
+
+**❌ 会失真（随重复行线性放大）的指标**（基于 `sum` / `count` / `sumIf`）：
+
+| 指标 | 聚合函数 | 失真倍率 | 代码位置 |
+|------|----------|----------|----------|
+| pageviews（页面浏览量） | `sum(t.c)` 或 `count(*)` 或 `sum(views)` | ≈ 重复次数 | [`getWebsiteStats`](src/queries/sql/getWebsiteStats.ts#L89) / [`getPageviewStats`](src/queries/sql/pageviews/getPageviewStats.ts#L67#L87) |
+| events（事件总数） | `sum(t.c)` 或 `count(*)` | ≈ 重复次数 | [`getWebsiteEventStats`](src/queries/sql/events/getWebsiteEventStats.ts#L75) |
+| bounces（跳出数） | `sumIf(1, t.c = 1)` | 非线性：重复行使 `t.c > 1` 后不再计入跳出，反而可能**低估** | [`getWebsiteStats`](src/queries/sql/getWebsiteStats.ts#L84#L92) |
+| totaltime（总停留时长） | `sum(max_time - min_time)` | ≈ 重复次数 | [`getWebsiteStats`](src/queries/sql/getWebsiteStats.ts#L93) |
+| revenue sum（收入总额） | `sum(website_revenue.revenue)` | ≈ 重复次数 | [`getRevenueStats`](src/queries/sql/reports/getRevenueStats.ts#L114) |
+| performance count（性能样本数） | `count()` | ≈ 重复次数 | [`getPerformanceStats`](src/queries/sql/performance/getPerformanceStats.ts#L70) |
+| revenue arpu（每会话收入） | `sum / total_sessions` | 分子放大、分母不放大 → **虚高** | [`getRevenueStats`](src/queries/sql/reports/getRevenueStats.ts#L133) |
+
+**3. 预聚合表的特殊性**
+
+`website_event_stats_hourly` 的 MV 写入逻辑 [`db/clickhouse/schema.sql`](db/clickhouse/schema.sql)：
+```sql
+sumIf(1, event_type NOT IN (2, 5)) views,    -- ❌ sum，会被重复行放大
+uniqState(session_id) as visitors,           -- ✅ State 函数会去重
+uniqState(visit_id) as visits,               -- ✅ State 函数会去重
+```
+
+即便是预聚合表，**`views`（页面浏览）列同样会被重复行放大**，只有 State 函数包裹的去重指标安全。
 
 #### 失败边界
 
