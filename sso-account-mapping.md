@@ -3,53 +3,74 @@
 ## 概述
 
 本文档基于 Umami v3.1.0 开源版本代码库，分析企业 SSO 登录链路的账号归属规则。
-SSO 功能主要在 **Cloud 模式** 下运行，核心的 OAuth/SAML 认证逻辑由 Cloud 服务层处理，开源版本提供 SSO 入口、用户匹配和权限管理框架。
+
+> **重要说明**：开源版本仅提供 SSO 接入的基础框架和用户/团队数据模型。完整的 OAuth/SAML 协议处理、JIT 用户自动创建、邮件域到 Team 自动映射、IdP 角色组映射等企业级 SSO 功能**未在开源版本中实现**，需依赖 Cloud 商业服务或自行扩展。
 
 ---
 
-## 1. SSO 整体架构
+## 1. 实现状态总览
 
-### 1.1 架构分层
+| 功能模块 | 开源版本实现状态 | 说明 |
+|---------|-----------------|------|
+| SSO 回调入口页面 | ✅ 已实现 | `/sso` 页面，接收 token 和 url 参数 |
+| SSO 认证 API | ✅ 已实现 | `/api/auth/sso`，验证并创建应用 Session |
+| 本地用户匹配 | ✅ 已实现 | 通过 `username` 字段精确匹配 |
+| 团队与成员模型 | ✅ 已实现 | Team + TeamUser 关联表 |
+| 角色与权限系统 | ✅ 已实现 | 系统级 + 团队级双层角色体系 |
+| OAuth 协议处理 | ❌ 未实现 | 依赖外部服务（Cloud/自建 IdP 适配层） |
+| SAML 协议处理 | ❌ 未实现 | 依赖外部服务（Cloud/自建 IdP 适配层） |
+| JIT 自动创建用户 | ❌ 未实现 | 需自行扩展或使用 Cloud 服务 |
+| 邮件域 → Team 自动映射 | ❌ 未实现 | 需自行扩展或使用 Cloud 服务 |
+| IdP 角色/组映射 | ❌ 未实现 | 需自行扩展或使用 Cloud 服务 |
+
+---
+
+## 2. SSO 整体架构
+
+### 2.1 分层架构
 
 ```
-┌─────────────────────────────────────────────────┐
-│           企业 IdP (OAuth/SAML)                │
-└────────────────────┬────────────────────────────┘
-                     │ SSO 认证
-                     ▼
-┌─────────────────────────────────────────────────┐
-│           Cloud 服务层 (SSO 核心逻辑)           │
-│  - OAuth/SAML 回调处理                          │
-│  - JIT 用户预配置                                │
-│  - 邮件域 → Team 映射                           │
-│  - 角色映射                                      │
-└────────────────────┬────────────────────────────┘
-                     │ 传递认证后的用户信息
-                     ▼
-┌─────────────────────────────────────────────────┐
-│           Umami 应用层 (开源版本)               │
-│  - /api/auth/sso 接收认证 Token                 │
-│  - 本地用户匹配 (username)                       │
-│  - 权限验证 (Auth + TeamUser)                   │
-│  - Session 管理 (Redis/JWT)                     │
-└─────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────┐
+│  企业 IdP (OAuth / SAML)                          │
+│  （第三方服务，非 Umami 代码）                    │
+└──────────────────────┬────────────────────────────┘
+                       │ SSO 认证
+                       ▼
+┌───────────────────────────────────────────────────┐
+│  SSO 适配层                                       │
+│  ⚠️  开源版本未实现 — 需自建或使用 Cloud 服务     │
+│  • OAuth/SAML 协议处理                            │
+│  • 回调验证与用户信息解析                          │
+│  • JIT 用户创建逻辑                               │
+│  • 邮件域 → Team 映射                             │
+│  • IdP 角色 → Umami 角色映射                      │
+└──────────────────────┬────────────────────────────┘
+                       │ 传递认证后的 userId / token
+                       ▼
+┌───────────────────────────────────────────────────┐
+│  Umami 应用层（开源版本已实现）                    │
+│  • /api/auth/sso 接收认证                          │
+│  • 本地用户匹配 (username)                         │
+│  • 权限验证 (Auth + TeamUser)                      │
+│  • Session 管理 (Redis / JWT)                      │
+└───────────────────────────────────────────────────┘
 ```
 
-### 1.2 关键入口点
+### 2.2 关键入口点
 
 | 入口 | 文件路径 | 作用 |
 |------|---------|------|
-| SSO 页面 | [src/app/sso/page.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/app/sso/page.tsx) | 接收 SSO 回调后的 url 和 token，完成客户端登录跳转 |
-| SSO API | [src/app/api/auth/sso/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/app/api/auth/sso/route.ts) | 验证 SSO 认证，生成应用 Session Token |
-| 登录页 | [src/app/login/page.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/app/login/page.tsx) | Cloud 模式下禁用本地登录页 |
+| SSO 页面 | `src/app/sso/page.tsx` | 接收 SSO 回调后的 url 和 token，完成客户端登录跳转 |
+| SSO API | `src/app/api/auth/sso/route.ts` | 验证 SSO 认证，生成应用 Session Token |
+| 登录页 | `src/app/login/page.tsx` | Cloud 模式下禁用本地登录页 |
 
 ---
 
-## 2. OAuth/SAML 回调流程
+## 3. SSO 回调流程（开源已实现部分）
 
-### 2.1 SSO 回调页面处理
+### 3.1 SSO 回调页面
 
-**文件**: [src/app/sso/SSOPage.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/app/sso/SSOPage.tsx)
+**文件**: `src/app/sso/SSOPage.tsx`
 
 ```typescript
 export function SSOPage() {
@@ -60,7 +81,7 @@ export function SSOPage() {
 
   useEffect(() => {
     if (url && token) {
-      setClientAuthToken(token);  // 存储 Token 到客户端
+      setClientAuthToken(token);  // 存储 Token 到客户端 (localStorage)
       router.push(url);           // 跳转到目标页面
     }
   }, [router, url, token]);
@@ -70,16 +91,16 @@ export function SSOPage() {
 ```
 
 **流程说明**:
-1. 用户从企业 IdP 完成认证后，IdP 重定向回 Umami 的 `/sso` 页面
+1. 用户从 SSO 适配层完成认证后，重定向回 Umami 的 `/sso` 页面
 2. URL 携带两个参数：
-   - `token`: SSO 认证凭证（由 Cloud 服务层签发）
+   - `token`: 已验证的认证凭证（由 SSO 适配层签发）
    - `url`: 登录成功后跳转的目标页面
 3. 前端将 Token 存入本地存储（key: `umami.auth`）
-4. 前端跳转到目标页面，后续请求通过 `Authorization` Header 携带 Token
+4. 前端跳转到目标页面，后续请求通过 `Authorization: Bearer <token>` 携带
 
-### 2.2 SSO API 验证
+### 3.2 SSO 认证 API
 
-**文件**: [src/app/api/auth/sso/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/app/api/auth/sso/route.ts)
+**文件**: `src/app/api/auth/sso/route.ts`
 
 ```typescript
 export async function POST(request: Request) {
@@ -106,9 +127,11 @@ export async function POST(request: Request) {
 4. 调用 `saveAuth` 将用户信息存入 Redis（有效期 86400 秒 = 24 小时）
 5. 返回新的应用 Token 和用户信息
 
-### 2.3 认证中间件
+> **注意**: SSO API 本身不做 OAuth/SAML 协议处理，仅接收已验证的用户身份并创建应用会话。
 
-**文件**: [src/lib/auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/lib/auth.ts)
+### 3.3 认证中间件
+
+**文件**: `src/lib/auth.ts`
 
 ```typescript
 export async function checkAuth(request: Request) {
@@ -120,9 +143,9 @@ export async function checkAuth(request: Request) {
   const { userId, authKey } = payload || {};
 
   if (userId) {
-    user = await getUser(userId);          // 直接通过 userId 查询
+    user = await getUser(userId);          // 方式1: 直接通过 userId 查询
   } else if (redis.enabled && authKey) {
-    const key = await redis.client.get(authKey); // 通过 Redis authKey 查询
+    const key = await redis.client.get(authKey); // 方式2: 通过 Redis authKey 查询
     if (key?.userId) {
       user = await getUser(key.userId);
     }
@@ -132,7 +155,9 @@ export async function checkAuth(request: Request) {
     return null; // 认证失败
   }
 
-  // ... 权限检查
+  if (user) {
+    user.isAdmin = user.role === ROLES.admin;
+  }
 
   return { token, authKey, shareToken, user };
 }
@@ -145,13 +170,13 @@ export async function checkAuth(request: Request) {
 
 ---
 
-## 3. 本地用户匹配规则
+## 4. 本地用户匹配规则（开源已实现）
 
-### 3.1 用户匹配键
+### 4.1 用户匹配键
 
 **核心匹配字段**: `username`
 
-**文件**: [src/queries/prisma/user.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/queries/prisma/user.ts)
+**文件**: `src/queries/prisma/user.ts`
 
 ```typescript
 export async function getUserByUsername(username: string, options: GetUserOptions = {}) {
@@ -159,33 +184,39 @@ export async function getUserByUsername(username: string, options: GetUserOption
 }
 ```
 
-**数据模型**: [prisma/schema.prisma](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/prisma/schema.prisma)
+**数据模型**: `prisma/schema.prisma`
 
 ```prisma
 model User {
   id          String    @id() @map("user_id") @db.Uuid
-  username    String    @unique @db.VarChar(255)  // 唯一索引，用于 SSO 匹配
+  username    String    @unique @db.VarChar(255)  // 唯一索引，SSO 匹配的唯一句柄
   password    String    @db.VarChar(60)
   role        String    @map("role") @db.VarChar(50)
+  logoUrl     String?   @map("logo_url") @db.VarChar(2183)
+  displayName String?   @map("display_name") @db.VarChar(255)
+  createdAt   DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime? @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt   DateTime? @map("deleted_at") @db.Timestamptz(6)
   // ...
 }
 ```
 
-### 3.2 匹配规则
+### 4.2 匹配规则
 
-| 匹配方式 | 说明 | 优先级 |
-|---------|------|--------|
-| `username` 精确匹配 | SSO 返回的用户名（通常是邮箱）与 User 表的 `username` 字段完全匹配 | 唯一匹配方式 |
+| 匹配方式 | 说明 | 状态 |
+|---------|------|------|
+| `username` 精确匹配 | SSO 返回的用户名（通常是邮箱）与 User 表的 `username` 字段完全匹配 | ✅ 已实现（唯一匹配方式） |
+| 邮箱正则匹配 | 通过邮箱格式或域名模糊匹配 | ❌ 未实现 |
+| 外部 ID 匹配 | 通过 IdP 提供的唯一外部 ID 匹配 | ❌ 未实现（无 external_id 字段） |
+| 多字段匹配 | 结合姓名、邮箱等多字段匹配 | ❌ 未实现 |
 
-> **注意**: 开源版本中，SSO 用户匹配完全依赖 `username` 字段。Cloud 模式下的 SSO 可能会使用邮箱作为 username 进行匹配。
+### 4.3 用户创建（手动方式）
 
-### 3.3 用户创建 (JIT 前置条件)
-
-**文件**: [src/app/api/users/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/app/api/users/route.ts)
+**文件**: `src/app/api/users/route.ts`
 
 ```typescript
 export async function POST(request: Request) {
-  // ... 权限检查
+  // ... 权限检查 (仅 admin 可创建)
 
   const existingUser = await getUserByUsername(username, { showDeleted: true });
 
@@ -206,25 +237,32 @@ export async function POST(request: Request) {
 
 **创建规则**:
 - 只有 `admin` 角色可以创建用户
-- `username` 全局唯一（含已删除用户）
+- `username` 全局唯一（含已删除用户也占用用户名）
 - 默认角色为 `user`
-- 必须设置密码（SSO 用户可能由 Cloud 层自动生成随机密码）
+- 必须设置密码字段
+
+> **⚠️ JIT 自动创建用户未实现**: 开源版本中不存在任何自动创建用户的逻辑。SSO 场景下，如果用户不存在，认证将失败。需自行扩展 JIT 逻辑或使用 Cloud 服务。
 
 ---
 
-## 4. 邮件域到 Team 映射
+## 5. 邮件域到 Team 映射
 
-### 4.1 团队模型
+### 5.1 团队数据模型（开源已实现）
 
-**文件**: [prisma/schema.prisma](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/prisma/schema.prisma)
+**文件**: `prisma/schema.prisma`
 
 ```prisma
 model Team {
   id         String    @id() @map("team_id") @db.Uuid
   name       String    @db.VarChar(50)
   accessCode String?   @unique @map("access_code") @db.VarChar(50)
+  logoUrl    String?   @map("logo_url") @db.VarChar(2183)
+  createdAt  DateTime? @default(now()) @map("created_at")
+  updatedAt  DateTime? @updatedAt @map("updated_at")
+  deletedAt  DateTime? @map("deleted_at")
+  websites   Website[]
+  members    TeamUser[]
   // ...
-  members  TeamUser[]
 }
 
 model TeamUser {
@@ -233,17 +271,17 @@ model TeamUser {
   userId    String    @map("user_id") @db.Uuid
   role      String    @db.VarChar(50)     // 团队内角色
   createdAt DateTime? @default(now()) @map("created_at")
-  // ...
+  updatedAt DateTime? @updatedAt @map("updated_at")
   team Team @relation(fields: [teamId], references: [id])
   user User @relation(fields: [userId], references: [id])
 }
 ```
 
-### 4.2 团队加入方式
+### 5.2 团队加入方式（开源已实现）
 
 **方式 1: 访问码加入**
 
-**文件**: [src/app/api/teams/join/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/app/api/teams/join/route.ts)
+**文件**: `src/app/api/teams/join/route.ts`
 
 ```typescript
 export async function POST(request: Request) {
@@ -269,11 +307,11 @@ export async function POST(request: Request) {
 
 **方式 2: 管理员添加成员**
 
-**文件**: [src/app/api/teams/[teamId]/users/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/app/api/teams/%5BteamId%5D/users/route.ts)
+**文件**: `src/app/api/teams/[teamId]/users/route.ts`
 
 ```typescript
 export async function POST(request: Request, { params }) {
-  // ... 权限检查 (canUpdateTeam)
+  // ... 权限检查 (需 canUpdateTeam)
 
   const { userId, role } = body;
 
@@ -289,65 +327,45 @@ export async function POST(request: Request, { params }) {
 }
 ```
 
-### 4.3 邮件域映射机制 (Cloud 模式)
+### 5.3 邮件域自动映射（❌ 未实现）
 
-开源版本中没有直接的邮件域到 Team 的自动映射代码。根据 Cloud 模式的架构推断：
+开源版本中**不存在**任何基于邮箱域名自动加入团队的逻辑。
 
-| 机制 | 说明 | 位置 |
-|------|------|------|
-| 企业域名配置 | 在 Cloud 管理后台配置企业邮箱域名与 Team 的绑定关系 | Cloud 服务层 |
-| 自动加入 | SSO 用户首次登录时，根据其邮箱后缀自动加入对应 Team | Cloud 服务层调用 `createTeamUser` |
-| 多 Team 支持 | 一个邮箱域可映射到多个 Team，或一个 Team 可绑定多个邮箱域 | Cloud 服务层配置 |
+| 相关功能 | 实现状态 | 说明 |
+|---------|---------|------|
+| 企业域名配置 | ❌ 未实现 | 无相关配置项，无对应数据库字段 |
+| 邮箱域 → Team 绑定 | ❌ 未实现 | 无映射关系表，无匹配逻辑 |
+| SSO 登录自动加入 Team | ❌ 未实现 | 登录流程中无自动加入团队的代码 |
+| 多 Team 映射 | ❌ 未实现 | 上述基础能力均未实现 |
+
+> **扩展建议**: 如需实现邮件域自动映射，可在 SSO 适配层或自定义扩展中：
+> 1. 新增 `team_domain` 配置表存储域名与 Team 的映射关系
+> 2. 在 SSO 登录流程中，根据用户邮箱后缀查询匹配的 Team
+> 3. 调用 `createTeamUser` 自动建立成员关系
 
 ---
 
-## 5. JIT (Just-In-Time) 配置
+## 6. JIT (Just-In-Time) 配置
 
-### 5.1 JIT 用户创建
+### 6.1 JIT 状态
 
-开源版本中，用户创建需要管理员手动操作。Cloud 模式下 JIT 功能的推断行为：
+| JIT 功能 | 实现状态 | 说明 |
+|---------|---------|------|
+| JIT 自动创建用户 | ❌ 未实现 | 开源版本无相关代码 |
+| 邮箱域白名单 | ❌ 未实现 | 无域名白名单校验逻辑 |
+| 默认角色配置 | ❌ 未实现 | 无 JIT 默认角色配置项 |
+| 自动加入默认 Team | ❌ 未实现 | 无相关逻辑 |
 
-| JIT 配置项 | 说明 | 默认值 |
-|-----------|------|--------|
-| `JIT_ENABLED` | 是否启用自动创建用户 | false |
-| `JIT_DEFAULT_ROLE` | 自动创建用户的默认角色 | `user` |
-| `JIT_EMAIL_DOMAINS` | 允许自动创建用户的邮箱域白名单 | 空 (全部允许或按配置) |
-| `JIT_TEAM_ID` | 用户自动加入的 Team ID | 空 (不自动加入) |
+### 6.2 现有创建流程（手动）
 
-### 5.2 JIT 流程 (推断)
+开源版本中，用户只能通过以下两种方式创建：
 
-```
-SSO 回调
-   │
-   ▼
-检查用户是否存在 (getUserByUsername)
-   │
-   ├─ 存在 → 直接登录，更新用户信息
-   │
-   └─ 不存在 →
-        │
-        ├─ JIT 未启用 → 登录失败
-        │
-        └─ JIT 已启用 →
-             │
-             ├─ 检查邮箱域名白名单
-             │
-             ├─ 创建用户 (createUser)
-             │   - username: SSO 返回的邮箱
-             │   - password: 随机生成 (SSO 用户不使用本地密码)
-             │   - role: JIT_DEFAULT_ROLE
-             │
-             ├─ 邮件域 → Team 映射
-             │   - 查找匹配的 Team
-             │   - 创建 TeamUser 关系
-             │   - 角色: 默认 team-member 或按映射规则
-             │
-             └─ 返回登录成功
-```
+1. **管理员手动创建**: 通过 `/api/users` POST 接口，需 `admin` 权限
+2. **用户注册**: （无内置注册功能，需自行扩展）
 
-### 5.3 支撑代码
+### 6.3 支撑代码（可作为 JIT 扩展基础）
 
-**用户创建函数**: [src/queries/prisma/user.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/queries/prisma/user.ts)
+**用户创建函数**: `src/queries/prisma/user.ts`
 
 ```typescript
 export async function createUser(data: {
@@ -363,7 +381,7 @@ export async function createUser(data: {
 }
 ```
 
-**团队成员创建函数**: [src/queries/prisma/teamUser.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/queries/prisma/teamUser.ts)
+**团队成员创建函数**: `src/queries/prisma/teamUser.ts`
 
 ```typescript
 export async function createTeamUser(userId: string, teamId: string, role: string) {
@@ -378,23 +396,28 @@ export async function createTeamUser(userId: string, teamId: string, role: strin
 }
 ```
 
+> **扩展建议**: 如需实现 JIT，可在 SSO 适配层中：
+> 1. SSO 回调后检查用户是否存在（`getUserByUsername`）
+> 2. 不存在则调用 `createUser` 创建（自动生成随机密码）
+> 3. 根据邮件域映射规则调用 `createTeamUser` 加入团队
+
 ---
 
-## 6. 角色映射规则
+## 7. 角色映射规则
 
-### 6.1 系统级角色
+### 7.1 系统级角色（开源已实现）
 
-**定义**: [src/lib/constants.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/lib/constants.ts#L164-L172)
+**定义**: `src/lib/constants.ts`
 
 | 角色 | 常量值 | 说明 |
 |------|--------|------|
 | admin | `admin` | 系统管理员，拥有所有权限 |
 | user | `user` | 普通注册用户，可创建网站和团队 |
-| view-only | `view-only` | 只读用户 (系统级，预留) |
+| view-only | `view-only` | 只读用户（系统级，预留） |
 
-### 6.2 团队级角色
+### 7.2 团队级角色（开源已实现）
 
-**定义**: [src/lib/constants.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/lib/constants.ts#L168-L171)
+**定义**: `src/lib/constants.ts`
 
 | 角色 | 常量值 | 说明 |
 |------|--------|------|
@@ -403,9 +426,9 @@ export async function createTeamUser(userId: string, teamId: string, role: strin
 | team-member | `teamMember` | 团队成员，可创建和管理网站 |
 | team-view-only | `teamViewOnly` | 团队只读成员，只能查看 |
 
-### 6.3 角色权限映射
+### 7.3 角色权限映射（开源已实现）
 
-**定义**: [src/lib/constants.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/lib/constants.ts#L186-L217)
+**定义**: `src/lib/constants.ts`
 
 | 权限 | admin | user | view-only | team-owner | team-manager | team-member | team-view-only |
 |------|-------|------|-----------|------------|--------------|-------------|----------------|
@@ -419,23 +442,25 @@ export async function createTeamUser(userId: string, teamId: string, role: strin
 | `team:update` | ✅ | - | - | ✅ | ✅ | - | - |
 | `team:delete` | ✅ | - | - | ✅ | - | - | - |
 
-### 6.4 SSO 角色映射 (推断)
+### 7.4 IdP 角色/组映射（❌ 未实现）
 
-Cloud 模式下，SSO 断言 (Assertion) 中的角色/组信息会映射到 Umami 角色：
+开源版本中**不存在**任何将 IdP（身份提供者）的用户组、角色声明映射到 Umami 角色的逻辑。
 
-| IdP 角色/组 | 映射到系统角色 | 映射到团队角色 |
-|------------|---------------|---------------|
-| `umami:admin` | `admin` | - |
-| `umami:user` | `user` | - |
-| `team:{teamId}:owner` | - | `team-owner` |
-| `team:{teamId}:manager` | - | `team-manager` |
-| `team:{teamId}:member` | - | `team-member` |
-| `team:{teamId}:view-only` | - | `team-view-only` |
-| 默认 (无匹配) | `user` (JIT 创建时) | `team-member` (自动加入时) |
+| 映射功能 | 实现状态 | 说明 |
+|---------|---------|------|
+| IdP 组 → 系统角色映射 | ❌ 未实现 | 无相关配置和代码 |
+| IdP 组 → 团队角色映射 | ❌ 未实现 | 无相关配置和代码 |
+| 角色断言解析 | ❌ 未实现 | 无 SAML/OAuth 断言解析代码 |
+| 默认角色分配 | ❌ 未实现 | SSO 创建用户时无默认角色逻辑 |
 
-### 6.5 权限检查函数
+> **扩展建议**: 如需实现角色映射，可在 SSO 适配层中：
+> 1. 从 IdP 返回的断言/令牌中提取角色或组信息
+> 2. 根据预配置的映射规则转换为 Umami 的系统角色或团队角色
+> 3. 创建用户时设置 `role` 字段，加入团队时设置 TeamUser 的 `role` 字段
 
-**文件**: [src/lib/auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/lib/auth.ts)
+### 7.5 权限检查函数（开源已实现）
+
+**文件**: `src/lib/auth.ts`
 
 ```typescript
 export async function hasPermission(role: string, permission: string | string[]) {
@@ -443,7 +468,7 @@ export async function hasPermission(role: string, permission: string | string[])
 }
 ```
 
-**文件**: [src/permissions/team.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/permissions/team.ts)
+**文件**: `src/permissions/team.ts`
 
 ```typescript
 export async function canUpdateTeam({ user }: Auth, teamId: string) {
@@ -457,107 +482,97 @@ export async function canUpdateTeam({ user }: Auth, teamId: string) {
 
 ---
 
-## 7. 账号归属决策树
+## 8. 账号归属决策树（开源版本实际行为）
 
 ```
-SSO 认证请求
-     │
-     ▼
-┌─────────────────────┐
-│  解析 SSO Token     │
-│  (Cloud 服务层)     │
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│  提取用户标识        │
-│  (username/email)   │
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│  本地用户匹配        │
-│  getUserByUsername  │
-└──────────┬──────────┘
-           │
-     ┌─────┴─────┐
-     │           │
-    存在        不存在
-     │           │
-     ▼           ▼
-  更新信息     JIT 启用?
-     │        ┌──┴──┐
-     │       是     否
-     │        │     │
-     │        ▼     ▼
-     │    创建用户  拒绝
-     │        │
-     │        ▼
-     │    邮件域映射?
-     │     ┌──┴──┐
-     │    有     无
-     │     │     │
-     │     ▼     │
-     │   加入 Team│
-     │     │     │
-     └─────┘     │
-           │     │
-           ▼     ▼
-         登录成功/失败
-           │
-           ▼
-┌─────────────────────┐
-│  创建 Session       │
-│  saveAuth (Redis)   │
-└──────────┬──────────┘
-           │
-           ▼
-      返回 Token
+SSO 回调请求 (已携带认证信息)
+            │
+            ▼
+    ┌──────────────────┐
+    │  checkAuth 验证   │
+    │  (解析 JWT Token)│
+    └────────┬─────────┘
+             │
+        ┌────┴────┐
+        │         │
+     有效       无效
+        │         │
+        ▼         ▼
+    继续执行    认证失败
+        │
+        ▼
+    ┌──────────────────┐
+    │  getUser 查询    │
+    │  (通过 userId)   │
+    └────────┬─────────┘
+             │
+        ┌────┴────┐
+        │         │
+      存在      不存在
+        │         │
+        ▼         ▼
+    返回用户    认证失败
+    信息        （无 JIT）
+        │
+        ▼
+    ┌──────────────────┐
+    │ saveAuth 存 Redis│
+    │  创建应用 Session│
+    └────────┬─────────┘
+             │
+             ▼
+        返回 Token
 ```
+
+> **关键结论**: 开源版本的 SSO 是"被动验证"模式 —— 只验证已有用户，不自动创建新用户，不自动分配团队。
 
 ---
 
-## 8. 关键代码文件索引
+## 9. 关键代码文件索引
 
 | 模块 | 文件路径 | 说明 |
 |------|---------|------|
-| SSO 页面 | [src/app/sso/SSOPage.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/app/sso/SSOPage.tsx) | SSO 回调页面，处理 Token 存储和跳转 |
-| SSO API | [src/app/api/auth/sso/route.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/app/api/auth/sso/route.ts) | SSO 认证 API，创建应用 Session |
-| 认证核心 | [src/lib/auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/lib/auth.ts) | checkAuth, saveAuth, hasPermission |
-| JWT 处理 | [src/lib/jwt.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/lib/jwt.ts) | Token 加密/解密/验证 |
-| 用户查询 | [src/queries/prisma/user.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/queries/prisma/user.ts) | getUser, getUserByUsername, createUser |
-| 团队查询 | [src/queries/prisma/team.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/queries/prisma/team.ts) | getTeam, getUserTeams, createTeam |
-| 团队成员 | [src/queries/prisma/teamUser.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/queries/prisma/teamUser.ts) | getTeamUser, createTeamUser |
-| 角色常量 | [src/lib/constants.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/lib/constants.ts) | ROLES, PERMISSIONS, ROLE_PERMISSIONS |
-| 权限检查 | [src/permissions/team.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/permissions/team.ts) | 团队相关权限函数 |
-| 权限检查 | [src/permissions/user.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/permissions/user.ts) | 用户相关权限函数 |
-| 数据模型 | [prisma/schema.prisma](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/prisma/schema.prisma) | User, Team, TeamUser 模型定义 |
-| 请求解析 | [src/lib/request.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/lib/request.ts) | parseRequest (调用 checkAuth) |
-| Cloud 数据加载 | [src/lib/load.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/52-umami/src/lib/load.ts) | fetchAccount, fetchTeam (Redis) |
+| SSO 页面 | `src/app/sso/SSOPage.tsx` | SSO 回调页面，处理 Token 存储和跳转 |
+| SSO API | `src/app/api/auth/sso/route.ts` | SSO 认证 API，创建应用 Session |
+| 认证核心 | `src/lib/auth.ts` | checkAuth, saveAuth, hasPermission |
+| JWT 处理 | `src/lib/jwt.ts` | Token 加密/解密/验证 |
+| 用户查询 | `src/queries/prisma/user.ts` | getUser, getUserByUsername, createUser |
+| 团队查询 | `src/queries/prisma/team.ts` | getTeam, getUserTeams, createTeam |
+| 团队成员 | `src/queries/prisma/teamUser.ts` | getTeamUser, createTeamUser |
+| 角色常量 | `src/lib/constants.ts` | ROLES, PERMISSIONS, ROLE_PERMISSIONS |
+| 团队权限 | `src/permissions/team.ts` | 团队相关权限校验函数 |
+| 用户权限 | `src/permissions/user.ts` | 用户相关权限校验函数 |
+| 数据模型 | `prisma/schema.prisma` | User, Team, TeamUser 模型定义 |
+| 请求解析 | `src/lib/request.ts` | parseRequest (调用 checkAuth) |
+| Cloud 数据加载 | `src/lib/load.ts` | fetchAccount, fetchTeam (Redis 缓存) |
 
 ---
 
-## 9. 总结
+## 10. 总结
 
-### 9.1 账号归属核心规则
+### 10.1 开源版本已实现的能力
 
-1. **用户匹配**: 仅通过 `username` 字段精确匹配，通常为邮箱地址
-2. **Team 归属**: 通过 `TeamUser` 关联表管理，支持多团队、多角色
-3. **角色体系**: 双层角色结构 — 系统级角色 (admin/user) + 团队级角色 (owner/manager/member/view-only)
-4. **权限判定**: 系统管理员 > 团队角色权限 > 个人用户权限
+1. **用户身份模型**: User 表 + username 唯一索引，支持基于用户名的匹配
+2. **团队成员模型**: Team + TeamUser 双层结构，支持多团队、多角色
+3. **权限系统**: 系统级角色 + 团队级角色的双层权限体系
+4. **SSO 接入点**: `/sso` 页面和 `/api/auth/sso` 接口，可对接外部 SSO 适配层
+5. **Session 管理**: Redis + JWT 双模式会话管理
 
-### 9.2 Cloud 模式扩展点
+### 10.2 需自行扩展或依赖 Cloud 服务的能力
 
-开源版本提供了完整的框架，Cloud 模式在此基础上扩展：
+| 功能 | 扩展点 | 建议实现位置 |
+|------|--------|-------------|
+| OAuth 协议 | 无现成实现，需从零接入 | SSO 适配层（独立服务或 Next.js API Route） |
+| SAML 协议 | 无现成实现，需从零接入 | SSO 适配层（独立服务） |
+| JIT 用户创建 | 可复用 `createUser` 函数 | SSO 回调处理逻辑中 |
+| 邮件域 → Team 映射 | 需新增映射表和匹配逻辑 | SSO 回调处理逻辑中 |
+| IdP 角色映射 | 需新增映射配置 | SSO 回调处理逻辑中 |
+| 自动团队加入 | 可复用 `createTeamUser` 函数 | SSO 回调处理逻辑中 |
 
-- **SSO 认证层**: OAuth/SAML 协议处理、IdP 配置管理
-- **JIT 用户创建**: 基于邮箱域白名单的自动用户创建
-- **邮件域映射**: 企业邮箱后缀到 Team 的自动绑定
-- **角色映射**: IdP 用户组/角色到 Umami 角色的映射规则
-- **账号同步**: 定期同步 IdP 用户信息和组织架构
+### 10.3 核心账号归属规则（开源版本）
 
-### 9.3 注意事项
-
-- 开源版本**不包含**完整的 OAuth/SAML 协议实现
-- 文档中关于 Cloud 模式的部分为基于代码架构的**合理推断**
-- 实际生产环境中，SSO 的具体行为以 Cloud 服务的配置为准
+1. **匹配键唯一**: 仅通过 `username` 字段精确匹配用户
+2. **无自动创建**: 用户不存在时认证失败，不会自动创建
+3. **团队手动加入**: 需通过访问码或管理员添加，无自动分配
+4. **角色双层结构**: 系统级角色决定全局权限，团队级角色决定团队内权限
+5. **管理员优先**: 系统管理员 (admin) 绕过所有团队权限检查
