@@ -4,7 +4,7 @@
 
 本文档对 Umami 系统中审计日志与配置变更追踪的实现进行代码层面的分析，涵盖站点、团队、账号、偏好、敏感字段脱敏、保留策略和导出边界。
 
-分析结论：系统未实现专门的 `audit_log` 审计日志表，变更追踪仅依赖实体表自身的时间戳字段，部分偏好设置仅保存在浏览器 localStorage 中。
+分析结论：系统未实现专门的 `audit_log` 审计日志表，变更追踪仅依赖实体表自身的时间戳字段，部分偏好设置仅保存在浏览器 localStorage 中。软删除支持不完整、查询过滤不一致，部分配置实体不具备软删除能力。
 
 ---
 
@@ -185,18 +185,20 @@ API 路由：`POST /api/me/password`
 
 ---
 
-### 2.6 其他实体的时间戳字段
+### 2.6 其他实体的时间戳与软删除字段
 
-| 实体 | 代码位置 | 追踪字段 |
-| :--- | :--- | :--- |
-| TeamUser | `prisma/schema.prisma`（第 216–230 行） | createdAt, updatedAt |
-| Report | `prisma/schema.prisma`（第 232–251 行） | createdAt, updatedAt |
-| Segment | `prisma/schema.prisma`（第 253–266 行） | createdAt, updatedAt |
-| Link | `prisma/schema.prisma`（第 288–307 行） | createdAt, updatedAt, deletedAt |
-| Pixel | `prisma/schema.prisma`（第 309–327 行） | createdAt, updatedAt, deletedAt |
-| Board | `prisma/schema.prisma`（第 329–347 行） | createdAt, updatedAt |
-| Share | `prisma/schema.prisma`（第 348–360 行） | createdAt, updatedAt |
-| SessionReplaySaved | `prisma/schema.prisma`（第 386–401 行） | createdAt, updatedAt |
+| 实体 | 代码位置 | 时间戳字段 | deletedAt 字段 |
+| :--- | :--- | :--- | :--- |
+| TeamUser | `prisma/schema.prisma`（第 216–230 行） | createdAt, updatedAt | ❌ 无 |
+| Report | `prisma/schema.prisma`（第 232–251 行） | createdAt, updatedAt | ❌ 无 |
+| Segment | `prisma/schema.prisma`（第 253–266 行） | createdAt, updatedAt | ❌ 无 |
+| Link | `prisma/schema.prisma`（第 288–307 行） | createdAt, updatedAt, deletedAt | ✅ 有 |
+| Pixel | `prisma/schema.prisma`（第 309–327 行） | createdAt, updatedAt, deletedAt | ✅ 有 |
+| Board | `prisma/schema.prisma`（第 329–347 行） | createdAt, updatedAt | ❌ **无（不支持软删除）** |
+| Share | `prisma/schema.prisma`（第 348–360 行） | createdAt, updatedAt | ❌ 无 |
+| SessionReplaySaved | `prisma/schema.prisma`（第 386–401 行） | createdAt, updatedAt | ❌ 无 |
+
+> **关键差异**：Board 模型未定义 `deletedAt` 字段，因此**不具备软删除能力**；Link 和 Pixel 虽定义了 `deletedAt`，但删除实现中**并未使用**（详见第 4 章）。
 
 ---
 
@@ -335,53 +337,154 @@ CLOUD_MODE 下执行用户删除时，为保留数据完整性不做物理删除
 
 数据清理仅在以下两种场景触发：
 - 用户手动调用「重置站点数据」
-- 用户 / 站点 / 团队被执行删除操作
+- 用户 / 站点 / 团队 / Link / Pixel / Board 被执行删除操作
 
 ---
 
-### 4.2 删除模式详解
+### 4.2 软删除字段与能力矩阵
 
-删除行为由环境变量 `CLOUD_MODE` 控制，行为差异如下表：
+| 实体 | deletedAt 字段 | CLOUD_MODE 下是否走软删除 | 非 CLOUD_MODE 下删除方式 |
+| :--- | :--- | :--- | :--- |
+| User | ✅ 有 | ✅ 是（username 随机化 + deletedAt） | 级联硬删除 |
+| Website | ✅ 有 | ✅ 是（先级联删分析数据 → 再设置 deletedAt） | 级联硬删除 |
+| Team | ✅ 有 | ✅ 是（仅自身 deletedAt） | teamUser + team 硬删除 |
+| Link | ✅ 有 | ❌ **否（永远硬删除，字段形同虚设）** | 硬删除 |
+| Pixel | ✅ 有 | ❌ **否（永远硬删除，字段形同虚设）** | 硬删除 |
+| Board | ❌ **无** | N/A（永远硬删除） | 硬删除 |
+| Report | ❌ 无 | N/A（永远硬删除） | 硬删除 |
+| Segment | ❌ 无 | N/A（永远硬删除） | 硬删除 |
+| Share | ❌ 无 | N/A（永远硬删除） | 硬删除 |
+| TeamUser | ❌ 无 | N/A（CLOUD_MODE 下不处理，非 CLOUD_MODE 随级联硬删） | 随 owner 级联硬删除 |
 
-| 操作 | CLOUD_MODE = true（软删除） | CLOUD_MODE = false（硬删除） |
+---
+
+### 4.3 查询层 deletedAt 过滤一致性校验
+
+> **关键发现**：即使拥有 `deletedAt` 字段的实体，各查询函数之间的 `deletedAt: null` 过滤也**严重不一致**，可能导致软删除记录通过某些路径被查询到。
+
+#### 4.3.1 User 查询
+**代码位置**：`src/queries/prisma/user.ts`
+
+| 函数 | deletedAt 过滤 | 说明 |
 | :--- | :--- | :--- |
-| **删除用户** | 用户名随机化 + `user.deletedAt`；名下网站 `website.deletedAt`；**团队与 teamUser 不处理** | 级联删除 website/event/session 数据、删除用户拥有的团队与 teamUser、删除用户 |
-| **删除网站** | 仅 `website.deletedAt = new Date()`；**下属数据（event/session/report/segment/share）不处理** | 级联删除网站所有分析数据 + report + segment + share + website 记录 |
-| **删除团队** | 仅 `team.deletedAt = new Date()`；**下属 teamUser / websites / links / pixels / boards 不处理** | 删除 teamUser 关联 + team 记录本身；**下属 websites / links / pixels / boards 不处理** |
-| **删除 Link** | 物理删除 `prisma.link.delete()`，**无 CLOUD_MODE 分支** | 同左（物理删除） |
-| **删除 Pixel** | 物理删除 `prisma.pixel.delete()`，**无 CLOUD_MODE 分支** | 同左（物理删除） |
+| `findUser` / `getUser` / `getUserByUsername` | ✅ 有 | 通过 `showDeleted` 参数控制，默认 `{ deletedAt: null }` |
+| `getUsers`（列表） | ✅ 有 | 第 54 行显式 `deletedAt: null` |
 
-#### 4.2.1 用户删除细节
+#### 4.3.2 Website 查询
+**代码位置**：`src/queries/prisma/website.ts`
+
+| 函数 | deletedAt 过滤 | 说明 |
+| :--- | :--- | :--- |
+| `getWebsites`（列表） | ✅ 有 | 第 37 行显式 `deletedAt: null` |
+| `getAllUserWebsitesIncludingTeamOwner` | ✅ 有 | 最终走 `getWebsites`，同时 team 也过滤 `deletedAt: null` |
+| `getUserWebsites` / `getTeamWebsites` | ✅ 有 | 最终走 `getWebsites` |
+| `getWebsiteCount` | ✅ 有 | 第 263 行显式 `deletedAt: null` |
+| **`getWebsite`（单个查询）** | ❌ **无** | 第 11–23 行 `findWebsite` 直接按 id 查找，**不排除已删除** |
+| **`findWebsite`** | ❌ **无** | 裸调用 Prisma，where 条件完全交给调用方 |
+
+**风险**：外部传入已知 websiteId 调用 `getWebsite` / `findWebsite` 时，即使 CLOUD_MODE 已软删除，记录仍可能被取出并正常展示 / 使用。
+
+#### 4.3.3 Team 查询
+**代码位置**：`src/queries/prisma/team.ts`
+
+| 函数 | deletedAt 过滤 | 说明 |
+| :--- | :--- | :--- |
+| `getUserTeams`（用户团队列表） | ✅ 有 | 第 53 行显式 `deletedAt: null`；计数中的 websites/members 也过滤了 deletedAt |
+| `getAllUserTeams` | ✅ 有 | 第 90 行显式 `deletedAt: null` |
+| **`getTeams`（通用列表）** | ❌ **无** | 第 34–37 行未加 `deletedAt`，完全依赖调用者 criteria 自行传入 |
+| **`getTeam`（单个查询）** | ❌ **无** | 第 19–24 行裸 `findTeam`，**已删除团队通过 id 仍可取出** |
+| **`findTeam`** | ❌ **无** | 裸调用 Prisma |
+
+#### 4.3.4 Link 查询
+**代码位置**：`src/queries/prisma/link.ts`
+
+| 函数 | deletedAt 过滤 | 说明 |
+| :--- | :--- | :--- |
+| `getUserLinks`（用户维度） | ✅ 有 | 第 38 行显式 `deletedAt: null` |
+| **`getTeamLinks`（团队维度）** | ❌ **无** | 第 48–50 行仅按 teamId 过滤，**不一致** |
+| **`getLinks`（通用列表）** | ❌ **无** | 第 21–28 行未加，依赖调用者 |
+| **`getLink`（单个）** | ❌ **无** | 直接裸查 |
+| **`findLink`** | ❌ **无** | 直接裸查 |
+
+#### 4.3.5 Pixel 查询
+**代码位置**：`src/queries/prisma/pixel.ts`
+
+| 函数 | deletedAt 过滤 | 说明 |
+| :--- | :--- | :--- |
+| **`getPixels`（通用）** | ❌ **无** | 第 20–23 行未加 |
+| **`getUserPixels`** | ❌ **无** | 第 31–33 行仅按 userId |
+| **`getTeamPixels`** | ❌ **无** | 第 42–44 行仅按 teamId |
+| **`getPixel` / `findPixel`** | ❌ **无** | 直接裸查 |
+
+> Pixel 虽然模型有 `deletedAt` 字段，但**所有查询函数均未过滤**，与删除实现（永远硬删除）一起看，该字段**完全未被使用**。
+
+#### 4.3.6 Board 查询
+**代码位置**：`src/queries/prisma/board.ts`
+
+| 函数 | deletedAt 过滤 | 说明 |
+| :--- | :--- | :--- |
+| `getBoards` / `getUserBoards` / `getTeamBoards` | N/A | Board 无 `deletedAt` 字段，因此不存在过滤 |
+| `getBoard` / `findBoard` | N/A | 同上 |
+
+---
+
+### 4.4 删除模式详解（按实体）
+
+#### 4.4.1 用户删除
 **代码位置**：`src/queries/prisma/user.ts`（第 102–206 行）
 
-CLOUD_MODE 分支（第 129–146 行）仅执行：
+**CLOUD_MODE = true（软删除）** 仅执行：
 
 ```typescript
 client.website.updateMany({ data: { deletedAt: new Date() }, where: { id: { in: websiteIds } }),
 client.user.update({ data: { username: getRandomChars(32), deletedAt: new Date() }, where: { id: userId } }),
 ```
 
-注意：用户作为 teamOwner 的团队在 CLOUD_MODE 下**不会被删除或标记 deletedAt**，团队成员关联 `teamUser` 也不处理。
+注意以下数据在 CLOUD_MODE 下**完全不处理**，会成为「孤儿」或继续存在：
+- 用户作为 owner 的**团队**（Team 记录 + TeamUser 成员关联都不会被标记或删除）
+- 用户名下的 **Link / Pixel / Board**（无级联、无标记）
+- 用户创建的 **Report**
 
-#### 4.2.2 站点删除细节
+**CLOUD_MODE = false（硬删除）** 会级联执行：
+1. eventData / sessionData / websiteEvent / session（名下网站的分析数据）
+2. teamUser（两种情况：用户作为 owner 的团队全部成员 + 用户参与的所有团队成员关系）
+3. team（删除用户作为 owner 的团队本身）
+4. report（名下网站的报告 + 用户本人的报告）
+5. website（名下网站）
+6. user（用户自身）
+
+但以下仍然**不会被硬删除**：
+- 用户名下的 **Link / Pixel / Board**（无对应 deleteMany 语句）
+
+#### 4.4.2 站点删除
 **代码位置**：`src/queries/prisma/website.ts`（第 188–257 行）
 
-CLOUD_MODE 分支（第 234–243 行）：
+**CLOUD_MODE = true**：
+1. 先**硬删除**分析数据：sessionReplaySaved → sessionReplay → revenue → eventData → sessionData → websiteEvent → session
+2. 再**硬删除**配置数据：report → segment → share（按 websiteId 或 entityId）
+3. 最后对 website 自身**软删除**：`deletedAt = new Date()`
 
-```typescript
-client.website.update({ data: { deletedAt: new Date() }, where: { id: websiteId } })
-```
+**CLOUD_MODE = false**：
+1-2 步与 CLOUD_MODE 完全相同（分析/配置数据始终硬删）
+3. 最后执行 `website.delete()` 硬删除
 
-下属的 `session / websiteEvent / sessionData / eventData / revenue / sessionReplay` 等**不会被清理**，`report / segment / share` 也不清理。
+> **关键差异**：Website 的分析/关联数据在**两种模式下都会被硬删除**，只有 website 记录本身在 CLOUD_MODE 下走软删除（保留 name / domain / shareId 等配置）。
 
-#### 4.2.3 团队删除细节
+#### 4.4.3 团队删除
 **代码位置**：`src/queries/prisma/team.ts`（第 143–172 行）
 
-CLOUD_MODE 分支（第 147–158 行）：仅 `team.deletedAt`。
+**CLOUD_MODE = true**：仅执行 `team.update({ deletedAt: new Date() })`，对下属资源**全部不处理**：
+- `teamUser` 成员关系不会被删除或标记
+- 团队下的 `websites`（CLOUD_MODE 可单独走 Website 软删除，但 Team 不触发）
+- 团队下的 `links` / `pixels` / `boards`（Board 无 deletedAt，Link/Pixel 删除实现不处理 CLOUD_MODE）
 
-非 CLOUD_MODE 分支（第 160–171 行）：删除 `teamUser` 关联 + `team` 记录。注意团队下的 `websites`、`links`、`pixels`、`boards` 在**两种模式下都不会被删除**，只会变成 `teamId` 指向已删除团队的「孤儿」记录。
+**CLOUD_MODE = false**：
+1. `teamUser.deleteMany` 删除成员关系
+2. `team.delete()` 删除团队本身
 
-#### 4.2.4 Link 删除
+但团队下属的 `websites / links / pixels / boards` 在**两种模式下都不会被团队删除触发**，全部保留为 `teamId` 指向已删除团队的记录。
+
+#### 4.4.4 Link 删除
 **代码位置**：`src/queries/prisma/link.ts`（第 64–66 行）
 
 ```typescript
@@ -390,27 +493,40 @@ export async function deleteLink(linkId: string) {
 }
 ```
 
-始终为硬删除，Link 表即使有 `deletedAt` 字段也**未被使用**。
+始终为物理删除。Link 表虽定义 `deletedAt` 字段，但代码中**从未写入或查询该字段**，属无效定义。
+
+#### 4.4.5 Pixel 删除
+**代码位置**：`src/queries/prisma/pixel.ts`（第 58–60 行）
+
+```typescript
+export async function deletePixel(pixelId: string) {
+  return prisma.client.pixel.delete({ where: { id: pixelId } });
+}
+```
+
+与 Link 完全一致：始终物理删除，`deletedAt` 字段形同虚设。
+
+#### 4.4.6 Board 删除
+**代码位置**：`src/queries/prisma/board.ts`（第 66–68 行）
+
+```typescript
+export async function deleteBoard(boardId: string) {
+  return prisma.client.board.delete({ where: { id: boardId } });
+}
+```
+
+Board 模型本身**没有 `deletedAt` 字段**，不具备软删除能力，永远物理删除。
 
 ---
 
-### 4.3 软删除过滤保证
-所有查询均带有 `deletedAt: null` 过滤条件，确保软删除记录不会出现在正常列表中：
-- `getUser` / `getUsers`：`src/queries/prisma/user.ts`（第 21、54 行）
-- `getWebsites`：`src/queries/prisma/website.ts`（第 37 行）
-- `getUserTeams`：`src/queries/prisma/team.ts`（第 53 行）
-- `getUserLinks`：`src/queries/prisma/link.ts`（第 38 行）
+### 4.5 会话级超时（非数据保留）
 
----
-
-### 4.4 会话级超时（非数据保留）
-
-#### 4.4.1 鉴权 Token 过期
+#### 4.5.1 鉴权 Token 过期
 **代码位置**：`src/lib/auth.ts`（第 62–74 行）
 
 Redis 存储的鉴权 Key 通过 `redis.client.expire(authKey, expire)` 设置 TTL，过期后 Token 失效。此处仅影响登录态有效性，不删除持久化数据。
 
-#### 4.4.2 Visit 超时
+#### 4.5.2 Visit 超时
 **代码位置**：`src/app/api/send/route.ts`（第 171 行）
 
 ```javascript
@@ -421,7 +537,7 @@ Redis 存储的鉴权 Key 通过 `redis.client.expire(authKey, expire)` 设置 T
 
 ---
 
-### 4.5 「Retention」说明
+### 4.6 「Retention」说明
 
 系统中出现的 `retention` / `label.retention` / `getRetention` **均指「用户留存分析报告」功能**（分析用户 N 天内回访率），与数据保留策略无关。
 
@@ -430,7 +546,7 @@ Redis 存储的鉴权 Key 通过 `redis.client.expire(authKey, expire)` 设置 T
 
 ---
 
-### 4.6 ClickHouse 分析数据保留
+### 4.7 ClickHouse 分析数据保留
 **代码位置**：`db/clickhouse/schema.sql`
 
 - 所有 MergeTree 表（`website_event`、`event_data`、`session_data`、`session_replay`、`website_revenue`）按 `toYYYYMM(created_at)` 做月分区
@@ -439,9 +555,9 @@ Redis 存储的鉴权 Key 通过 `redis.client.expire(authKey, expire)` 设置 T
 
 ---
 
-### 4.7 手动数据清理入口
+### 4.8 手动数据清理入口
 
-#### 4.7.1 站点重置
+#### 4.8.1 站点重置
 **代码位置**：`src/queries/prisma/website.ts`（第 133–186 行）
 
 清理范围（PostgreSQL 侧，均为 `deleteMany` 硬删除）：
@@ -449,7 +565,7 @@ Redis 存储的鉴权 Key 通过 `redis.client.expire(authKey, expire)` 设置 T
 
 最后更新 `Website.resetAt = new Date()`。
 
-#### 4.7.2 站点删除（非 CLOUD_MODE）
+#### 4.8.2 站点删除（非 CLOUD_MODE）
 **代码位置**：`src/queries/prisma/website.ts`（第 188–257 行）
 
 清理范围 = 重置范围 + `report` + `segment` + `share` + `website` 记录本身。
@@ -554,7 +670,7 @@ if (!(await canViewWebsite(auth, websiteId))) {
 
 ---
 
-## 7. 总结与建议
+## 7. 总结与改进建议
 
 ### 7.1 当前覆盖范围总结
 
@@ -565,34 +681,63 @@ if (!(await canViewWebsite(auth, websiteId))) {
 | 账号资料 | ⚠️ 部分覆盖 | 密码变更有独立 API 但无审计表；用户名/角色变更只能在 `User.updatedAt` 看到最后变更时间 |
 | 团队/站点配置 | ⚠️ 部分覆盖 | 可变更字段有时间戳，但无字段级变更历史 |
 | 敏感字段脱敏 | ✅ 良好覆盖 | 会话重放提供 strict/moderate 两级脱敏；密码 bcrypt 哈希存储 + 查询时默认排除；CLOUD_MODE 删除用户时用户名随机化 |
-| 保留策略 | ❌ 未覆盖 | 无自动化 TTL / 定时清理；CLOUD_MODE 软删除存在残留数据（下属数据不清理）；ClickHouse 无 TTL 配置 |
+| 软删除字段一致性 | ❌ 严重不一致 | Board 无 deletedAt；Link/Pixel 有字段但删除实现不使用；查询层各函数过滤不统一 |
+| 保留策略 | ❌ 未覆盖 | 无自动化 TTL / 定时清理；CLOUD_MODE 软删除级联不完整；ClickHouse 无 TTL 配置 |
 | 导出边界 | ✅ 良好控制 | 仅允许导出 7 类聚合指标；原始明细/会话重放/收入/用户信息均不暴露；但导出操作本身无审计 |
 | 导出操作审计 | ❌ 缺失 | 导出行为不记录任何日志 |
 
-### 7.2 改进建议
+### 7.2 代码事实梳理：软删除过滤差异汇总
 
-1. **新增 `audit_log` 表**：记录所有配置类变更
-   - 推荐字段：`entity_type`、`entity_id`、`field_name`、`old_value`、`new_value`、`user_id`、`ip_address`、`user_agent`、`created_at`
-   - 覆盖：Website / Team / TeamUser / User（含密码变更）/ Segment / Report / Link / Pixel / Board 的增删改
+| 实体 | 有 deletedAt | 列表过滤 deletedAt | 单查过滤 deletedAt | CLOUD_MODE 下走软删除 |
+| :--- | :--- | :--- | :--- | :--- |
+| User | ✅ | ✅ `getUsers` | ✅ `findUser`（showDeleted 默认关） | ✅ |
+| Website | ✅ | ✅ `getWebsites` | ❌ `getWebsite`/`findWebsite` 未过滤 | ✅（但分析数据在两种模式下都硬删） |
+| Team | ✅ | 仅 `getUserTeams` 有 | ❌ `getTeam`/`getTeams` 未过滤 | ✅ |
+| Link | ✅ | 仅 `getUserLinks` 有，`getTeamLinks` 没有 | ❌ 单查未过滤 | ❌（永远硬删除） |
+| Pixel | ✅ | ❌ 全部没过滤 | ❌ 单查未过滤 | ❌（永远硬删除） |
+| Board | ❌ | N/A | N/A | N/A（永远硬删除） |
 
-2. **偏好设置上云（可选）**：若需要审计偏好变更，将 localStorage 项迁移至用户表 JSON 字段或独立 `user_preference` 表，写操作走 API 并触发 audit_log。
+---
 
-3. **补全 CLOUD_MODE 软删除的级联处理**：
-   - 删除用户时同步标记其拥有的团队 `deletedAt`、团队成员 `teamUser` 状态
-   - 删除团队时同步标记 `websites` / `links` / `pixels` / `boards` 的 `deletedAt`
-   - Website 软删除时同步标记 `reports` / `segments` / `shares`
-   - Link / Pixel 删除逻辑补充 CLOUD_MODE 分支
+### 7.3 改进建议
 
-4. **实现数据保留策略**：
-   - PostgreSQL：增加定时任务清理已超过保留期的 `website_event`、`session`、`session_replay` 等
-   - ClickHouse：为 MergeTree 表增加 `TTL created_at + INTERVAL X DAY` 配置，并按月分区定期 DROP PARTITION
-   - 提供保留期配置项（按站点或全局）
+#### 建议 1：新增 `audit_log` 审计日志表
+记录所有配置类变更，推荐字段：`entity_type`、`entity_id`、`field_name`、`old_value`、`new_value`、`user_id`、`ip_address`、`user_agent`、`created_at`，覆盖 Website/Team/TeamUser/User（含密码变更）/Segment/Report/Link/Pixel/Board 的增删改。
 
-5. **操作行为审计**：
-   - 网站重置、网站删除、用户删除、团队删除、数据导出等高危操作，强制写入 audit_log
-   - 导出接口记录 `website_id`、`date_range_start`、`date_range_end`、`exported_by`、`exported_at`
+#### 建议 2：统一 `deletedAt` 能力与查询过滤
+针对上表中不一致的地方，进行以下代码修正：
 
-6. **Link / Pixel 统一删除模式**：当前 `deleteLink` / `deletePixel` 未使用 `deletedAt` 字段，建议与 Website/Team/User 保持一致，补充 CLOUD_MODE 软删除分支。
+1. **Board 模型补充 `deletedAt` 字段**（`prisma/schema.prisma` Board 模型），使其具备软删除能力，与 Website/Team 保持一致。
+2. **`deleteLink` / `deletePixel` 补充 CLOUD_MODE 分支**：CLOUD_MODE 下走 `update({ deletedAt: new Date() })`，与 deleteWebsite/deleteTeam 行为一致，让 `deletedAt` 字段真正生效。
+3. **Pixel 全部查询函数补充 `deletedAt: null`**：`getPixels` / `getUserPixels` / `getTeamPixels` 统一加上过滤条件。
+4. **Link 补齐 `getTeamLinks` 的 `deletedAt: null`**，与 `getUserLinks` 保持一致。
+5. **Website 的 `findWebsite` / `getWebsite` 补充 `deletedAt: null`**，防止通过 ID 取出已删除站点；如需提供管理后台的「已删除列表」，新增 `findWebsiteIncludingDeleted` 专门函数。
+6. **Team 的 `findTeam` / `getTeam` / `getTeams` 补充 `deletedAt: null`**，同理。
+
+#### 建议 3：补全 CLOUD_MODE 软删除的级联处理
+1. `deleteUser` CLOUD_MODE 分支补充：
+   - 用户作为 owner 的团队 → 标记 `team.deletedAt`
+   - 用户名下 `links / pixels / boards` → boards 需先补字段后再标记 deletedAt
+   - 用户的 `reports` → Report 无 deletedAt，建议物理删除或补充字段后软删
+2. `deleteTeam` CLOUD_MODE 分支补充：
+   - 下属 `websites` → `updateMany({ where: { teamId }, data: { deletedAt } })`
+   - 下属 `links / pixels / boards` → 同上
+   - `teamUser` 成员关系 → 无 deletedAt 字段，建议物理删除
+3. `deleteWebsite` CLOUD_MODE 分支（目前 report/segment/share 已经硬删）：如业务需要保留配置历史，Report/Segment/Share 补充 deletedAt 后改为软删除。
+
+#### 建议 4：非 CLOUD_MODE 硬删除的补齐
+修正 `deleteUser` 非 CLOUD_MODE 分支中遗漏的 `links / pixels / boards`，避免用户删除后留下 `userId = null` 的「孤儿」记录。
+
+#### 建议 5：实现数据保留策略
+- PostgreSQL：增加定时任务清理超过保留期的分析数据（session / websiteEvent / sessionReplay 等）
+- ClickHouse：为 MergeTree 表增加 `TTL created_at + INTERVAL X DAY` 配置，并按月分区定期 DROP PARTITION
+- 提供保留期配置项（按站点或全局）
+
+#### 建议 6：操作行为审计
+网站重置、网站删除、用户删除、团队删除、数据导出等高危操作强制写入 audit_log；导出接口额外记录 `website_id`、`date_range_start`、`date_range_end`、`exported_by`、`exported_at`。
+
+#### 建议 7：偏好设置上云（可选）
+若业务要求审计用户偏好，将 localStorage 的语言 / 时区 / 主题 / 默认日期范围迁移至用户表 JSON 字段或独立 `user_preference` 表，写操作走 API 并同步触发 audit_log。
 
 ---
 
