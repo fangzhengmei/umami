@@ -279,7 +279,7 @@ event_id IN (
 | 前端组件 | `<EventProperties>` 首次挂载 | [src/app/(main)/websites/[websiteId]/events/EventProperties.tsx](src/app/(main)/websites/%5BwebsiteId%5D/events/EventProperties.tsx) | - | - |
 | 前端 Hook | `useEventDataPropertiesQuery` | [src/components/hooks/queries/useEventDataPropertiesQuery.ts](src/components/hooks/queries/useEventDataPropertiesQuery.ts) | - | - |
 | API 路由 | GET `/websites/:id/event-data/properties` | [src/app/api/websites/[websiteId]/event-data/properties/route.ts](src/app/api/websites/%5BwebsiteId%5D/event-data/properties/route.ts) | - | - |
-| 查询函数 | `getEventDataProperties` | [src/queries/sql/events/getEventDataProperties.ts](src/queries/sql/events/getEventDataProperties.ts) | **event_data**（主查）<br>ANY LEFT JOIN **website_event**（type=2 子查询过滤） | ed：**仅第 1 列** `website_id` 命中（created_at 在第 4 位被 event_id、data_key 隔开，不能直接走前缀；event_name 来自 event_data 宽表冗余列）<br>we：第 1+2 列命中 |
+| 查询函数 | `getEventDataProperties` | [src/queries/sql/events/getEventDataProperties.ts](src/queries/sql/events/getEventDataProperties.ts) | **event_data**（主查）<br>ANY LEFT JOIN **website_event**（type=2 子查询） | ed：**仅第 1 列** `website_id` 命中（created_at 在第 4 位被 event_id、data_key 隔开，不能直接走前缀；event_name 来自 event_data 宽表冗余列）<br>we：第 1+2 列命中 |
 
 SQL 结构（CH 方言）：
 ```sql
@@ -287,12 +287,12 @@ SELECT event_name, data_key propertyName, count(*) total
 FROM event_data
 ANY LEFT JOIN (SELECT * FROM website_event
                 WHERE website_id=? AND created_at BETWEEN ? AND ? AND event_type=2) we
-  ON we.event_id = ed.event_id AND we.session_id = ed.session_id AND we.website_id = ed.website_id
-WHERE ed.website_id=? AND ed.created_at BETWEEN ? AND ?
+  ON we.event_id = event_data.event_id AND we.session_id = event_data.session_id AND we.website_id = event_data.website_id
+WHERE event_data.website_id=? AND event_data.created_at BETWEEN ? AND ?
 GROUP BY event_name, data_key ORDER BY total DESC LIMIT 500
 ```
 
-→ **注意**：ClickHouse 模式下 event_name 来自 `event_data` 表的**宽表冗余列**，LEFT JOIN 仅用于过滤可能的孤立 event_data 行（理论上不会出现）；主查仅 `website_id` 前缀命中 + 全量扫后按 created_at 过滤。
+→ **注意**：ANY LEFT JOIN 右表的 `event_type=2` **不等于过滤左表**。它只是确保右表只包含事件记录，但不会过滤掉 event_data 中那些 event_id 属于 pageView（event_type=1）的属性行——只是那些行的 website_event 字段为 NULL。实际过滤 event_type=2 的是**event_data 自身冗余的 event_name 不为空**（pageView 无 event_name），以及外层 GROUP BY 时 event_name 为空的行被自然忽略。详见 3.9 节。
 
 ### 3.6 Properties Tab：指定属性的 Top 值分布（饼图 + 表格）
 
@@ -301,7 +301,7 @@ GROUP BY event_name, data_key ORDER BY total DESC LIMIT 500
 | 前端组件 | `<EventValues>`（EventProperties 子组件） | [src/app/(main)/websites/[websiteId]/events/EventProperties.tsx](src/app/(main)/websites/%5BwebsiteId%5D/events/EventProperties.tsx) | - | - |
 | 前端 Hook | `useEventDataValuesQuery` | [src/components/hooks/queries/useEventDataValuesQuery.ts](src/components/hooks/queries/useEventDataValuesQuery.ts) | - | - |
 | API 路由 | GET `/websites/:id/event-data/values` | [src/app/api/websites/[websiteId]/event-data/values/route.ts](src/app/api/websites/%5BwebsiteId%5D/event-data/values/route.ts) | - | - |
-| 查询函数 | `getEventDataValues` | [src/queries/sql/events/getEventDataValues.ts](src/queries/sql/events/getEventDataValues.ts) | **event_data**（主查）<br>ANY LEFT JOIN **website_event** | ❗ **修正说明**：仅第 1 列 `website_id` 命中前缀。`data_key = ?` 是第 3 列，被第 2 列 event_id 隔开，**不构成连续前缀**，无法用于 mark 跳跃。实际执行路径：先按 website_id 粗定位 → 扫该 website_id 下的全量数据 → 用 data_key 和 created_at 过滤后聚合。 |
+| 查询函数 | `getEventDataValues` | [src/queries/sql/events/getEventDataValues.ts](src/queries/sql/events/getEventDataValues.ts) | **event_data**（主查）<br>ANY LEFT JOIN **website_event**（type=2 子查询） | ❗ **修正说明**：仅第 1 列 `website_id` 命中前缀。`data_key = ?` 是第 3 列，被第 2 列 event_id 隔开，**不构成连续前缀**，无法用于 mark 跳跃。实际执行路径：先按 website_id 粗定位 → 扫该 website_id 下的全量数据 → 用 data_key 和 created_at 过滤后聚合。 |
 
 **类型归一化 + 分组 SQL**（CH 方言）：
 ```sql
@@ -310,10 +310,17 @@ SELECT
           data_type=4, toString(date_trunc('hour', date_value)),
           string_value) AS value,
   count(*) AS total
-FROM event_data ...
-WHERE website_id=? AND created_at BETWEEN ? AND ? AND data_key = {propertyName:String}
+FROM event_data
+ANY LEFT JOIN (SELECT * FROM website_event
+                WHERE website_id=? AND created_at BETWEEN ? AND ? AND event_type=2) website_event
+  ON website_event.event_id = event_data.event_id
+  AND website_event.session_id = event_data.session_id
+  AND website_event.website_id = event_data.website_id
+WHERE event_data.website_id=? AND event_data.created_at BETWEEN ? AND ? AND event_data.data_key = {propertyName:String}
 GROUP BY value ORDER BY total DESC LIMIT 100
 ```
+
+→ **ANY LEFT JOIN 的作用**：右表 `event_type=2` 只筛选自定义事件，但**不影响左表数据范围**。`getEventDataValues` 查询还有 `parseFilters` 产生的 `filterQuery`（如事件名过滤），以及 `data_key = ?` 等值条件（由 propertyName 参数显式写入），这些才是真正过滤数据的手段。详见 3.9 节。
 
 > 💡 **性能启示**：如果某站点属性键数量极多（几千个），`data_key = ?` 的过滤只能在扫数据时做，开销与该站总属性行数成正比。若需要高频按 data_key 聚合，可以考虑加一个 `(website_id, data_key, created_at)` 的 PROJECTION 或换一张按 data_key 排序的物化表。
 
@@ -336,15 +343,82 @@ WHERE website_id = {websiteId:UUID} AND event_id = {eventId:UUID}
 
 | 报表场景 | 前端/API | 查询函数 | 文件路径 | CH 主表 | 核心排序键命中 |
 |---|---|---|---|---|---|
-| 属性总览（事件数/属性数/记录数） | `/event-data/stats` → `useEventDataStatsQuery` | `getEventDataStats` | [src/queries/sql/events/getEventDataStats.ts](src/queries/sql/events/getEventDataStats.ts) | **event_data** + website_event | 仅第 1 列 `website_id` |
-| 字段×类型×值预览 | `/event-data/fields` | `getEventDataFields` | [src/queries/sql/events/getEventDataFields.ts](src/queries/sql/events/getEventDataFields.ts) | **event_data** + website_event | 仅第 1 列 `website_id` |
-| 事件-属性-值矩阵 | `/event-data/events` → `useEventDataEventsQuery` | `getEventDataEvents` | [src/queries/sql/events/getEventDataEvents.ts](src/queries/sql/events/getEventDataEvents.ts) | **event_data** + website_event | 仅第 1 列 `website_id` |
+| 属性总览（事件数/属性数/记录数） | `/event-data/stats` → `useEventDataStatsQuery` | `getEventDataStats` | [src/queries/sql/events/getEventDataStats.ts](src/queries/sql/events/getEventDataStats.ts) | **event_data**（主查）<br>ANY LEFT JOIN **website_event**（type=2 子查询） | 仅第 1 列 `website_id` |
+| 字段×类型×值预览 | `/event-data/fields` | `getEventDataFields` | [src/queries/sql/events/getEventDataFields.ts](src/queries/sql/events/getEventDataFields.ts) | **event_data**（主查）<br>ANY LEFT JOIN **website_event**（type=2 子查询） | 仅第 1 列 `website_id` |
+| 事件-属性-值矩阵 | `/event-data/events` → `useEventDataEventsQuery` | `getEventDataEvents` | [src/queries/sql/events/getEventDataEvents.ts](src/queries/sql/events/getEventDataEvents.ts) | **event_data**（主查）<br>ANY LEFT JOIN **website_event**（type=2 子查询） | 仅第 1 列 `website_id` |
+
+### 3.9 ANY LEFT JOIN 的协作机制解析
+
+本节专门分析 ClickHouse 模式下所有属性聚合查询中 `ANY LEFT JOIN website_event` 的真实作用，厘清三个常见误区。
+
+#### 3.9.1 误区一：右表 event_type=2 不等于过滤左表 event_data
+
+**典型 SQL 模式**（所有 5 个属性聚合查询完全相同）：
+```sql
+FROM event_data
+ANY LEFT JOIN (
+  SELECT * FROM website_event
+  WHERE website_id = ?
+    AND created_at BETWEEN ? AND ?
+    AND event_type = 2          -- 只取自定义事件
+) website_event
+  ON website_event.event_id   = event_data.event_id
+  AND website_event.session_id = event_data.session_id
+  AND website_event.website_id = event_data.website_id
+${cohortQuery}
+WHERE event_data.website_id = ?
+  AND event_data.created_at BETWEEN ? AND ?
+```
+
+**关键分析**：
+- 右表子查询加了 `event_type=2`，只能限制**右表**只包含自定义事件，不能过滤**左表** event_data。
+- 左表 event_data 中那些 event_id 属于 pageView（event_type=1）的属性行，仍会被扫描出来，只是 JOIN 后对应的 website_event 字段全部为 NULL。
+- **真正过滤掉 pageView 属性的，是 event_data 表自身的冗余列**：event_data 写入时就冗余了 `event_name` 列（只有自定义事件才有 event_name，pageView 的 event_name 为空字符串）。因此：
+  - `getEventDataProperties` 的 `GROUP BY event_name` 会将 event_name 为空的行分到一组（通常被 LIMIT 500 截断掉）
+  - `getEventDataValues` 的 `filterQuery` 通常包含 `event_name = ?`（从前端事件下拉框传入）
+  - 所有属性聚合查询的最终结果只包含自定义事件，是**冗余列 + 过滤条件**共同作用的结果，不是 ANY LEFT JOIN 的作用。
+
+#### 3.9.2 误区二：ANY LEFT JOIN 是为了获取事件字段
+
+实际上 event_data 表在写入时已经冗余了 `event_name`、`session_id`、`url_path`、`website_id`、`event_id`、`created_at` 等多个 website_event 的字段（见 saveEventData.ts 的 clickhouseQuery 函数）。
+
+**ANY LEFT JOIN 的真实目的有两个**：
+
+1. **配合 cohort 查询**：`${cohortQuery}` 是一个 `INNER JOIN (SELECT DISTINCT session_id ...) AS cohort ON cohort.cohort_session_id = website_event.session_id`。它依赖 ANY LEFT JOIN 引入的 `website_event.session_id` 列来做留存过滤。**这才是 ANY LEFT JOIN 存在的首要原因**。
+
+2. **配合过滤条件（filterQuery）中只存在于 website_event 的列**：parseFilters 生成的 filterQuery 不带表前缀，直接附加在 WHERE 末尾。对于那些只存在于 website_event 的列（`os`、`browser`、`device`、`country`、`region`、`city`、`language`、`url_path`、`referrer_domain`、`hostname` 等），必须通过 ANY LEFT JOIN 引入这些列才能生效。
+
+#### 3.9.3 误区三：filterQuery 的列名冲突与解析
+
+`getFilterQuery`（[src/lib/clickhouse.ts](src/lib/clickhouse.ts)）生成的过滤条件不带任何表前缀，列名解析规则如下：
+
+| 列名来源 | 示例列名 | 解析行为 | 作用对象 |
+|---|---|---|---|
+| 两表共有 | `event_name`、`session_id`、`website_id`、`event_id`、`created_at` | ClickHouse 按列名匹配（两表同值，无歧义） | 可作用于任一表，实际按查询计划优化 |
+| 仅 website_event | `os`、`browser`、`country`、`url_path`、`referrer_domain` | 必须通过 ANY LEFT JOIN 引入 | 作用于 JOIN 后的 website_event 列 |
+| 仅 event_data | `data_key`、`data_type`、`string_value`、`number_value`、`date_value` | 直接作用于 event_data（若 JOIN 未引入则语法错误） | 作用于 event_data |
+
+**特殊映射**：`getEventDataProperties` 通过 `parseFilters(..., { columns: { propertyName: 'data_key' } })` 手动将前端参数 `propertyName` 映射为 `data_key` 列，这是因为 `FILTER_COLUMNS` 字典中没有 `propertyName` → `data_key` 的内建映射（见 [src/lib/params.ts](src/lib/params.ts) 的 `filtersObjectToArray` 函数，优先使用 `options.columns` 映射）。
+
+#### 3.9.4 各属性聚合查询中 ANY LEFT JOIN 的实际贡献
+
+| 查询函数 | ANY LEFT JOIN 是否必要 | 真实贡献 |
+|---|---|---|
+| `getEventDataProperties` | ✅ 是 | 1) cohort 留存过滤；2) 设备/地域/URL 等 website_event 独有列的过滤；3) 防止孤立 event_data 行（理论上不存在） |
+| `getEventDataValues` | ✅ 是 | 1) cohort 留存过滤；2) 设备/地域/URL 等过滤；3) filterQuery 中 `event_name` 列若从 website_event 取也可，但 event_data 已有冗余 |
+| `getEventDataStats` | ✅ 是 | 1) cohort 留存过滤；2) 设备/地域/URL 等过滤 |
+| `getEventDataFields` | ✅ 是 | 1) cohort 留存过滤；2) 设备/地域/URL 等过滤 |
+| `getEventDataEvents` | ✅ 是 | 1) cohort 留存过滤；2) 设备/地域/URL 等过滤 |
+| `getEventData`（明细分页） | ✅ 是 | 1) cohort 留存过滤；2) 设备/地域/URL 等过滤；3) 获取事件详情字段 |
+| `getEventDataById`（单事件详情） | ❌ 否 | **此查询没有 ANY LEFT JOIN**！直接查 event_data，因为 event_data 已冗余 event_name 等所有需要的字段 |
+
+> 💡 架构设计启示：`event_data` 宽表冗余是 ClickHouse 模式下的核心性能优化，将高频使用的 `event_name`、`session_id`、`url_path` 冗余到 event_data 中，使得大多数查询可以避免 JOIN。ANY LEFT JOIN 的存在只是为了兼容**两类不常见的过滤需求**：cohort 留存分析、以及基于 website_event 独有列（如设备、地域）的过滤。若无需这两类过滤，理论上可以完全去掉 ANY LEFT JOIN。
 
 ---
 
 ## 四、parseFilters：统一过滤语义在 ClickHouse 中的列映射
 
-核心实现位于 [src/lib/clickhouse.ts](src/lib/clickhouse.ts)。
+核心实现位于 [src/lib/clickhouse.ts](src/lib/clickhouse.ts) 和 [src/lib/params.ts](src/lib/params.ts)。
 
 ### 4.1 FILTER_COLUMNS 字典（过滤名 → DB 列名）
 
@@ -362,13 +436,25 @@ FILTER_COLUMNS = {
 }
 ```
 
-→ **注意**：`propertyName` 在 `getEventDataProperties` 中通过 `parseFilters` 的 `columns` 选项手动映射为 `'data_key'`（而非通过 FILTER_COLUMNS 字典），见 `getEventDataProperties.relationalQuery`：
+→ **注意**：`propertyName` 在 `getEventDataProperties` 中通过 `parseFilters` 的 `columns` 选项手动映射为 `'data_key'`（而非通过 FILTER_COLUMNS 字典）。`filtersObjectToArray` 函数的解析优先级为：`options.columns?.[name]` → `FILTER_COLUMNS[name]`。
 
+### 4.2 过滤条件的列名解析与表归属
+
+`getFilterQuery` 生成的过滤条件**不带任何表前缀**，直接附加在 SQL WHERE 末尾。结合 ANY LEFT JOIN 的结构，列名解析规则如下（详见 3.9.3 节）：
+
+| 列名分类 | 示例 | 是否需要 ANY LEFT JOIN | 作用表 |
+|---|---|---|---|
+| 两表共有列 | `event_name`、`session_id`、`website_id`、`event_id` | 不需要 | event_data（冗余列）或 website_event |
+| website_event 独有列 | `os`、`browser`、`country`、`url_path`、`referrer_domain` | **必须** | website_event（通过 ANY LEFT JOIN 引入） |
+| event_data 独有列 | `data_key`、`data_type`、`string_value`、`number_value`、`date_value` | 不需要 | event_data |
+
+**特殊映射示例**（getEventDataProperties.ts）：
 ```typescript
 parseFilters({ ...filters, websiteId }, { columns: { propertyName: 'data_key' } })
 ```
+→ 手动将前端参数名 `propertyName` 映射为 event_data 表的 `data_key` 列。
 
-### 4.2 过滤操作符 → ClickHouse 函数映射
+### 4.3 过滤操作符 → ClickHouse 函数映射
 
 `mapFilter()` 函数定义于 [src/lib/clickhouse.ts](src/lib/clickhouse.ts)：
 
@@ -432,11 +518,11 @@ EventsPage
    └─ properties
         └─ <EventProperties>
              ├─ Step 1: useEventDataPropertiesQuery → /event-data/properties
-             │     └─ getEventDataProperties → event_data + website_event
+             │     └─ getEventDataProperties → event_data (主查) + ANY LEFT JOIN website_event (仅 cohort/设备/地域过滤用，event_name 取自 event_data 冗余列)
              ├─ Step 2: 填充事件下拉 + 属性下拉（级联过滤）
              └─ Step 3: 选中后渲染 <EventValues>
                    ├─ useEventDataValuesQuery(event, propertyName) → /event-data/values
-                   │     └─ getEventDataValues → event_data.data_key 过滤（注意：data_key 不构成连续前缀，需扫全量后过滤）
+                   │     └─ getEventDataValues → event_data (主查) + ANY LEFT JOIN website_event（注意：右表 event_type=2 不用于过滤左表；data_key 不构成连续前缀，需扫全量后过滤）
                    ├─ <ListTable> → 每行 value / count / percent（用 total 算比例）
                    └─ <PieChart type=doughnut> → 占比可视化
 ```
@@ -453,16 +539,17 @@ EventsPage
 | Prisma 模型（PG 版本） | `prisma/schema.prisma` |
 | DATA_TYPE / FILTER_COLUMNS / EVENT_TYPE | `src/lib/constants.ts` |
 | JSON 扁平化 + 类型识别 | `src/lib/data.ts` |
-| CH 客户端 + parseFilters | `src/lib/clickhouse.ts` |
+| CH 客户端 + parseFilters + getFilterQuery | `src/lib/clickhouse.ts` |
+| 过滤器值解析 + filtersObjectToArray | `src/lib/params.ts` |
 | Tracker SDK | `src/tracker/index.js` |
 | 采集入口 API | `src/app/api/send/route.ts` |
 | 写 website_event | `src/queries/sql/events/saveEvent.ts` |
-| 写 event_data | `src/queries/sql/events/saveEventData.ts` |
+| 写 event_data（含 CH 宽表冗余） | `src/queries/sql/events/saveEventData.ts` |
 | **属性相关查询（共 8 个）** | `src/queries/sql/events/getEventData*.ts` |
 | 指标卡查询（events stats） | `src/queries/sql/events/getWebsiteEventStats.ts` |
 | 事件图表 series | `src/queries/sql/events/getEventStats.ts` |
 | 事件名 Top N（MetricsTable） | `src/queries/sql/events/getEventMetrics.ts` |
-| Activity Tab 明细 | `src/queries/sql/events/getWebsiteEvents.ts` |
+| Activity Tab 明细（含 hasData 子查询） | `src/queries/sql/events/getWebsiteEvents.ts` |
 | **属性 API 路由（共 8 个）** | `src/app/api/websites/[websiteId]/event-data/**/route.ts` |
 | Events 页面容器 | `src/app/(main)/websites/[websiteId]/events/EventsPage.tsx` |
 | 属性探索组件 | `src/app/(main)/websites/[websiteId]/events/EventProperties.tsx` |
@@ -486,8 +573,14 @@ EventsPage
 
 4. **hasData 子查询（Activity Tab）不是单事件属性查询**：子查询 `SELECT event_id FROM event_data WHERE website_id=? AND created_at BETWEEN ?` 的 `event_id` 是**输出列**而非过滤条件，它的语义是"找出该站有哪些事件拥有属性行"。因此排序键只有第 1 列 `website_id` 命中，需扫全站属性行后按 created_at 过滤。
 
-5. **无过滤事件图表**走 `website_event_stats_hourly` 物化表，比扫明细快约 1~2 个数量级；但一旦带 filter / cohort，回源 `website_event` 明细。
+5. **ANY LEFT JOIN 的真实作用不是过滤 event_type=2**：
+   - 右表 `event_type=2` 只能限制右表内容，不能过滤左表 event_data。真正过滤 pageView 的是 event_data 自身冗余的 `event_name` 列（pageView 的 event_name 为空）。
+   - ANY LEFT JOIN 存在的**两个真实原因**：① 配合 cohort 留存分析（INNER JOIN cohort ON website_event.session_id）；② 配合 filterQuery 中只存在于 website_event 的列（设备、地域、URL 等）。
+   - `getEventDataById` 查询**没有 ANY LEFT JOIN**，因为只需要 event_data 表中的冗余字段即可。
+   - 若无需 cohort 留存分析和设备/地域过滤，理论上可以移除所有 ANY LEFT JOIN。
 
-6. **FILTER_COLUMNS 中没有 data_key / data_value 级的内建列** → 属性值级的自定义过滤只能通过 parseFilters 的 `columns` 选项手动映射（见 getEventDataProperties 的做法）。
+6. **无过滤事件图表**走 `website_event_stats_hourly` 物化表，比扫明细快约 1~2 个数量级；但一旦带 filter / cohort，回源 `website_event` 明细。
 
-7. event_data 表**不分区**，所有查询都必须带 `created_at BETWEEN` 时间范围来减少扫描量；但由于 created_at 在排序键末位，时间过滤对 mark 跳跃帮助有限，主要靠**每 mark 内的二级裁剪**。
+7. **FILTER_COLUMNS 中没有 data_key / data_value 级的内建列** → 属性值级的自定义过滤只能通过 parseFilters 的 `columns` 选项手动映射（见 getEventDataProperties 的做法）。
+
+8. event_data 表**不分区**，所有查询都必须带 `created_at BETWEEN` 时间范围来减少扫描量；但由于 created_at 在排序键末位，时间过滤对 mark 跳跃帮助有限，主要靠**每 mark 内的二级裁剪**。
