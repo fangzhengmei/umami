@@ -28,31 +28,63 @@ referrerDomain = referrerUrl.hostname.replace(/^www\./, '');
 
 **实际影响**：合法域名不会出现 `wwwexample.com` 这种形式，因此差异通常不可感知。
 
-### 1.2 规范化应用场景与完整调用链（共 10 处代码事实）
+### 1.2 规范化应用场景与完整调用链（Prisma 10 处 + ClickHouse 0 处）
 
-经源码逐处核对，www 规范化在 **Prisma/PostgreSQL 模式** 下有 **10 处**；**ClickHouse 模式 完全不做** www 规范化，直接 `referrer_domain != hostname` 比较，两者存在统计差异。
+经源码逐处核对，www 规范化在 **Prisma/PostgreSQL 模式** 下有 **10 处**；**ClickHouse 模式 完全不做** www 规范化。以下是两层（框架层 + 查询层）的对称差异对照：
 
-| # | 位置 | 用途 | 所属模块 | 代码位置 |
-|---|------|------|---------|----------|
-| 1 | 采集时 urlDomain | 页面域名规范化，作为 hostname 的 fallback 值 | 采集层 | [send/route.ts#L184](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/app/api/send/route.ts#L184-L184) |
-| 2 | 采集时 referrerDomain | 来源域名规范化后入库 | 采集层 | [send/route.ts#L214](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/app/api/send/route.ts#L214-L214) |
-| 3 | prisma.ts referrer 过滤器 | referrer 筛选时排除自引用 | 查询框架层 | [prisma.ts#L134](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/lib/prisma.ts#L134-L136) |
-| 4 | getPageviewMetrics | 来源域名维度统计时排除自引用 | 页面浏览统计 | [getPageviewMetrics.ts#L50](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/pageviews/getPageviewMetrics.ts#L50-L51) |
-| 5 | getPageviewExpandedMetrics | 来源域名扩展维度排除自引用 | 页面浏览统计 | [getPageviewExpandedMetrics.ts#L54](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/pageviews/getPageviewExpandedMetrics.ts#L54-L55) |
-| 6 | getValues | 获取可筛选值时排除自引用 | 基础查询 | [getValues.ts#L26](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/getValues.ts#L26-L27) |
-| 7 | getChannelMetrics | 渠道统计中判定 referral 渠道 | 渠道统计 | [getChannelMetrics.ts#L65](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/getChannelMetrics.ts#L65-L65) |
-| 8 | getChannelExpandedMetrics | 扩展渠道统计判定 referral | 渠道统计 | [getChannelExpandedMetrics.ts#L96](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/getChannelExpandedMetrics.ts#L96-L96) |
-| 9 | getAttribution | 归因分析中排除自引用来源 | 报表 | [getAttribution.ts#L118](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/reports/getAttribution.ts#L118-L118) |
-| 10 | getRevenueMetrics | 收入统计中判定 referral 渠道 | 报表 | [getRevenueMetrics.ts#L218](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/reports/getRevenueMetrics.ts#L218-L218) |
+#### 框架层差异（`getFilterQuery` 函数）
 
-⚠️ **Prisma vs ClickHouse 差异**：
+| 框架 | referrer 过滤器逻辑 | 代码位置 |
+|------|-------------------|----------|
+| Prisma | `referrer_domain != regexp_replace(hostname, '^www.', '')` | [prisma.ts#L132-L136](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/lib/prisma.ts#L132-L136) |
+| ClickHouse | `referrer_domain != hostname`（无 www 规范化） | [clickhouse.ts#L125-L127](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/lib/clickhouse.ts#L125-L127) |
 
-| 模式 | 自引用判定逻辑 | 示例影响 |
-|------|---------------|----------|
-| Prisma/PostgreSQL | `referrer_domain != regexp_replace(hostname, '^www.', '')` | hostname 带 www 也能正确识别自引用 |
-| ClickHouse | `referrer_domain != hostname` | hostname 为 `www.example.com`、referrer_domain 为 `example.com` 时 → **误判为外部 referral** |
+#### 查询层 7 个函数的对称差异（Prisma vs ClickHouse 对照）
 
-对应 ClickHouse 的 8 处查询函数（`getChannelMetrics.clickhouseQuery`、`getPageviewMetrics.clickhouseQuery`、`getAttribution` ClickHouse 版本等）均直接用 `referrer_domain != hostname`，不做 www 规范化。
+| # | 查询函数 | Prisma 规范化位置 | ClickHouse 缺规范化位置 |
+|---|---------|-----------------|---------------------|
+| 1 | getPageviewMetrics | [getPageviewMetrics.ts#L50](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/pageviews/getPageviewMetrics.ts#L50) `regexp_replace(hostname, '^www.', '')` | [getPageviewMetrics.ts#L118](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/pageviews/getPageviewMetrics.ts#L118) `referrer_domain != hostname` |
+| 2 | getPageviewExpandedMetrics | [getPageviewExpandedMetrics.ts#L54](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/pageviews/getPageviewExpandedMetrics.ts#L54) `regexp_replace(...)` | [getPageviewExpandedMetrics.ts#L136](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/pageviews/getPageviewExpandedMetrics.ts#L136) `referrer_domain != hostname` |
+| 3 | getValues | [getValues.ts#L26](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/getValues.ts#L26) `regexp_replace(...)` | [getValues.ts#L83](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/getValues.ts#L83) `referrer_domain != hostname` |
+| 4 | getChannelMetrics | [getChannelMetrics.ts#L65](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/getChannelMetrics.ts#L65) `regexp_replace(...)` | [getChannelMetrics.ts#L120](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/getChannelMetrics.ts#L120) `referrer_domain != hostname` |
+| 5 | getChannelExpandedMetrics | [getChannelExpandedMetrics.ts#L96](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/getChannelExpandedMetrics.ts#L96) `regexp_replace(...)` | [getChannelExpandedMetrics.ts#L167](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/getChannelExpandedMetrics.ts#L167) `referrer_domain != hostname` |
+| 6 | getAttribution | [getAttribution.ts#L118](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/reports/getAttribution.ts#L118) `regexp_replace(we.hostname, ...)` | [getAttribution.ts#L335](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/reports/getAttribution.ts#L335) `we.referrer_domain != hostname` |
+| 7 | getRevenueMetrics | [getRevenueMetrics.ts#L218](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/reports/getRevenueMetrics.ts#L218) `regexp_replace(...)` | [getRevenueMetrics.ts#L420](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/queries/sql/reports/getRevenueMetrics.ts#L420) `referrer_domain != hostname` |
+
+#### 采集层 2 处（两种模式共享，入库前处理）
+
+| # | 位置 | 正则 | 代码位置 |
+|---|------|------|----------|
+| 1 | 采集时 urlDomain | `/^www./`（无转义点号） | [send/route.ts#L184](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/app/api/send/route.ts#L184) |
+| 2 | 采集时 referrerDomain | `/^www\./`（有转义点号） | [send/route.ts#L214](file:///d:/fz/0601-2/solo-dogfeeding/code/55-umami/src/app/api/send/route.ts#L214) |
+
+#### Prisma 模式 10 处汇总
+
+```
+采集层 2 处（入库前规范化）
+  ├─ urlDomain     = hostname.replace(/^www./, '')
+  └─ referrerDomain = referrerHostname.replace(/^www\./, '')
+
+框架层 1 处（过滤器公共函数）
+  └─ prisma.ts getFilterQuery: referrer_domain != regexp_replace(hostname, '^www.', '')
+
+查询层 7 处（各统计查询内联）
+  ├─ getPageviewMetrics
+  ├─ getPageviewExpandedMetrics
+  ├─ getValues
+  ├─ getChannelMetrics
+  ├─ getChannelExpandedMetrics
+  ├─ getAttribution
+  └─ getRevenueMetrics
+```
+
+⚠️ **ClickHouse 模式统计差异示例**：
+
+| 场景 | hostname | referrer_domain | Prisma 判定 | ClickHouse 判定 |
+|------|----------|-----------------|------------|----------------|
+| 站内跳转（带 www → 不带 www） | `www.example.com` | `example.com` | 自引用（排除） | **误判为外部 referral** |
+| 站内跳转（不带 → 不带） | `example.com` | `example.com` | 自引用（排除） | 自引用（排除） |
+| 真正外部来源 | `example.com` | `google.com` | referral | referral |
 
 ### 1.3 页面域名入库差异：hostname vs urlDomain
 
@@ -495,7 +527,8 @@ from website_event
     │      （域名/hostname 完全不参与！）
     ├─ 4. visitId 处理
     │     ├─ 有 cache 且 now-iat ≤ 1800s → 复用 cache visitId（可跨小时）
-    │     └─ 无 cache 或 超时 → uuid(sessionId, visitSalt) ← 确定性生成
+    │     ├─ 无 cache 或超时 → uuid(sessionId, visitSalt) ← 确定性生成
+    │     └─ 注意：iat 不是滑动窗口，只有超时时才重置
     ├─ 5. URL 解析 + 域名规范化
     │     ├─ urlDomain = hostname.replace(/^www./, '')   ← 无转义点
     │     └─ referrerDomain = referrerHostname.replace(/^www\./, '') ← 转义点
