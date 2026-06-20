@@ -56,13 +56,13 @@ recorder.js ──→ /api/record ──→ saveRecording  ──→ Kafka (prod
 
 ### 1.2 现有"出向"通信的真实边界
 
-项目中仅有以下两种服务端对外 HTTP 通信，但**都不是用户可配置的 Webhook**：
+项目中仅有以下三种对外 HTTP 通信，但**都不是用户可配置的 Webhook**：
 
-| 通信 | 方向 | 目标 | 触发条件 | 失败处理 |
-|------|------|------|----------|----------|
-| 构建遥测上报 | 出向 | `https://api.umami.is/v1/telemetry` | postbuild 时触发 | 空 catch 完全静默 |
-| 页面遥测像素 | 出向（浏览器端） | `https://telemetry.umami.is` | production + 非 share 路径 | `<img>` 标签加载，浏览器静默失败 |
-| 版本更新检查 | 出向（浏览器端） | `https://api.umami.is/v1/updates` | admin 登录 + production | `res.ok` 为 false 时返回 null，静默退出 |
+| 通信 | 发起方 | 方向 | 目标 | 触发条件 | 失败处理 |
+|------|--------|------|------|----------|----------|
+| 构建遥测上报 | 服务端（Node.js） | 服务端 → 外部 | `https://api.umami.is/v1/telemetry` | postbuild 时触发 | 空 catch 完全静默 |
+| 页面遥测像素 | 浏览器端 | 浏览器 → 外部 | `https://i.umami.is/a.png`（见 `TELEMETRY_PIXEL` 常量） | production + 非 share 路径 | `<img>` 标签加载，浏览器静默失败 |
+| 版本更新检查 | 浏览器端 | 浏览器 → 外部 | `https://api.umami.is/v1/updates`（见 `UPDATES_URL` 常量） | admin 登录 + production | `res.ok` 为 false 时返回 null，静默退出 |
 
 ---
 
